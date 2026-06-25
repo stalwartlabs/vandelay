@@ -75,7 +75,9 @@ mod tests {
         let conn = mem();
         let id = insert(&conn, "Sent", Some("sent"));
         assert_eq!(
-            unique_role(&conn, Some("sent"), Some(id)).unwrap().as_deref(),
+            unique_role(&conn, Some("sent"), Some(id))
+                .unwrap()
+                .as_deref(),
             Some("sent")
         );
     }

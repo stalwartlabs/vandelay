@@ -222,7 +222,7 @@ fn try_via_principal(
                     return Ok(None);
                 }
                 Err(JmapError::RetriesExhausted(_)) | Err(JmapError::Malformed(_)) => {
-                    return Ok(None)
+                    return Ok(None);
                 }
                 Err(e) => return Err(DiscoveryError::Transport(e)),
             };

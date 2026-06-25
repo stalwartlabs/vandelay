@@ -24,6 +24,17 @@ fn client(retries: u32) -> DavClient {
     )
 }
 
+fn digest_client(retries: u32, user: &str, password: &str) -> DavClient {
+    DavClient::new(
+        Auth::Digest {
+            user: user.into(),
+            password: password.into(),
+        },
+        RetryPolicy::new(retries),
+        false,
+    )
+}
+
 const MULTISTATUS_HEADERS: &[(&str, &str)] = &[("content-type", "application/xml; charset=utf-8")];
 
 fn multistatus_response(
@@ -1427,4 +1438,71 @@ fn mixed_source_archive_allows_distinct_kinds_against_same_url() {
 
     let no_conflict = sources::conflicting_source(&conn, "caldav", "https://x", "alice").unwrap();
     assert!(no_conflict.is_none());
+}
+
+#[test]
+fn digest_get_retries_then_reuses_nonce() {
+    let mut server = mockito::Server::new();
+    let challenge =
+        r#"Digest realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093""#;
+    let expected = r#"Digest username="Mufasa", realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", uri="/dir/index.html", response="670fd8c2df070c60b045671b8b24ff02""#;
+
+    let _challenge = server
+        .mock("GET", "/dir/index.html")
+        .with_status(401)
+        .with_header("www-authenticate", challenge)
+        .expect(1)
+        .create();
+    let _authed = server
+        .mock("GET", "/dir/index.html")
+        .match_header("authorization", expected)
+        .with_status(200)
+        .with_body("ok")
+        .expect(1)
+        .create();
+
+    let client = digest_client(0, "Mufasa", "Circle of Life");
+    let first = client
+        .get(&format!("{}/dir/index.html", server.url()))
+        .expect("first GET");
+    assert_eq!(first.body, b"ok");
+
+    let _preemptive = server
+        .mock("GET", "/dir/index.html")
+        .match_header("authorization", expected)
+        .with_status(200)
+        .with_body("cached")
+        .expect(1)
+        .create();
+    let second = client
+        .get(&format!("{}/dir/index.html", server.url()))
+        .expect("second GET");
+    assert_eq!(second.body, b"cached");
+}
+
+#[test]
+fn digest_invalid_credentials_fail_after_single_retry() {
+    let mut server = mockito::Server::new();
+    let challenge =
+        r#"Digest realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093""#;
+
+    let _challenge = server
+        .mock("GET", "/dir/index.html")
+        .with_status(401)
+        .with_header("www-authenticate", challenge)
+        .expect(1)
+        .create();
+    let _retry = server
+        .mock("GET", "/dir/index.html")
+        .match_header("authorization", mockito::Matcher::Regex("^Digest ".into()))
+        .with_status(401)
+        .with_header("www-authenticate", challenge)
+        .expect(1)
+        .create();
+
+    let client = digest_client(0, "Mufasa", "wrong");
+    let err = client
+        .get(&format!("{}/dir/index.html", server.url()))
+        .unwrap_err();
+    assert!(matches!(err, JmapError::Auth(_)), "got {err:?}");
 }

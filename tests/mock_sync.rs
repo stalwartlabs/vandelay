@@ -863,7 +863,10 @@ fn import_missing_email_blob_is_skipped_and_counted_once() {
         .find(|(t, _)| *t == "Email")
         .map(|(_, c)| c.clone())
         .expect("email counts");
-    assert_eq!(email.fetched, 1, "only the email with a present blob imports");
+    assert_eq!(
+        email.fetched, 1,
+        "only the email with a present blob imports"
+    );
     assert_eq!(
         email.failed, 1,
         "a missing blob counts the email failed exactly once, not twice"
@@ -2571,7 +2574,10 @@ fn export_duplicate_role_mailbox_created_as_plain_folder_keeping_subtree() {
         .find(|(t, _)| *t == "Mailbox")
         .map(|(_, c)| c.clone())
         .expect("mailbox counts");
-    assert_eq!(counts.skipped, 2, "Inbox and Sent match existing role mailboxes");
+    assert_eq!(
+        counts.skipped, 2,
+        "Inbox and Sent match existing role mailboxes"
+    );
     assert_eq!(
         counts.created, 2,
         "duplicate-role folder and its child are both created"

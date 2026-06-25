@@ -160,8 +160,7 @@ pub fn reconcile(
         .unwrap_or(0);
 
     let mut uploader = Uploader::new(net, &ctx.conn);
-    let mut taken_roles: HashSet<String> =
-        targets.iter().filter_map(|t| t.role.clone()).collect();
+    let mut taken_roles: HashSet<String> = targets.iter().filter_map(|t| t.role.clone()).collect();
     let interleave = ty == ObjectType::FileNode;
     for d in 0..=max_depth {
         let level: Vec<&LocalNode> = to_create

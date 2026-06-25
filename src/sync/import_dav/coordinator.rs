@@ -47,6 +47,7 @@ impl DavKindArg {
 #[derive(Debug, Clone)]
 pub enum DavAuth {
     Basic { user: String, password: String },
+    Digest { user: String, password: String },
     Bearer { token: String },
 }
 
@@ -54,6 +55,10 @@ impl DavAuth {
     pub fn to_jmap_auth(&self) -> Auth {
         match self {
             DavAuth::Basic { user, password } => Auth::Basic {
+                user: user.clone(),
+                password: password.clone(),
+            },
+            DavAuth::Digest { user, password } => Auth::Digest {
                 user: user.clone(),
                 password: password.clone(),
             },
@@ -65,7 +70,7 @@ impl DavAuth {
 
     pub fn username(&self) -> String {
         match self {
-            DavAuth::Basic { user, .. } => user.clone(),
+            DavAuth::Basic { user, .. } | DavAuth::Digest { user, .. } => user.clone(),
             DavAuth::Bearer { .. } => "(bearer)".to_owned(),
         }
     }

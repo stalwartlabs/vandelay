@@ -29,16 +29,19 @@ const LONG_RETRY_THRESHOLD: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone)]
 pub enum Auth {
     Basic { user: String, password: String },
+    Digest { user: String, password: String },
     Bearer { token: String },
 }
 
 impl Auth {
-    pub fn header_value(&self) -> String {
+    pub fn header_value(&self) -> Option<String> {
         match self {
-            Auth::Basic { user, password } => {
-                format!("Basic {}", STANDARD.encode(format!("{user}:{password}")))
-            }
-            Auth::Bearer { token } => format!("Bearer {token}"),
+            Auth::Basic { user, password } => Some(format!(
+                "Basic {}",
+                STANDARD.encode(format!("{user}:{password}"))
+            )),
+            Auth::Digest { .. } => None,
+            Auth::Bearer { token } => Some(format!("Bearer {token}")),
         }
     }
 }
@@ -97,6 +100,10 @@ enum Attempt {
 
 impl HttpClient {
     pub fn new(auth: Auth, retry: RetryPolicy, allow_invalid_certs: bool) -> Self {
+        assert!(
+            !matches!(&auth, Auth::Digest { .. }),
+            "Digest auth is only supported for DAV connections"
+        );
         let config: Config = Config::builder()
             .http_status_as_error(false)
             .redirect_auth_headers(RedirectAuthHeaders::SameHost)
@@ -364,7 +371,11 @@ impl HttpClient {
     }
 
     fn one_attempt(&self, url: &str, body: Option<&[u8]>, content_type: Option<&str>) -> Attempt {
-        let auth = self.inner.auth.header_value();
+        let auth = self
+            .inner
+            .auth
+            .header_value()
+            .expect("Digest auth is only supported for DAV connections");
         let result = if let Some(payload) = body {
             let mut req = self
                 .inner
@@ -586,7 +597,10 @@ mod tests {
             user: "Aladdin".to_owned(),
             password: "open sesame".to_owned(),
         };
-        assert_eq!(auth.header_value(), "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+        assert_eq!(
+            auth.header_value().as_deref(),
+            Some("Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==")
+        );
     }
 
     #[test]
@@ -594,7 +608,29 @@ mod tests {
         let auth = Auth::Bearer {
             token: "abc.def".to_owned(),
         };
-        assert_eq!(auth.header_value(), "Bearer abc.def");
+        assert_eq!(auth.header_value().as_deref(), Some("Bearer abc.def"));
+    }
+
+    #[test]
+    fn digest_header_is_deferred() {
+        let auth = Auth::Digest {
+            user: "alice".to_owned(),
+            password: "pw".to_owned(),
+        };
+        assert_eq!(auth.header_value(), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "Digest auth is only supported for DAV connections")]
+    fn digest_auth_is_rejected_for_http_client() {
+        let _ = HttpClient::new(
+            Auth::Digest {
+                user: "alice".to_owned(),
+                password: "pw".to_owned(),
+            },
+            RetryPolicy::new(0),
+            false,
+        );
     }
 
     #[test]

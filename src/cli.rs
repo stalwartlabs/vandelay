@@ -446,13 +446,16 @@ pub struct ManageSieveImportArgs {
 }
 
 #[derive(Args)]
-#[command(group(clap::ArgGroup::new("auth").required(true).args(["auth_basic", "auth_bearer"])))]
+#[command(group(clap::ArgGroup::new("auth").required(true).args(["auth_basic", "auth_digest", "auth_bearer"])))]
 pub struct DavImportArgs {
     #[arg(long, value_name = "URL", help = "http(s)://host[:port][/path]")]
     url: String,
 
     #[arg(long, value_name = "USER", help = "HTTP Basic user")]
     auth_basic: Option<String>,
+
+    #[arg(long, value_name = "USER", help = "HTTP Digest user")]
+    auth_digest: Option<String>,
 
     #[arg(
         long,
@@ -701,6 +704,7 @@ fn resolve_dav_import(args: DavImportArgs, kind: DavKindArg) -> Result<Action, E
     let common = common_config(&args.global, args.archive);
     let auth = resolve_dav_auth(
         args.auth_basic.as_deref(),
+        args.auth_digest.as_deref(),
         args.auth_password.as_deref(),
         args.auth_bearer.as_ref(),
     )?;
@@ -722,6 +726,7 @@ fn resolve_dav_import(args: DavImportArgs, kind: DavKindArg) -> Result<Action, E
 
 fn resolve_dav_auth(
     auth_basic: Option<&str>,
+    auth_digest: Option<&str>,
     auth_password: Option<&str>,
     auth_bearer: Option<&Option<String>>,
 ) -> Result<DavAuth, Error> {
@@ -732,13 +737,22 @@ fn resolve_dav_auth(
             password,
         });
     }
+    if let Some(user) = auth_digest {
+        let password = secret::resolve(auth_password, "VANDELAY_PASSWORD", "password")?;
+        return Ok(DavAuth::Digest {
+            user: user.to_owned(),
+            password,
+        });
+    }
     if auth_password.is_some() {
         return Err(Error::Usage(
-            "--auth-password is only valid together with --auth-basic".to_owned(),
+            "--auth-password is only valid together with --auth-basic or --auth-digest".to_owned(),
         ));
     }
     let bearer = auth_bearer.ok_or_else(|| {
-        Error::Usage("exactly one of --auth-basic / --auth-bearer is required".to_owned())
+        Error::Usage(
+            "exactly one of --auth-basic / --auth-digest / --auth-bearer is required".to_owned(),
+        )
     })?;
     let token = secret::resolve(bearer.as_deref(), "VANDELAY_TOKEN", "bearer token")?;
     Ok(DavAuth::Bearer { token })
@@ -1360,5 +1374,39 @@ mod tests {
         let bearer: Option<String> = Some("t".to_owned());
         let auth = resolve_auth(None, None, Some(&bearer)).unwrap();
         assert!(matches!(auth, Auth::Bearer { token } if token == "t"));
+    }
+
+    #[test]
+    fn dav_auth_password_without_basic_or_digest_is_usage_error() {
+        let _g = lock();
+        unsafe {
+            env::remove_var("VANDELAY_TOKEN");
+            env::remove_var("VANDELAY_PASSWORD");
+        }
+        let bearer: Option<String> = Some("t".to_owned());
+        let r = resolve_dav_auth(None, None, Some("hunter2"), Some(&bearer));
+        match r {
+            Err(Error::Usage(m)) => {
+                assert!(m.contains("auth-password"), "msg was: {m}");
+            }
+            other => panic!("expected Usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dav_auth_digest_with_password_resolves() {
+        let _g = lock();
+        unsafe {
+            env::remove_var("VANDELAY_TOKEN");
+            env::remove_var("VANDELAY_PASSWORD");
+        }
+        let auth = resolve_dav_auth(None, Some("alice"), Some("pw"), None).unwrap();
+        match auth {
+            DavAuth::Digest { user, password } => {
+                assert_eq!(user, "alice");
+                assert_eq!(password, "pw");
+            }
+            _ => panic!("expected Digest"),
+        }
     }
 }
