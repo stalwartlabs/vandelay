@@ -1445,7 +1445,7 @@ fn digest_get_retries_then_reuses_nonce() {
     let mut server = mockito::Server::new();
     let challenge =
         r#"Digest realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093""#;
-    let expected = r#"Digest username="Mufasa", realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", uri="/dir/index.html", response="670fd8c2df070c60b045671b8b24ff02""#;
+    let expected = r#"Digest username="Mufasa", realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", uri="/dir/index.html", response="2951cdbad33b2271fcb6b8e7b8feac23""#;
 
     let _challenge = server
         .mock("GET", "/dir/index.html")

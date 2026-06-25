@@ -141,7 +141,7 @@ fn collect_blob_ids(value: &Value, out: &mut Vec<String>) {
 
 fn username_of(auth: &Auth) -> String {
     match auth {
-        Auth::Basic { user, .. } => user.clone(),
+        Auth::Basic { user, .. } | Auth::Digest { user, .. } => user.clone(),
         Auth::Bearer { .. } => "(bearer)".to_owned(),
     }
 }

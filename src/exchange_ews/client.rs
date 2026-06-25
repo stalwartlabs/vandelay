@@ -170,6 +170,7 @@ impl EwsClient {
             Some(Auth::Basic { user, password }) => {
                 format!("Basic {}", STANDARD.encode(format!("{user}:{password}")))
             }
+            Some(Auth::Digest { .. }) => unreachable!("Digest auth is only supported for DAV"),
             Some(Auth::Bearer { token }) => format!("Bearer {token}"),
             None => String::new(),
         }

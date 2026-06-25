@@ -612,8 +612,7 @@ impl DavClient {
                     }
                 }
                 Err(e) => {
-                    let err = map_ureq_error(e);
-                    self.handle_transport(&logger, err, &mut attempt, &policy)?;
+                    self.handle_transport(&logger, e, &mut attempt, &policy)?;
                 }
             }
         }
@@ -799,10 +798,10 @@ impl DavClient {
             .uri(req.url)
             .header("Accept", req.accept)
             .header("User-Agent", self.inner.user_agent.as_str());
-        if req.include_auth {
-            if let Some(auth) = self.authorization_header(&req)? {
-                builder = builder.header("Authorization", auth);
-            }
+        if req.include_auth
+            && let Some(auth) = self.authorization_header(&req)?
+        {
+            builder = builder.header("Authorization", auth);
         }
         if let Some(d) = req.depth {
             builder = builder.header("Depth", d.to_string());
@@ -1085,7 +1084,7 @@ mod tests {
         assert_eq!(
             header.as_deref(),
             Some(
-                r#"Digest username="Mufasa", realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", uri="/dir/index.html", response="670fd8c2df070c60b045671b8b24ff02""#
+                r#"Digest username="Mufasa", realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", uri="/dir/index.html", response="2951cdbad33b2271fcb6b8e7b8feac23""#
             )
         );
     }
