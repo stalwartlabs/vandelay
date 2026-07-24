@@ -5,17 +5,22 @@
  */
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value, json};
 
 use super::common::{jid, target_query_get};
-use super::{Maps, Net, Plan, Uploader};
+use super::{Maps, Net, Plan};
+use crate::db;
 use crate::error::Error;
+use crate::jmap::blobxfer;
 use crate::jmap::error::JmapError;
 use crate::jmap::request::{Request, check_method_error, get_objects};
+use crate::jmap::session::Limits;
 use crate::jmap::wire::JmapId;
 use crate::logging::Logger;
 use crate::sync::import_jmap::mapping::{EMAIL_SELECT, EmailRow, TargetResolver, row_to_email};
+use crate::sync::import_jmap::pool::{Pool, effective_workers};
 use crate::sync::keys::{EmailIndex, EmailKey, email_index, email_keys, index_from_json};
 use crate::sync::{Context, TypeCounts};
 use crate::types::ObjectType;
@@ -48,6 +53,28 @@ fn server_index(v: &Value) -> EmailIndex {
         &arr("to"),
     )
 }
+
+fn import_workers(threads: usize, limits: &Limits) -> usize {
+    effective_workers(threads, limits, true).min(effective_workers(threads, limits, false))
+}
+
+struct ImportJob {
+    cid: String,
+    blob_local_id: i64,
+    bytes: Vec<u8>,
+    mids: Map<String, Value>,
+    keywords: Map<String, Value>,
+    received_at: String,
+    hint: String,
+}
+
+struct ImportResult {
+    cid: String,
+    hint: String,
+    outcome: Result<SingleImport, JmapError>,
+}
+
+type BlobCache = Mutex<HashMap<i64, JmapId>>;
 
 pub fn reconcile(
     ctx: &Context,
@@ -113,17 +140,177 @@ pub fn reconcile(
         .collect();
     let local_keys = email_keys(&local_indices);
 
-    let mut uploader = Uploader::new(net, &ctx.conn);
+    let workers = import_workers(ctx.common.threads, &net.limits);
+    let cache: Arc<BlobCache> = Arc::new(Mutex::new(HashMap::new()));
+    let pool: Pool<ImportJob, ImportResult> = Pool::new(workers, {
+        let net = Arc::new(net.clone());
+        let cache = cache.clone();
+        move |job: ImportJob| {
+            let outcome = run_import(&net, &cache, &job);
+            ImportResult {
+                cid: job.cid,
+                hint: job.hint,
+                outcome,
+            }
+        }
+    });
+    let window = workers * 2;
+    let mut in_flight = 0usize;
+
     for (i, key) in local_keys.iter().enumerate() {
         if target_keys.contains(key) {
             counts.skipped += 1;
             continue;
         }
         let (local_id, row) = &local[i];
-        export_one(net, &mut uploader, maps, *local_id, row, counts, logger);
+        let job = match prepare_job(ctx, maps, *local_id, row, counts, logger) {
+            Some(j) => j,
+            None => continue,
+        };
+        if net.dry_run {
+            counts.created += 1;
+            continue;
+        }
+        pool.submit(job);
+        in_flight += 1;
+        if in_flight >= window
+            && let Ok(res) = pool.results().recv()
+        {
+            in_flight -= 1;
+            account(res, counts, logger);
+        }
+    }
+    for res in pool.finish() {
+        account(res, counts, logger);
     }
 
     Ok(Plan::default())
+}
+
+fn prepare_job(
+    ctx: &Context,
+    maps: &Maps,
+    local_id: i64,
+    row: &EmailRow,
+    counts: &mut TypeCounts,
+    logger: &Logger,
+) -> Option<ImportJob> {
+    let cid = format!("e{local_id}");
+    let mids = match build_mailbox_ids(row, maps) {
+        Some(m) => m,
+        None => {
+            logger.warn(&format!(
+                "Email/import {cid} ({}) skipped: mailbox not on target",
+                blob_hint(row, None)
+            ));
+            counts.failed += 1;
+            return None;
+        }
+    };
+    let bytes = match db::blobs::blob_bytes(&ctx.conn, row.blob_local_id) {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            logger.warn(&format!(
+                "Email/import {cid} ({}) blob upload failed: blob local id {} missing",
+                blob_hint(row, None),
+                row.blob_local_id
+            ));
+            counts.failed += 1;
+            return None;
+        }
+        Err(e) => {
+            logger.warn(&format!(
+                "Email/import {cid} ({}) blob read failed: {e}",
+                blob_hint(row, None)
+            ));
+            counts.failed += 1;
+            return None;
+        }
+    };
+    let hint = blob_hint(row, Some(bytes.len() as u64));
+    Some(ImportJob {
+        cid,
+        blob_local_id: row.blob_local_id,
+        bytes,
+        mids,
+        keywords: build_keywords(row),
+        received_at: row.received_at.clone(),
+        hint,
+    })
+}
+
+fn run_import(net: &Net, cache: &BlobCache, job: &ImportJob) -> Result<SingleImport, JmapError> {
+    let blob = upload_cached(net, cache, job.blob_local_id, &job.bytes)?;
+    let item = import_item(
+        blob.0.clone(),
+        job.mids.clone(),
+        job.keywords.clone(),
+        &job.received_at,
+    );
+    match send_single_import(net, &job.cid, item)? {
+        SingleImport::NotCreated { ref error_type, .. } if error_type == "blobNotFound" => {
+            invalidate(cache, job.blob_local_id, &blob);
+            let blob = upload_cached(net, cache, job.blob_local_id, &job.bytes)?;
+            let item = import_item(
+                blob.0,
+                job.mids.clone(),
+                job.keywords.clone(),
+                &job.received_at,
+            );
+            send_single_import(net, &job.cid, item)
+        }
+        other => Ok(other),
+    }
+}
+
+fn upload_cached(
+    net: &Net,
+    cache: &BlobCache,
+    local_id: i64,
+    bytes: &[u8],
+) -> Result<JmapId, JmapError> {
+    if let Some(id) = cache.lock().unwrap().get(&local_id) {
+        return Ok(id.clone());
+    }
+    let id = blobxfer::upload_bytes(
+        &net.client,
+        &net.session,
+        &net.account,
+        "message/rfc822",
+        bytes,
+    )?;
+    cache.lock().unwrap().insert(local_id, id.clone());
+    Ok(id)
+}
+
+fn invalidate(cache: &BlobCache, local_id: i64, stale: &JmapId) {
+    let mut c = cache.lock().unwrap();
+    if c.get(&local_id) == Some(stale) {
+        c.remove(&local_id);
+    }
+}
+
+fn account(res: ImportResult, counts: &mut TypeCounts, logger: &Logger) {
+    match res.outcome {
+        Ok(SingleImport::Created) => counts.created += 1,
+        Ok(SingleImport::Skipped) => counts.skipped += 1,
+        Ok(SingleImport::NotCreated { detail, .. }) => {
+            logger.warn(&format!(
+                "Email/import {} ({}) failed: {detail}",
+                res.cid, res.hint
+            ));
+            counts.failed += 1;
+        }
+        Err(e) => {
+            logger.warn(&format!(
+                "Email/import {} ({}) send failed: {e}{}",
+                res.cid,
+                res.hint,
+                size_note(&e)
+            ));
+            counts.failed += 1;
+        }
+    }
 }
 
 fn build_mailbox_ids(row: &EmailRow, maps: &Maps) -> Option<Map<String, Value>> {
@@ -143,13 +330,13 @@ fn build_keywords(row: &EmailRow) -> Map<String, Value> {
     kw
 }
 
-fn blob_hint(uploader: &Uploader, row: &EmailRow) -> String {
+fn blob_hint(row: &EmailRow, len: Option<u64>) -> String {
     let idx = index_from_json(&row.message_match);
     let mut s = match idx.mids.first() {
         Some(mid) => format!("message-id <{mid}>"),
         None => "no message-id".to_owned(),
     };
-    if let Some(len) = uploader.blob_len(row.blob_local_id) {
+    if let Some(len) = len {
         use std::fmt::Write;
         let _ = write!(s, ", {}", crate::inspect::format_bytes(len));
     }
@@ -179,123 +366,6 @@ fn import_item(
         "keywords": Value::Object(kw),
         "receivedAt": received_at,
     })
-}
-
-fn export_one(
-    net: &Net,
-    uploader: &mut Uploader,
-    maps: &Maps,
-    local_id: i64,
-    row: &EmailRow,
-    counts: &mut TypeCounts,
-    logger: &Logger,
-) {
-    let cid = format!("e{local_id}");
-    let mids = match build_mailbox_ids(row, maps) {
-        Some(m) => m,
-        None => {
-            logger.warn(&format!(
-                "Email/import {cid} ({}) skipped: mailbox not on target",
-                blob_hint(uploader, row)
-            ));
-            counts.failed += 1;
-            return;
-        }
-    };
-    let blob = match uploader.upload_with(row.blob_local_id, "message/rfc822") {
-        Ok(b) => b.0,
-        Err(e) => {
-            logger.warn(&format!(
-                "Email/import {cid} ({}) blob upload failed: {e}{}",
-                blob_hint(uploader, row),
-                size_note(&e)
-            ));
-            counts.failed += 1;
-            return;
-        }
-    };
-    if net.dry_run {
-        counts.created += 1;
-        return;
-    }
-    let item = import_item(blob, mids, build_keywords(row), &row.received_at);
-    match send_single_import(net, &cid, item) {
-        Ok(SingleImport::Created) => counts.created += 1,
-        Ok(SingleImport::Skipped) => counts.skipped += 1,
-        Ok(SingleImport::NotCreated { error_type, .. }) if error_type == "blobNotFound" => {
-            retry_after_reupload(net, uploader, maps, &cid, row, counts, logger);
-        }
-        Ok(SingleImport::NotCreated { detail, .. }) => {
-            logger.warn(&format!(
-                "Email/import {cid} ({}) failed: {detail}",
-                blob_hint(uploader, row)
-            ));
-            counts.failed += 1;
-        }
-        Err(e) => {
-            logger.warn(&format!(
-                "Email/import {cid} ({}) send failed: {e}{}",
-                blob_hint(uploader, row),
-                size_note(&e)
-            ));
-            counts.failed += 1;
-        }
-    }
-}
-
-fn retry_after_reupload(
-    net: &Net,
-    uploader: &mut Uploader,
-    maps: &Maps,
-    cid: &str,
-    row: &EmailRow,
-    counts: &mut TypeCounts,
-    logger: &Logger,
-) {
-    uploader.invalidate(row.blob_local_id);
-    let blob = match uploader.upload_with(row.blob_local_id, "message/rfc822") {
-        Ok(b) => b.0,
-        Err(e) => {
-            logger.warn(&format!(
-                "Email/import {cid} ({}) blob re-upload failed: {e}{}",
-                blob_hint(uploader, row),
-                size_note(&e)
-            ));
-            counts.failed += 1;
-            return;
-        }
-    };
-    let mids = match build_mailbox_ids(row, maps) {
-        Some(m) => m,
-        None => {
-            logger.warn(&format!(
-                "Email/import {cid} ({}) skipped: mailbox not on target",
-                blob_hint(uploader, row)
-            ));
-            counts.failed += 1;
-            return;
-        }
-    };
-    let item = import_item(blob, mids, build_keywords(row), &row.received_at);
-    match send_single_import(net, cid, item) {
-        Ok(SingleImport::Created) => counts.created += 1,
-        Ok(SingleImport::Skipped) => counts.skipped += 1,
-        Ok(SingleImport::NotCreated { detail, .. }) => {
-            logger.warn(&format!(
-                "Email/import {cid} ({}) failed after blob re-upload: {detail}",
-                blob_hint(uploader, row)
-            ));
-            counts.failed += 1;
-        }
-        Err(e) => {
-            logger.warn(&format!(
-                "Email/import {cid} ({}) send failed after blob re-upload: {e}{}",
-                blob_hint(uploader, row),
-                size_note(&e)
-            ));
-            counts.failed += 1;
-        }
-    }
 }
 
 enum SingleImport {
@@ -348,4 +418,25 @@ fn send_single_import(net: &Net, cid: &str, item: Value) -> Result<SingleImport,
         error_type: String::new(),
         detail: format!("Email/import returned neither created nor notCreated for {cid}"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_workers_capped_by_both_request_and_upload_limits() {
+        let limits = Limits {
+            max_objects_in_get: 500,
+            max_objects_in_set: 500,
+            max_calls_in_request: 16,
+            max_concurrent_requests: 8,
+            max_concurrent_upload: 2,
+            max_size_request: 10_000_000,
+            max_size_upload: 50_000_000,
+        };
+        assert_eq!(import_workers(16, &limits), 2);
+        assert_eq!(import_workers(1, &limits), 1);
+        assert_eq!(import_workers(0, &limits), 1);
+    }
 }

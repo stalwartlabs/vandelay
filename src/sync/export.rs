@@ -101,10 +101,6 @@ impl<'a> Uploader<'a> {
         self.cache.remove(&local_id);
     }
 
-    fn blob_len(&self, local_id: i64) -> Option<u64> {
-        db::blobs::blob_len(self.conn, local_id).ok().flatten()
-    }
-
     fn take_touched(&mut self) -> Vec<i64> {
         std::mem::take(&mut self.touched)
     }
