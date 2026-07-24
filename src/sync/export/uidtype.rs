@@ -172,10 +172,14 @@ fn handle_result(
             return;
         }
     };
-    let (local, touched) = state
-        .touched_by_cid
-        .remove(&cid)
-        .unwrap_or((0, Vec::new()));
+    let Some((local, touched)) = state.touched_by_cid.remove(&cid) else {
+        logger.warn(&format!(
+            "{} {cid}: internal error: no pending create for this id",
+            ty.jmap_name()
+        ));
+        state.counts.failed += 1;
+        return;
+    };
     let outcome = match retry_if_blob_missing(
         net,
         ty,
