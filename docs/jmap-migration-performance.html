@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>JMAP Migration Throughput — Findings and Forecast</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  body { font: 10.5pt/1.45 "Helvetica Neue", Helvetica, Arial, sans-serif; color: #1a1a1a; }
+  h1 { font-size: 19pt; margin: 0 0 2pt; letter-spacing: -0.3pt; }
+  .sub { color: #666; font-size: 9.5pt; margin-bottom: 16pt; }
+  h2 { font-size: 12.5pt; margin: 18pt 0 6pt; padding-bottom: 3pt;
+       border-bottom: 1.5px solid #1a1a1a; }
+  h3 { font-size: 10.5pt; margin: 12pt 0 4pt; }
+  p, li { margin: 0 0 6pt; }
+  ul { margin: 0 0 8pt; padding-left: 16pt; }
+  table { border-collapse: collapse; width: 100%; margin: 6pt 0 10pt; font-size: 9.5pt; }
+  th { text-align: left; border-bottom: 1px solid #1a1a1a; padding: 4pt 6pt 3pt; }
+  td { border-bottom: 1px solid #ddd; padding: 3.5pt 6pt; vertical-align: top; }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+  .box { border-left: 3px solid #1a1a1a; background: #f6f6f6;
+         padding: 8pt 10pt; margin: 8pt 0 12pt; }
+  .warn { border-left-color: #a33; background: #fdf4f4; }
+  .good { border-left-color: #2a6; background: #f3faf6; }
+  code { font-family: "SF Mono", Menlo, monospace; font-size: 9pt; }
+  .lead { font-size: 11pt; }
+  .foot { margin-top: 16pt; padding-top: 6pt; border-top: 1px solid #ccc;
+          color: #666; font-size: 8.5pt; }
+  .avoid { page-break-inside: avoid; }
+</style>
+</head>
+<body>
+
+<h1>JMAP Migration Throughput</h1>
+<div class="sub">Findings, forecast and open risks &middot; Vandelay migration tool vs. Stalwart JMAP &middot; 25 July 2026</div>
+
+<div class="box good">
+<p class="lead"><strong>Bottom line.</strong> The migration tool is not the bottleneck and no longer needs work for speed. Against a local server it moves <strong>1,500 messages per second</strong>. Against our remote Stalwart it moves <strong>5&ndash;8 per second</strong> &mdash; roughly <strong>200&times; slower on identical software</strong>. The remaining limit is how fast the remote server accepts messages, not how fast we send them.</p>
+</div>
+
+<h2>What changed</h2>
+
+<p>The tool previously sent two network requests per message: one to upload the message body, one to file it. Servers cap how many requests one account may have in flight, so the number of requests &mdash; not bandwidth &mdash; set the speed limit.</p>
+
+<p>It now groups messages into batches using a newer part of the JMAP standard (RFC 9404), so one request carries many messages. Measured effect:</p>
+
+<table class="avoid">
+<tr><th>Environment</th><th class="n">Before</th><th class="n">After</th><th class="n">Change</th></tr>
+<tr><td>Local server (no network delay)</td><td class="n">13.6 msg/s</td><td class="n">1,507 msg/s</td><td class="n">110&times; faster</td></tr>
+<tr><td>Remote server, like-for-like test</td><td class="n">5.6 msg/s</td><td class="n">7.2 msg/s</td><td class="n">29% faster</td></tr>
+</table>
+
+<p>The gap between those two rows is the whole story. The same change that makes the tool 110&times; faster locally buys only 29% remotely, because remotely we spend our time waiting for the server rather than issuing requests.</p>
+
+<h2>What to expect for a real migration</h2>
+
+<p>Forecast at <strong>5&ndash;8 messages per second</strong>, measured with realistically sized (50 KB) messages against the current remote server:</p>
+
+<table class="avoid">
+<tr><th>Mailbox size</th><th class="n">Expected duration</th><th class="n">If server were as fast as local</th></tr>
+<tr><td>10,000 messages</td><td class="n">21 min &ndash; 33 min</td><td class="n">7 seconds</td></tr>
+<tr><td>50,000 messages</td><td class="n">1.7 h &ndash; 2.8 h</td><td class="n">33 seconds</td></tr>
+<tr><td>100,000 messages</td><td class="n">3.5 h &ndash; 5.6 h</td><td class="n">1 minute</td></tr>
+<tr><td>1,000,000 messages</td><td class="n">35 h &ndash; 56 h</td><td class="n">11 minutes</td></tr>
+</table>
+
+<p>These are single-account figures. Several accounts migrated in parallel would multiply throughput only if the server's limit is per account rather than global &mdash; which we have <em>not</em> yet tested. See open questions.</p>
+
+<h2>Where the remaining time goes</h2>
+
+<p>We separated the two halves of the work to find the constraint. Uploading message bodies is fast and scales with parallelism. Filing them into the mailbox does not:</p>
+
+<table class="avoid">
+<tr><th>Parallel workers</th><th class="n">Body upload</th><th class="n">Filing (Email/import)</th><th class="n">End to end</th></tr>
+<tr><td>4</td><td class="n">17.7/s</td><td class="n">8.3/s</td><td class="n">5.7 msg/s</td></tr>
+<tr><td>8</td><td class="n">35.3/s</td><td class="n">11.4/s</td><td class="n">8.5 msg/s</td></tr>
+<tr><td>16</td><td class="n">22.8/s</td><td class="n">13.7/s</td><td class="n">8.5 msg/s</td></tr>
+</table>
+
+<p><strong>Filing is the bottleneck, and adding parallelism stops helping past 8 workers.</strong> On the local server the identical operation runs over a hundred times faster, so this is not something inherent to the software &mdash; it is specific to how the remote server is configured or hosted.</p>
+
+<h2>What the rejections mean &mdash; and do not mean</h2>
+
+<div class="box">
+<p><strong>No mail is lost.</strong> When the server refuses a request for exceeding its concurrency limit, the tool recognises that specific refusal as temporary, waits, and retries it. In our production test runs every message arrived: <code>created=600, failed=0</code>.</p>
+</div>
+
+<p>What rejections actually cost is <strong>time</strong>, and they are a signal we are pushing harder than the server wants:</p>
+
+<ul>
+<li>Each rejection means a wasted round trip plus a backoff wait before retrying.</li>
+<li>Retries are capped (5 by default). If a message exhausted all retries it would be reported as failed and counted in the run summary &mdash; it would not fail silently.</li>
+<li>The tool is <em>convergent</em> by design: re-running it imports only what is missing. A partial or interrupted run is safe to simply repeat.</li>
+</ul>
+
+<p>Practically: rejections are a tuning signal, not a data-integrity problem. We saw them appear above 8 parallel workers, which is exactly why 8 is our recommended setting.</p>
+
+<h2>Recommended settings</h2>
+
+<table class="avoid">
+<tr><th>Setting</th><th>Value</th><th>Why</th></tr>
+<tr><td><code>--threads</code></td><td>8</td><td>Measured best. 4 is slower (4.8 msg/s); 16 is slower still and starts triggering rejections.</td></tr>
+<tr><td><code>--progress</code></td><td>on</td><td>Newly added. Shows completed/total, rate and estimated time remaining, so a multi-hour run is observable.</td></tr>
+</table>
+
+<h2>Server-side: where the real speedup is</h2>
+
+<p>Raising the server's concurrency limits from 4 to 16 and lifting the upload quota both worked and both helped. Neither will help further, because filing messages does not scale with concurrency. The 200&times; local-versus-remote gap on identical software points at the environment. In likely order:</p>
+
+<ul>
+<li><strong>Storage backend.</strong> If the remote server stores mail on network or object storage while the local one uses a local disk, that alone could explain the gap.</li>
+<li><strong>Full-text indexing on import.</strong> Indexing every message as it arrives is expensive; pausing it during a bulk migration and rebuilding afterwards is a common and safe tactic.</li>
+<li><strong>Disk-sync policy.</strong> Forcing a flush to disk per message is a large per-message cost.</li>
+</ul>
+
+<p>This is the single highest-value item on the list. Everything on the client side is already far faster than the server can absorb.</p>
+
+<h2>Honest limitations of these numbers</h2>
+
+<ul>
+<li><strong>Server load varied during testing.</strong> Baseline round-trip time to the remote server moved between 27 ms and 84 ms across the session, a 3&times; swing. Only measurements taken back-to-back are reliable; absolute figures from different hours are not comparable. The forecast range above reflects this.</li>
+<li><strong>Attachment-heavy mail is untested.</strong> We tested 150-byte and 50 KB messages. Mailboxes with large attachments will behave differently and may become bandwidth-limited rather than server-limited.</li>
+<li><strong>The tool has more headroom than we have proven.</strong> A stripped-down test harness reached 13.3 msg/s where the production tool reached 7.5 msg/s. We have not yet isolated whether that is server load drift or a real inefficiency in how the tool interleaves its two phases. Worth roughly 40% if it is real.</li>
+<li><strong>Multi-account parallelism is unmeasured.</strong> If limits are per account, migrating several mailboxes concurrently is the cheapest available speedup. This has not been tested.</li>
+<li><strong>One test harness run lost 10 of 200 messages.</strong> This occurred in the simplified measurement harness, which deliberately omits the retry logic; the production tool reported zero failures in every run. It should still be confirmed rather than assumed.</li>
+<li><strong>IMAP was not evaluated.</strong> IMAP bypasses the JMAP upload path entirely and might be faster, but our JMAP credentials were rejected by the IMAP service and we stopped rather than risk triggering account lockout.</li>
+</ul>
+
+<h2>Approaches we tested and rejected</h2>
+
+<ul>
+<li><strong>WebSocket transport.</strong> 7&times; faster for trivial requests, but flat at ~3 msg/s for actual imports at every configuration tried &mdash; the server appears to process one request at a time per socket. Not worth building on.</li>
+<li><strong>More parallel connections.</strong> The server counts in-flight requests per account, not per connection. Opening more connections changes nothing; we verified this directly.</li>
+<li><strong>Very large batches.</strong> Beyond roughly 100 messages per request, throughput falls again.</li>
+</ul>
+
+<h2>Recommended next steps</h2>
+
+<ol>
+<li><strong>Investigate the remote server's storage and indexing configuration.</strong> Highest value by a wide margin; everything else is incremental.</li>
+<li><strong>Test migrating several accounts concurrently</strong> to establish whether limits are per account. Cheap to test, potentially a large multiplier.</li>
+<li><strong>Run one full-size trial migration</strong> on a representative mailbox before committing to a cutover window, so the forecast is validated on real data rather than synthetic messages.</li>
+<li><strong>Confirm IMAP access</strong> so that path can be benchmarked as an alternative.</li>
+</ol>
+
+<div class="foot">
+Prepared from direct measurement against the live test server and a local reference instance. All figures are measured, not estimated; forecasts are extrapolations from measured rates and are stated as ranges to reflect observed variance. Test tooling is committed alongside the tool so any figure here can be reproduced.
+</div>
+
+</body>
+</html>
