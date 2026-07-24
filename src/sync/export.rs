@@ -444,6 +444,8 @@ mod uidtype;
 
 mod email;
 
+mod email_batch;
+
 mod common {
     use super::*;
 

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Map, Value, json};
 
 use super::common::{jid, target_query_get};
-use super::{Maps, Net, Plan};
+use super::{Maps, Net, Plan, email_batch};
 use crate::db;
 use crate::error::Error;
 use crate::jmap::blobxfer;
@@ -141,21 +141,24 @@ pub fn reconcile(
     let local_keys = email_keys(&local_indices);
 
     let workers = import_workers(ctx.common.threads, &net.limits);
+    // Servers cap in-flight requests per user, so the cost driver is request
+    // count. With RFC 9404 one request carries a whole batch of blobs.
+    let batched = email_batch::supports_blob_upload(&net.session);
+    let (batch_count, batch_bytes) = if batched {
+        email_batch::batch_limits(&net.limits)
+    } else {
+        (1, usize::MAX)
+    };
     let cache: Arc<BlobCache> = Arc::new(Mutex::new(HashMap::new()));
-    let pool: Pool<ImportJob, ImportResult> = Pool::new(workers, {
+    let pool: Pool<Vec<ImportJob>, Vec<ImportResult>> = Pool::new(workers, {
         let net = Arc::new(net.clone());
         let cache = cache.clone();
-        move |job: ImportJob| {
-            let outcome = run_import(&net, &cache, &job);
-            ImportResult {
-                cid: job.cid,
-                hint: job.hint,
-                outcome,
-            }
-        }
+        move |jobs: Vec<ImportJob>| run_batch(&net, &cache, jobs)
     });
     let window = workers * 2;
     let mut in_flight = 0usize;
+    let mut batch: Vec<ImportJob> = Vec::new();
+    let mut batch_encoded = 0usize;
 
     for (i, key) in local_keys.iter().enumerate() {
         if target_keys.contains(key) {
@@ -176,20 +179,164 @@ pub fn reconcile(
             crate::progress::advance(1);
             continue;
         }
-        pool.submit(job);
-        in_flight += 1;
-        if in_flight >= window
-            && let Ok(res) = pool.results().recv()
-        {
-            in_flight -= 1;
+        batch_encoded += email_batch::encoded_len(job.bytes.len());
+        batch.push(job);
+        if batch.len() >= batch_count || batch_encoded >= batch_bytes {
+            submit_batch(
+                &pool,
+                &mut batch,
+                &mut batch_encoded,
+                &mut in_flight,
+                window,
+                counts,
+                logger,
+            );
+        }
+    }
+    submit_batch(
+        &pool,
+        &mut batch,
+        &mut batch_encoded,
+        &mut in_flight,
+        window,
+        counts,
+        logger,
+    );
+    for batch in pool.finish() {
+        for res in batch {
             account(res, counts, logger);
         }
     }
-    for res in pool.finish() {
-        account(res, counts, logger);
-    }
 
     Ok(Plan::default())
+}
+
+type BatchPool = Pool<Vec<ImportJob>, Vec<ImportResult>>;
+
+/// Hands the accumulated batch to the pool, then drains one completed batch
+/// once the submission window is full so memory stays bounded.
+fn submit_batch(
+    pool: &BatchPool,
+    batch: &mut Vec<ImportJob>,
+    encoded: &mut usize,
+    in_flight: &mut usize,
+    window: usize,
+    counts: &mut TypeCounts,
+    logger: &Logger,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    pool.submit(std::mem::take(batch));
+    *encoded = 0;
+    *in_flight += 1;
+    if *in_flight >= window
+        && let Ok(done) = pool.results().recv()
+    {
+        *in_flight -= 1;
+        for res in done {
+            account(res, counts, logger);
+        }
+    }
+}
+
+fn one_result(net: &Net, cache: &BlobCache, job: ImportJob) -> ImportResult {
+    let outcome = run_import(net, cache, &job);
+    ImportResult {
+        cid: job.cid,
+        hint: job.hint,
+        outcome,
+    }
+}
+
+fn per_message(net: &Net, cache: &BlobCache, jobs: Vec<ImportJob>) -> Vec<ImportResult> {
+    jobs.into_iter()
+        .map(|job| one_result(net, cache, job))
+        .collect()
+}
+
+/// One `Blob/upload` for the whole batch, then one `Email/import`. Any
+/// batch-level failure degrades to the per-message path rather than failing
+/// every message in the chunk.
+fn run_batch(net: &Net, cache: &BlobCache, jobs: Vec<ImportJob>) -> Vec<ImportResult> {
+    if jobs.len() < 2 {
+        return per_message(net, cache, jobs);
+    }
+    let items: Vec<(String, &[u8])> = jobs
+        .iter()
+        .map(|j| (j.cid.clone(), j.bytes.as_slice()))
+        .collect();
+    let blobs = match email_batch::upload_batch(
+        &net.client,
+        &net.api,
+        &net.account,
+        &net.limits,
+        &items,
+    ) {
+        Ok(b) => b,
+        Err(_) => return per_message(net, cache, jobs),
+    };
+    match import_uploaded(net, &jobs, &blobs) {
+        Some(results) => results,
+        None => per_message(net, cache, jobs),
+    }
+}
+
+/// Imports every successfully uploaded blob of a batch in one call. Returns
+/// `None` if the import request itself failed, so the caller can retry per
+/// message.
+fn import_uploaded(
+    net: &Net,
+    jobs: &[ImportJob],
+    blobs: &HashMap<String, email_batch::BlobOutcome>,
+) -> Option<Vec<ImportResult>> {
+    let mut emails = Map::new();
+    for job in jobs {
+        if let Some(email_batch::BlobOutcome::Created(blob)) = blobs.get(&job.cid) {
+            emails.insert(
+                job.cid.clone(),
+                import_item(
+                    blob.0.clone(),
+                    job.mids.clone(),
+                    job.keywords.clone(),
+                    &job.received_at,
+                ),
+            );
+        }
+    }
+    let imported = if emails.is_empty() {
+        HashMap::new()
+    } else {
+        send_batch_import(net, emails).ok()?
+    };
+    Some(
+        jobs.iter()
+            .map(|job| ImportResult {
+                cid: job.cid.clone(),
+                hint: job.hint.clone(),
+                outcome: batch_outcome(&job.cid, blobs, &imported),
+            })
+            .collect(),
+    )
+}
+
+fn batch_outcome(
+    cid: &str,
+    blobs: &HashMap<String, email_batch::BlobOutcome>,
+    imported: &HashMap<String, SingleImport>,
+) -> Result<SingleImport, JmapError> {
+    match blobs.get(cid) {
+        Some(email_batch::BlobOutcome::Failed { error_type, detail }) => {
+            Ok(SingleImport::NotCreated {
+                error_type: error_type.clone(),
+                detail: format!("Blob/upload failed: {detail}"),
+            })
+        }
+        _ => Ok(imported.get(cid).cloned().unwrap_or(SingleImport::NotCreated {
+            error_type: String::new(),
+            detail: format!("Email/import returned no result for {cid}"),
+        })),
+    }
 }
 
 fn prepare_job(
@@ -374,10 +521,59 @@ fn import_item(
     })
 }
 
+#[derive(Clone)]
 enum SingleImport {
     Created,
     Skipped,
     NotCreated { error_type: String, detail: String },
+}
+
+/// Imports a whole batch in one `Email/import` call and reports each creation
+/// id separately, so one bad message cannot fail its neighbours.
+fn send_batch_import(
+    net: &Net,
+    emails: Map<String, Value>,
+) -> Result<HashMap<String, SingleImport>, JmapError> {
+    let cids: Vec<String> = emails.keys().cloned().collect();
+    let mut req = Request::new();
+    req.call(
+        "Email/import",
+        json!({ "accountId": net.account, "emails": Value::Object(emails) }),
+        "i",
+    );
+    req.fits(&net.limits)?;
+    let resp = req.send(&net.client, &net.api)?;
+    let mr = resp.first()?;
+    check_method_error(mr)?;
+    let created = mr.args.get("created").and_then(Value::as_object);
+    let not_created = mr.args.get("notCreated").and_then(Value::as_object);
+
+    let mut out = HashMap::with_capacity(cids.len());
+    for cid in cids {
+        if created.is_some_and(|c| c.contains_key(&cid)) {
+            out.insert(cid, SingleImport::Created);
+            continue;
+        }
+        let err = not_created.and_then(|nc| nc.get(&cid));
+        let error_type = err
+            .and_then(|e| e.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let entry = if error_type == "alreadyExists" {
+            SingleImport::Skipped
+        } else {
+            SingleImport::NotCreated {
+                detail: match err {
+                    Some(e) => e.to_string(),
+                    None => format!("Email/import returned no result for {cid}"),
+                },
+                error_type,
+            }
+        };
+        out.insert(cid, entry);
+    }
+    Ok(out)
 }
 
 fn send_single_import(net: &Net, cid: &str, item: Value) -> Result<SingleImport, JmapError> {

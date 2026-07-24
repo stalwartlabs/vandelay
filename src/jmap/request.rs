@@ -14,6 +14,9 @@ use crate::jmap::session::Limits;
 use crate::jmap::wire::JmapId;
 
 pub const URN_CORE: &str = "urn:ietf:params:jmap:core";
+/// RFC 9404 blob management. Lets many blobs be created in one method call
+/// instead of one HTTP upload each.
+pub const URN_BLOB: &str = "urn:ietf:params:jmap:blob";
 
 pub fn using_urn(method: &str) -> &'static str {
     let prefix = method.split('/').next().unwrap_or(method);
@@ -25,6 +28,7 @@ pub fn using_urn(method: &str) -> &'static str {
         "Calendar" | "CalendarEvent" | "ParticipantIdentity" => "urn:ietf:params:jmap:calendars",
         "FileNode" => "urn:ietf:params:jmap:filenode",
         "Principal" => "urn:ietf:params:jmap:principals",
+        "Blob" => URN_BLOB,
         "x:Account" | "x:Domain" => "urn:stalwart:jmap",
         _ => URN_CORE,
     }

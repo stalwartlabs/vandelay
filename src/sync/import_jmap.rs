@@ -205,6 +205,9 @@ pub fn run(common: CommonConfig, config: ImportConfig) -> Result<Summary, Error>
             eprintln!("import: {} ...", ty.jmap_name());
         }
         let mut counts = TypeCounts::default();
+        // The object count only becomes known once the server has been
+        // queried, so the phase starts without a total and reports a rate.
+        crate::progress::start(ty.jmap_name(), None);
         match reconcile_type(
             &ctx,
             &net,
@@ -224,6 +227,7 @@ pub fn run(common: CommonConfig, config: ImportConfig) -> Result<Summary, Error>
                 counts.failed += 1;
             }
         }
+        crate::progress::finish();
         summary.per_type.push((ty.jmap_name(), counts));
     }
 
@@ -468,6 +472,7 @@ fn insert_objects(
                     db::ids::insert(&tx, source_id, ty, &jmap_id, local_id)
                         .map_err(|e| Error::Partial(e.to_string()))?;
                     counts.fetched += 1;
+                    crate::progress::advance(1);
                 }
                 Err(e) => {
                     logger.warn(&format!("{} {jmap_id} skipped: {e}", ty.jmap_name()));

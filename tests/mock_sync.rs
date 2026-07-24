@@ -3783,3 +3783,155 @@ fn import_jmap_duplicate_role_is_deduplicated_to_single_mailbox() {
     drop(conn);
     let _ = std::fs::remove_file(&archive);
 }
+
+/// Session advertising RFC 9404 blob management, so the exporter takes the
+/// batched path.
+fn session_body_with_blob(base: &str) -> String {
+    let mut v: Value = serde_json::from_str(&session_body(base)).unwrap();
+    v["capabilities"]["urn:ietf:params:jmap:blob"] = json!({});
+    v.to_string()
+}
+
+#[test]
+fn export_email_batches_blob_upload_when_server_supports_it() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let count = 120;
+
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
+            [],
+        )
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        for n in 1..=count {
+            let raw = format!("From: a@x\r\nSubject: batch {n}\r\nMessage-ID: <b-{n}@h>\r\n\r\nb{n}");
+            let blob = db::blobs::intern_blob(&tx, raw.as_bytes()).unwrap();
+            tx.execute(
+                "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
+                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]')",
+                rusqlite::params![blob],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_with_blob(&base))
+        .create();
+    let _anchor = anchor_terminator(&mut server, api, "Mailbox");
+    let _mq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",{"accountId":"w","ids":["t1"]},"q"]]})
+                .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let _mg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
+                {"id":"t1","name":"Inbox","role":"inbox","parentId":null,
+                 "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let _eq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/query",{"accountId":"w","ids":[]},"q"]]}).to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+
+    // The HTTP upload endpoint must not be touched at all on the batched path.
+    let uploads = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UP"}).to_string())
+        .expect(0)
+        .create();
+
+    let blob_calls = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Blob/upload".into()))
+        .with_body_from_request(|req| {
+            let v: Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+            let mut created = serde_json::Map::new();
+            for cid in v["methodCalls"][0][1]["create"].as_object().unwrap().keys() {
+                created.insert(cid.clone(), json!({"id": format!("blob-{cid}"), "size": 10}));
+            }
+            json!({"methodResponses":[["Blob/upload",
+                {"accountId":"w","created": created},"u"]]})
+            .to_string()
+            .into_bytes()
+        })
+        .expect(2) // 120 messages at the 100-per-batch cap
+        .create();
+
+    let imports = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/import".into()))
+        .with_body_from_request(|req| {
+            let v: Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+            let mut created = serde_json::Map::new();
+            for cid in v["methodCalls"][0][1]["emails"].as_object().unwrap().keys() {
+                created.insert(
+                    cid.clone(),
+                    json!({"id": format!("x-{cid}"), "blobId": "b", "threadId": "t", "size": 10}),
+                );
+            }
+            json!({"methodResponses":[["Email/import",
+                {"accountId":"w","created": created},"i"]]})
+            .to_string()
+            .into_bytes()
+        })
+        .expect(2)
+        .create();
+
+    let summary = sync::export::run(
+        CommonConfig {
+            threads: 4,
+            ..common(&archive)
+        },
+        ExportConfig {
+            connect: ConnectConfig {
+                url: base.clone(),
+                auth: Auth::Basic {
+                    user: "u".into(),
+                    password: "p".into(),
+                },
+                account: AccountSelector::Id("w".into()),
+            },
+            objects: None,
+            prune: false,
+            yes: true,
+        },
+    )
+    .expect("export run");
+
+    let email = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.clone())
+        .expect("email counts");
+    assert_eq!(email.created, count as u64, "all messages imported");
+    assert_eq!(email.failed, 0);
+
+    uploads.assert();
+    blob_calls.assert();
+    imports.assert();
+    let _ = std::fs::remove_file(&archive);
+}
