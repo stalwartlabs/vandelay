@@ -51,6 +51,7 @@ chrono-tz = { version = "0.10", default-features = false }
 mockito = "1.7.2"
 tempfile = "3.13"
 testcontainers = { version = "0.27", features = ["blocking"] }
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }
 
 [profile.dist]
 inherits = "release"

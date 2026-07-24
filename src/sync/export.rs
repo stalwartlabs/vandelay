@@ -122,6 +122,15 @@ struct Net {
     dry_run: bool,
 }
 
+fn count_rows(conn: &Connection, ty: ObjectType) -> Option<u64> {
+    let table = crate::sync::table_name(ty);
+    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .ok()
+    .map(|n| n as u64)
+}
+
 fn has_rows(conn: &Connection, ty: ObjectType) -> bool {
     let table = crate::sync::table_name(ty);
     conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table})"), [], |r| {
@@ -157,6 +166,7 @@ pub fn run(common: CommonConfig, config: ExportConfig) -> Result<Summary, Error>
             eprintln!("export: {} ...", ty.jmap_name());
         }
         let mut counts = TypeCounts::default();
+        crate::progress::start(ty.jmap_name(), count_rows(&ctx.conn, *ty));
         let res = reconcile_type(
             &ctx,
             &net,
@@ -174,6 +184,7 @@ pub fn run(common: CommonConfig, config: ExportConfig) -> Result<Summary, Error>
                 Plan::default()
             }
         };
+        crate::progress::finish();
         plans.insert(*ty, plan);
         counts_per_type.insert(*ty, counts);
     }

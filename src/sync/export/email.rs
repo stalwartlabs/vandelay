@@ -160,15 +160,20 @@ pub fn reconcile(
     for (i, key) in local_keys.iter().enumerate() {
         if target_keys.contains(key) {
             counts.skipped += 1;
+            crate::progress::advance(1);
             continue;
         }
         let (local_id, row) = &local[i];
         let job = match prepare_job(ctx, maps, *local_id, row, counts, logger) {
             Some(j) => j,
-            None => continue,
+            None => {
+                crate::progress::advance(1);
+                continue;
+            }
         };
         if net.dry_run {
             counts.created += 1;
+            crate::progress::advance(1);
             continue;
         }
         pool.submit(job);
@@ -291,6 +296,7 @@ fn invalidate(cache: &BlobCache, local_id: i64, stale: &JmapId) {
 }
 
 fn account(res: ImportResult, counts: &mut TypeCounts, logger: &Logger) {
+    crate::progress::advance(1);
     match res.outcome {
         Ok(SingleImport::Created) => counts.created += 1,
         Ok(SingleImport::Skipped) => counts.skipped += 1,

@@ -16,6 +16,7 @@ pub mod inspect;
 pub mod jmap;
 pub mod logging;
 pub mod managesieve;
+pub mod progress;
 pub mod secret;
 pub mod sync;
 pub mod types;

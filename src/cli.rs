@@ -127,6 +127,16 @@ struct GlobalArgs {
 
     #[arg(long, help = "Accept self-signed / invalid TLS certificates")]
     allow_invalid_certs: bool,
+
+    #[arg(
+        long,
+        help = "Show a live progress line per object type on stderr",
+        long_help = "Show a live progress line per object type on stderr.\n\
+            Reports processed/total, percentage, rate and ETA. When stderr is \
+            not a terminal the line is emitted every few seconds instead of \
+            being redrawn in place."
+    )]
+    progress: bool,
 }
 
 #[derive(Args)]
@@ -1258,6 +1268,7 @@ fn resolve_graph_auth(
 }
 
 fn common_config(global: &GlobalArgs, archive: PathBuf) -> CommonConfig {
+    init_progress(global);
     let threads = global
         .threads
         .filter(|n| *n > 0)
@@ -1271,6 +1282,12 @@ fn common_config(global: &GlobalArgs, archive: PathBuf) -> CommonConfig {
         allow_invalid_certs: global.allow_invalid_certs,
         logger: Logger::from_flags(global.quiet, global.verbose),
     }
+}
+
+fn init_progress(global: &GlobalArgs) {
+    // A redrawn line and per-call protocol tracing fight over stderr, so the
+    // progress line stands down whenever verbose output is on.
+    crate::progress::init(global.progress && !global.quiet && global.verbose == 0);
 }
 
 fn resolve_auth(
