@@ -121,7 +121,7 @@ All actions accept a set of global flags (verbosity, worker pool size, retry pol
 
 | Flag | Purpose |
 | --- | --- |
-| `-j, --threads <N>` | Worker pool size (default: logical CPUs). |
+| `-j, --threads <N>` | Worker pool size (default: logical CPUs). Concurrent JMAP requests are additionally capped by the target server's `maxConcurrentRequests` / `maxConcurrentUpload` session limits, so raising this beyond what the server advertises has no effect. |
 | `--dry-run` | Compute the full plan; perform no writes. |
 | `-v`, `-vv`, `-vvv` | Increase log verbosity. |
 | `-q, --quiet` | Warnings and errors only. |

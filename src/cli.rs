@@ -85,7 +85,11 @@ struct GlobalArgs {
         short = 'j',
         long,
         value_name = "N",
-        help = "Worker pool size (default: logical CPUs)"
+        help = "Worker pool size (default: logical CPUs)",
+        long_help = "Worker pool size (default: logical CPUs).\n\
+            Concurrent JMAP requests are additionally capped by the target \
+            server's maxConcurrentRequests / maxConcurrentUpload session \
+            limits, so values beyond what the server advertises have no effect."
     )]
     threads: Option<usize>,
 
