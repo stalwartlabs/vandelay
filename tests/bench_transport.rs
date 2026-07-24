@@ -937,3 +937,213 @@ fn concurrency_limit_scope() {
         );
     }
 }
+
+/// Reports what the server actually enforces, as opposed to what it advertises:
+/// the concurrency ceiling, then how many blobs fit in one quota window.
+#[test]
+#[ignore = "talks to a remote server configured in .env"]
+fn verify_effective_limits() {
+    let env = dotenv();
+    let raw = env.get("JMAP_SERVER").expect("JMAP_SERVER").clone();
+    let base = if raw.starts_with("http") {
+        raw
+    } else {
+        format!("https://{raw}")
+    };
+    let auth = basic_header(
+        env.get("JMAP_ACCOUNT").expect("JMAP_ACCOUNT"),
+        env.get("JMAP_PASSWORD").expect("JMAP_PASSWORD"),
+    );
+    let setup = agent(8);
+    let target = discover(&setup, &base, &auth);
+
+    println!("\n=== effective concurrency (Email/query, no uploads) ===");
+    for workers in [4usize, 8, 16, 24, 32] {
+        let rejected = AtomicUsize::new(0);
+        let ok = AtomicUsize::new(0);
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    let own = agent(1);
+                    let body = json!({
+                        "using": [CORE, MAIL],
+                        "methodCalls": [["Email/query", {
+                            "accountId": target.account_id, "limit": 20
+                        }, "q"]]
+                    });
+                    let payload = serde_json::to_vec(&body).unwrap();
+                    for _ in 0..10 {
+                        let mut resp = own
+                            .post(&target.api_url)
+                            .header("Authorization", &target.auth)
+                            .header("Content-Type", "application/json")
+                            .send(payload.as_slice())
+                            .expect("request");
+                        let status = resp.status().as_u16();
+                        let text = resp.body_mut().read_to_string().unwrap_or_default();
+                        if status == 400 && text.contains("jmap:error:limit") {
+                            rejected.fetch_add(1, Ordering::Relaxed);
+                        } else if status == 200 {
+                            ok.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        let elapsed = started.elapsed().as_secs_f64();
+        println!(
+            "  {workers:>2} concurrent: {:>3} ok, {:>3} rejected, {:>5.1} req/s",
+            ok.load(Ordering::Relaxed),
+            rejected.load(Ordering::Relaxed),
+            ok.load(Ordering::Relaxed) as f64 / elapsed,
+        );
+    }
+
+    println!("\n=== blob upload quota depth (uploads until refusal) ===");
+    let payload = b"From: q@x\r\nSubject: quota depth\r\nMessage-ID: <qd@x>\r\n\r\nx\r\n";
+    let mut accepted = 0usize;
+    let mut bytes = 0usize;
+    let started = Instant::now();
+    for _ in 0..5000 {
+        let mut resp = setup
+            .post(&target.upload_url)
+            .header("Authorization", &target.auth)
+            .header("Content-Type", "message/rfc822")
+            .send(payload.as_slice())
+            .expect("upload");
+        let status = resp.status().as_u16();
+        let _ = resp.body_mut().read_to_string();
+        if status != 200 {
+            break;
+        }
+        accepted += 1;
+        bytes += payload.len();
+    }
+    println!(
+        "  {accepted} blobs / {bytes} bytes accepted in {:.0}s before refusal",
+        started.elapsed().as_secs_f64()
+    );
+}
+
+/// Splits the import into its two phases so the cost can be attributed:
+/// blob creation first, then `Email/import` over blobs that already exist.
+#[test]
+#[ignore = "writes to a remote server configured in .env"]
+fn bench_import_phases() {
+    let env = dotenv();
+    let raw = env.get("JMAP_SERVER").expect("JMAP_SERVER").clone();
+    let base = if raw.starts_with("http") {
+        raw
+    } else {
+        format!("https://{raw}")
+    };
+    let auth = basic_header(
+        env.get("JMAP_ACCOUNT").expect("JMAP_ACCOUNT"),
+        env.get("JMAP_PASSWORD").expect("JMAP_PASSWORD"),
+    );
+    let ag = agent(16);
+    let target = discover(&ag, &base, &auth);
+    let mailbox = ensure_mailbox(&target, &ag, "vandelay-bench");
+    let n = mails();
+    let pid = std::process::id();
+
+    for workers in [4usize, 8, 16] {
+        let body = corpus(&format!("ph{workers}-{pid}"), n);
+        let blobs: Vec<String> = Vec::with_capacity(n);
+        let blobs = std::sync::Mutex::new(blobs);
+        let next = AtomicUsize::new(0);
+
+        // Phase 1: create every blob, batched through Blob/upload.
+        let started = Instant::now();
+        let batch = std::env::var("BENCH_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50usize);
+        let chunks: Vec<&[Vec<u8>]> = body.chunks(batch).collect();
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let c = next.fetch_add(1, Ordering::Relaxed);
+                        if c >= chunks.len() {
+                            break;
+                        }
+                        let mut create = Map::new();
+                        for (i, bytes) in chunks[c].iter().enumerate() {
+                            create.insert(
+                                format!("b{c}_{i}"),
+                                json!({
+                                    "data": [ { "data:asBase64":
+                                        base64::engine::general_purpose::STANDARD.encode(bytes) } ],
+                                    "type": "message/rfc822"
+                                }),
+                            );
+                        }
+                        let resp = target.api(
+                            &ag,
+                            &[CORE, BLOB],
+                            json!([["Blob/upload", {
+                                "accountId": target.account_id, "create": Value::Object(create)
+                            }, "u"]]),
+                        );
+                        let created = resp["methodResponses"][0][1]["created"]
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default();
+                        let mut guard = blobs.lock().unwrap();
+                        for v in created.values() {
+                            if let Some(id) = v["id"].as_str() {
+                                guard.push(id.to_owned());
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let upload_time = started.elapsed();
+        let ids = blobs.into_inner().unwrap();
+
+        // Phase 2: import those blobs, nothing else.
+        let idx = AtomicUsize::new(0);
+        let imported = AtomicUsize::new(0);
+        let groups: Vec<&[String]> = ids.chunks(batch).collect();
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let g = idx.fetch_add(1, Ordering::Relaxed);
+                        if g >= groups.len() {
+                            break;
+                        }
+                        let mut emails = Map::new();
+                        for (i, blob) in groups[g].iter().enumerate() {
+                            emails.insert(format!("e{g}_{i}"), email_obj(blob, &mailbox));
+                        }
+                        let resp = target.api(
+                            &ag,
+                            &[CORE, MAIL],
+                            json!([["Email/import", {
+                                "accountId": target.account_id, "emails": Value::Object(emails)
+                            }, "i"]]),
+                        );
+                        imported.fetch_add(count_created(&resp), Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        let import_time = started.elapsed();
+
+        println!(
+            "workers={workers:<3} Blob/upload {:>6.1}/s ({:>5.1}s)   Email/import {:>6.1}/s ({:>5.1}s)   end-to-end {:>5.1} mails/s   imported={}/{n}",
+            ids.len() as f64 / upload_time.as_secs_f64(),
+            upload_time.as_secs_f64(),
+            imported.load(Ordering::Relaxed) as f64 / import_time.as_secs_f64(),
+            import_time.as_secs_f64(),
+            imported.load(Ordering::Relaxed) as f64
+                / (upload_time + import_time).as_secs_f64(),
+            imported.load(Ordering::Relaxed),
+        );
+    }
+}
