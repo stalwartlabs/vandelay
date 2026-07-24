@@ -214,6 +214,14 @@ fn bench_export_remote() {
     let user = env.get("JMAP_ACCOUNT").expect("JMAP_ACCOUNT").clone();
     let password = env.get("JMAP_PASSWORD").expect("JMAP_PASSWORD").clone();
 
+    if let Ok(path) = std::env::var("BENCH_BUILD_ARCHIVE") {
+        // Build a corpus archive and stop, so the CLI can be driven against it.
+        let p = PathBuf::from(&path);
+        let _ = std::fs::remove_file(&p);
+        build_archive(&p);
+        println!("archive written: {path}");
+        return;
+    }
     let jmap = seeder::jmap::Jmap::connect(&url, &user, &password).expect("connect remote");
     let account_id = jmap.account_id.clone();
     println!("\n=== remote {url} ===");
