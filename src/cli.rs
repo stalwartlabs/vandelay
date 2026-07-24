@@ -88,8 +88,11 @@ struct GlobalArgs {
         help = "Worker pool size (default: logical CPUs)",
         long_help = "Worker pool size (default: logical CPUs).\n\
             Concurrent JMAP requests are additionally capped by the target \
-            server's maxConcurrentRequests / maxConcurrentUpload session \
-            limits, so values beyond what the server advertises have no effect."
+            server's session limits, so values beyond what the server \
+            advertises have no effect. Email export is bound by \
+            maxConcurrentRequests alone when the target supports \
+            urn:ietf:params:jmap:blob, and by the smaller of \
+            maxConcurrentRequests and maxConcurrentUpload otherwise."
     )]
     threads: Option<usize>,
 

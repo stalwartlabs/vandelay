@@ -121,6 +121,15 @@ pub fn upload_batch(
     Ok(out)
 }
 
+/// True when the server refused this blob because the account's upload quota
+/// for the current window is exhausted.
+pub fn is_over_quota(outcome: Option<&BlobOutcome>) -> bool {
+    matches!(
+        outcome,
+        Some(BlobOutcome::Failed { error_type, .. }) if error_type == "overQuota"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +163,22 @@ mod tests {
     fn byte_budget_leaves_headroom_under_max_size_request() {
         let (_, bytes) = batch_limits(&limits(500, 10_000_000));
         assert_eq!(bytes, 5_000_000);
+    }
+
+    #[test]
+    fn over_quota_is_recognised_only_for_that_error_type() {
+        assert!(is_over_quota(Some(&BlobOutcome::Failed {
+            error_type: "overQuota".to_owned(),
+            detail: String::new(),
+        })));
+        assert!(!is_over_quota(Some(&BlobOutcome::Failed {
+            error_type: "tooLarge".to_owned(),
+            detail: String::new(),
+        })));
+        assert!(!is_over_quota(Some(&BlobOutcome::Created(JmapId(
+            "b".to_owned()
+        )))));
+        assert!(!is_over_quota(None));
     }
 
     #[test]

@@ -54,8 +54,16 @@ fn server_index(v: &Value) -> EmailIndex {
     )
 }
 
-fn import_workers(threads: usize, limits: &Limits) -> usize {
-    effective_workers(threads, limits, true).min(effective_workers(threads, limits, false))
+/// The batched path creates blobs through a regular method call, so it never
+/// touches the upload endpoint and only `maxConcurrentRequests` applies. The
+/// per-message path uses both and is bound by the smaller of the two.
+fn import_workers(threads: usize, limits: &Limits, batched: bool) -> usize {
+    let by_requests = effective_workers(threads, limits, false);
+    if batched {
+        by_requests
+    } else {
+        by_requests.min(effective_workers(threads, limits, true))
+    }
 }
 
 struct ImportJob {
@@ -140,10 +148,10 @@ pub fn reconcile(
         .collect();
     let local_keys = email_keys(&local_indices);
 
-    let workers = import_workers(ctx.common.threads, &net.limits);
     // Servers cap in-flight requests per user, so the cost driver is request
     // count. With RFC 9404 one request carries a whole batch of blobs.
     let batched = email_batch::supports_blob_upload(&net.session);
+    let workers = import_workers(ctx.common.threads, &net.limits, batched);
     let (batch_count, batch_bytes) = if batched {
         email_batch::batch_limits(&net.limits)
     } else {
@@ -276,10 +284,49 @@ fn run_batch(net: &Net, cache: &BlobCache, jobs: Vec<ImportJob>) -> Vec<ImportRe
         Ok(b) => b,
         Err(_) => return per_message(net, cache, jobs),
     };
-    match import_uploaded(net, &jobs, &blobs) {
-        Some(results) => results,
-        None => per_message(net, cache, jobs),
+
+    // `Blob/upload` reports an exhausted upload quota as a method-level
+    // `overQuota` inside a 200 response, which no retry layer sees. The upload
+    // endpoint reports the same condition as HTTP 429, which the client retries
+    // with backoff, so those messages go back to the per-message path.
+    let (throttled, uploaded): (Vec<ImportJob>, Vec<ImportJob>) = jobs
+        .into_iter()
+        .partition(|j| email_batch::is_over_quota(blobs.get(&j.cid)));
+    if uploaded.is_empty() {
+        return per_message(net, cache, throttled);
     }
+
+    let mut results = match import_uploaded(net, &uploaded, &blobs) {
+        Some(r) => r,
+        None => {
+            let mut all = uploaded;
+            all.extend(throttled);
+            return per_message(net, cache, all);
+        }
+    };
+
+    // A staged blob can expire between the upload and the import when the
+    // server throttles in between. Those go back through the per-message path,
+    // which re-uploads before retrying.
+    let stale: HashSet<String> = results
+        .iter()
+        .filter(|r| is_blob_not_found(r))
+        .map(|r| r.cid.clone())
+        .collect();
+    let mut redo = throttled;
+    if !stale.is_empty() {
+        results.retain(|r| !stale.contains(&r.cid));
+        redo.extend(uploaded.into_iter().filter(|j| stale.contains(&j.cid)));
+    }
+    results.extend(per_message(net, cache, redo));
+    results
+}
+
+fn is_blob_not_found(res: &ImportResult) -> bool {
+    matches!(
+        &res.outcome,
+        Ok(SingleImport::NotCreated { error_type, .. }) if error_type == "blobNotFound"
+    )
 }
 
 /// Imports every successfully uploaded blob of a batch in one call. Returns
@@ -637,8 +684,24 @@ mod tests {
             max_size_request: 10_000_000,
             max_size_upload: 50_000_000,
         };
-        assert_eq!(import_workers(16, &limits), 2);
-        assert_eq!(import_workers(1, &limits), 1);
-        assert_eq!(import_workers(0, &limits), 1);
+        assert_eq!(import_workers(16, &limits, false), 2);
+        assert_eq!(import_workers(1, &limits, false), 1);
+        assert_eq!(import_workers(0, &limits, false), 1);
+    }
+
+    #[test]
+    fn batched_import_workers_ignore_the_upload_limit() {
+        let limits = Limits {
+            max_objects_in_get: 500,
+            max_objects_in_set: 500,
+            max_calls_in_request: 16,
+            max_concurrent_requests: 16,
+            max_concurrent_upload: 2,
+            max_size_request: 10_000_000,
+            max_size_upload: 50_000_000,
+        };
+        assert_eq!(import_workers(16, &limits, true), 16);
+        assert_eq!(import_workers(16, &limits, false), 2);
+        assert_eq!(import_workers(4, &limits, true), 4);
     }
 }
