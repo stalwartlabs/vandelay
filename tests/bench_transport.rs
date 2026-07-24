@@ -168,15 +168,31 @@ impl Target {
 }
 
 /// Distinct corpus per mode so nothing is skipped as already-present.
+///
+/// `BENCH_MSG_BYTES` pads each message to a realistic size; real mailboxes
+/// average tens of kilobytes, and throughput measured on tiny synthetic
+/// messages does not transfer to them.
 fn corpus(tag: &str, n: usize) -> Vec<Vec<u8>> {
+    let pad_to: usize = std::env::var("BENCH_MSG_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     (1..=n)
         .map(|i| {
-            format!(
+            let mut m = format!(
                 "From: bench@vandelay.org\r\nTo: sink@vandelay.org\r\n\
                  Subject: transport {tag} {i}\r\nMessage-ID: <tx-{tag}-{i}@vandelay.org>\r\n\
                  Date: Wed, 01 Jan 2020 00:00:00 +0000\r\n\r\nbody {i}\r\n"
-            )
-            .into_bytes()
+            );
+            if m.len() < pad_to {
+                // Varied filler, so compression cannot flatter the result.
+                let filler: String = (m.len()..pad_to)
+                    .map(|k| (b'a' + ((k * 7 + i) % 26) as u8) as char)
+                    .collect();
+                m.push_str(&filler);
+                m.push_str("\r\n");
+            }
+            m.into_bytes()
         })
         .collect()
 }
