@@ -38,11 +38,25 @@ pub fn supports_blob_upload(session: &Session) -> bool {
     session.capabilities.contains_key(URN_BLOB)
 }
 
+/// Smallest batch worth forming. Below this the per-request overhead the
+/// batching exists to amortise starts to dominate again.
+const MIN_BATCH: usize = 10;
+
+/// Batches in flight per worker to aim for, so a worker always has another
+/// batch queued behind the one it is sending.
+const BATCHES_PER_WORKER: usize = 4;
+
 /// Messages per batch, and the encoded-byte budget for one batch.
-pub fn batch_limits(limits: &Limits) -> (usize, usize) {
-    let count = MAX_BATCH.min(limits.max_objects_in_set.max(1) as usize);
+///
+/// `pending` and `workers` shape the count: a batch large enough to leave most
+/// workers idle is slower than several smaller ones, so the corpus is divided
+/// to keep every worker fed before the per-batch cap applies.
+pub fn batch_limits(limits: &Limits, pending: usize, workers: usize) -> (usize, usize) {
+    let server_cap = MAX_BATCH.min(limits.max_objects_in_set.max(1) as usize);
+    let to_fill = pending.div_ceil((workers * BATCHES_PER_WORKER).max(1));
+    let count = server_cap.min(to_fill.max(MIN_BATCH)).max(1);
     let bytes = (limits.max_size_request / REQUEST_BUDGET_DIVISOR) as usize;
-    (count.max(1), bytes.max(1))
+    (count, bytes.max(1))
 }
 
 /// Encoded size a message contributes to a batch: base64 is 4 bytes per 3.
@@ -148,20 +162,33 @@ mod tests {
 
     #[test]
     fn batch_count_is_capped_by_max_objects_in_set() {
-        assert_eq!(batch_limits(&limits(20, 10_000_000)).0, 20);
-        assert_eq!(batch_limits(&limits(500, 10_000_000)).0, MAX_BATCH);
+        assert_eq!(batch_limits(&limits(20, 10_000_000), 100_000, 4).0, 20);
+        assert_eq!(batch_limits(&limits(500, 10_000_000), 100_000, 4).0, MAX_BATCH);
+    }
+
+    #[test]
+    fn small_corpus_is_split_so_every_worker_gets_work() {
+        // 400 messages over 16 workers must not become 4 batches of 100.
+        let (count, _) = batch_limits(&limits(500, 10_000_000), 400, 16);
+        assert!(count <= 25, "batch of {count} leaves workers idle");
+        assert!(400usize.div_ceil(count) >= 16, "fewer batches than workers");
+    }
+
+    #[test]
+    fn batch_never_drops_below_the_minimum() {
+        assert_eq!(batch_limits(&limits(500, 10_000_000), 8, 16).0, MIN_BATCH);
     }
 
     #[test]
     fn batch_count_and_bytes_never_collapse_to_zero() {
-        let (count, bytes) = batch_limits(&limits(0, 1));
+        let (count, bytes) = batch_limits(&limits(0, 1), 0, 0);
         assert_eq!(count, 1);
         assert_eq!(bytes, 1);
     }
 
     #[test]
     fn byte_budget_leaves_headroom_under_max_size_request() {
-        let (_, bytes) = batch_limits(&limits(500, 10_000_000));
+        let (_, bytes) = batch_limits(&limits(500, 10_000_000), 100_000, 4);
         assert_eq!(bytes, 5_000_000);
     }
 

@@ -3877,7 +3877,9 @@ fn export_email_batches_blob_upload_when_server_supports_it() {
             .to_string()
             .into_bytes()
         })
-        .expect(2) // 120 messages at the 100-per-batch cap
+        // Batch size adapts to worker count, so pin the property rather than
+        // the arithmetic: far fewer requests than the 120 messages.
+        .expect_at_most(24)
         .create();
 
     let imports = server
@@ -3897,7 +3899,7 @@ fn export_email_batches_blob_upload_when_server_supports_it() {
             .to_string()
             .into_bytes()
         })
-        .expect(2)
+        .expect_at_most(24)
         .create();
 
     let summary = sync::export::run(

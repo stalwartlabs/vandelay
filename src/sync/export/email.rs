@@ -153,7 +153,11 @@ pub fn reconcile(
     let batched = email_batch::supports_blob_upload(&net.session);
     let workers = import_workers(ctx.common.threads, &net.limits, batched);
     let (batch_count, batch_bytes) = if batched {
-        email_batch::batch_limits(&net.limits)
+        let pending = local_keys
+            .iter()
+            .filter(|k| !target_keys.contains(*k))
+            .count();
+        email_batch::batch_limits(&net.limits, pending, workers)
     } else {
         (1, usize::MAX)
     };
