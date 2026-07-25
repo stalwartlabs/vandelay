@@ -18,7 +18,7 @@ use crate::logging::Logger;
 use crate::sync::import_jmap::mapping::{
     CALENDAR_EVENT_SELECT, CONTACT_CARD_SELECT, calendar_event_to_wire, contact_card_to_wire,
 };
-use crate::sync::import_jmap::pool::{Pool, effective_workers};
+use crate::sync::pool::{Pool, effective_workers};
 use crate::sync::prune::{TargetObj, candidates};
 use crate::sync::{Context, TypeCounts};
 use crate::types::ObjectType;

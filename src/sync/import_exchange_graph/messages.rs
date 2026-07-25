@@ -15,7 +15,7 @@ use crate::exchange_graph::error::GraphError;
 use crate::logging::LEVEL_PROGRESS;
 use crate::sync::TypeCounts;
 use crate::sync::emailmeta::email_meta_from_blob;
-use crate::sync::import_jmap::pool::Pool;
+use crate::sync::pool::Pool;
 use crate::sync::keys::index_to_json;
 
 use super::coordinator::{CHUNK_SIZE, GraphCoordinator};

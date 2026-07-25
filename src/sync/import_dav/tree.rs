@@ -21,7 +21,7 @@ use crate::error::Error;
 use crate::jmap::error::JmapError;
 use crate::logging::{LEVEL_PROGRESS, Logger};
 use crate::sync::TypeCounts;
-use crate::sync::import_jmap::pool::Pool;
+use crate::sync::pool::Pool;
 
 struct FilePlan {
     item_href: String,

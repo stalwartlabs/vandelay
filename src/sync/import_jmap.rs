@@ -6,7 +6,6 @@
 
 pub mod diff;
 pub mod mapping;
-pub mod pool;
 pub mod tree;
 
 use std::collections::{HashMap, HashSet};
@@ -17,8 +16,8 @@ use serde_json::Value;
 
 use self::diff::diff;
 use self::mapping::{BlobIntern, LocalResolver};
-use self::pool::{Pool, effective_workers};
 use self::tree::topo_order;
+use super::pool::{Pool, effective_workers};
 use crate::db;
 use crate::db::sources::SourceKey;
 use crate::error::Error;

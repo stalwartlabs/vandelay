@@ -19,7 +19,7 @@ use crate::exchange_graph::error::GraphError;
 use crate::exchange_graph::types::EventBodyFormat;
 use crate::logging::LEVEL_PROGRESS;
 use crate::sync::TypeCounts;
-use crate::sync::import_jmap::pool::Pool;
+use crate::sync::pool::Pool;
 
 use super::coordinator::{CHUNK_SIZE, GraphCoordinator};
 use super::folders::CalendarFolder;

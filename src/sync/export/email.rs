@@ -20,7 +20,7 @@ use crate::jmap::session::Limits;
 use crate::jmap::wire::JmapId;
 use crate::logging::Logger;
 use crate::sync::import_jmap::mapping::{EMAIL_SELECT, EmailRow, TargetResolver, row_to_email};
-use crate::sync::import_jmap::pool::{Pool, effective_workers};
+use crate::sync::pool::{Pool, effective_workers};
 use crate::sync::keys::{EmailIndex, EmailKey, email_index, email_keys, index_from_json};
 use crate::sync::{Context, TypeCounts};
 use crate::types::ObjectType;

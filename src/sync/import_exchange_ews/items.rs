@@ -326,8 +326,8 @@ pub fn get_items(
         usize,
         Result<Vec<crate::exchange_ews::parse::ResponseMessage>, EwsError>,
     );
-    let pool: crate::sync::import_jmap::pool::Pool<Vec<ItemId>, BatchResult> =
-        crate::sync::import_jmap::pool::Pool::new(workers, move |chunk: Vec<ItemId>| {
+    let pool: crate::sync::pool::Pool<Vec<ItemId>, BatchResult> =
+        crate::sync::pool::Pool::new(workers, move |chunk: Vec<ItemId>| {
             let body = get_item_body(shape, &chunk, version);
             let n = chunk.len();
             let result = match client.call(&url, "GetItem", &body) {
