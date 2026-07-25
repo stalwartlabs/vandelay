@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, params, types::ValueRef};
 
 pub fn intern_blob(conn: &Connection, bytes: &[u8]) -> Result<i64, rusqlite::Error> {
     let hash = blake3::hash(bytes);
@@ -20,11 +20,66 @@ pub fn intern_blob(conn: &Connection, bytes: &[u8]) -> Result<i64, rusqlite::Err
     )
 }
 
+// `data` is declared BLOB, but SQLite is dynamically typed: a raw SQL UPDATE
+// using a text function (e.g. replace()) on this column stores the result
+// with TEXT storage class instead of BLOB. Accept either.
+fn column_bytes(row: &Row, idx: usize, name: &str) -> Result<Vec<u8>, rusqlite::Error> {
+    match row.get_ref(idx)? {
+        ValueRef::Blob(b) => Ok(b.to_vec()),
+        ValueRef::Text(t) => Ok(t.to_vec()),
+        other => Err(rusqlite::Error::InvalidColumnType(
+            idx,
+            name.to_owned(),
+            other.data_type(),
+        )),
+    }
+}
+
 pub fn blob_bytes(conn: &Connection, id: i64) -> Result<Option<Vec<u8>>, rusqlite::Error> {
     conn.query_row("SELECT data FROM blobs WHERE id = ?1", params![id], |row| {
-        row.get(0)
+        column_bytes(row, 0, "data")
     })
     .optional()
+}
+
+fn is_unique_violation(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(f, _) if f.code == ErrorCode::ConstraintViolation
+    )
+}
+
+/// Recomputes the BLAKE3 hash for any blob row that was touched by a raw SQL
+/// edit outside vandelay (e.g. `UPDATE blobs SET data = replace(data, ...)`
+/// to hand-patch a sieve script). SQLite stores such a row's `data` with TEXT
+/// storage class even though the column is declared BLOB, which is how a
+/// legitimate vandelay write (always bound as a `Vec<u8>` parameter) never
+/// looks — so that's the marker used to find rows whose stored hash may no
+/// longer match their content. Rewriting hash+data together also restores
+/// proper BLOB storage class. Rows whose recomputed hash collides with an
+/// existing blob are left untouched (stale hash) for manual resolution,
+/// rather than failing the whole archive open.
+pub fn repair_stale_hashes(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    let candidates: Vec<(i64, Vec<u8>)> = {
+        let mut stmt = conn.prepare("SELECT id, data FROM blobs WHERE typeof(data) = 'text'")?;
+        stmt.query_map([], |row| Ok((row.get(0)?, column_bytes(row, 1, "data")?)))?
+            .collect::<Result<_, _>>()?
+    };
+
+    let mut repaired = 0usize;
+    for (id, data) in candidates {
+        let hash = blake3::hash(&data);
+        let result = conn.execute(
+            "UPDATE blobs SET hash = ?1, data = ?2 WHERE id = ?3",
+            params![hash.as_bytes().as_slice(), data, id],
+        );
+        match result {
+            Ok(_) => repaired += 1,
+            Err(e) if is_unique_violation(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(repaired)
 }
 
 pub fn blob_len(conn: &Connection, id: i64) -> Result<Option<u64>, rusqlite::Error> {
@@ -87,6 +142,85 @@ mod tests {
             Some(&b"payload"[..])
         );
         assert_eq!(blob_bytes(&c, 9999).unwrap(), None);
+    }
+
+    #[test]
+    fn blob_bytes_tolerates_text_storage_class() {
+        // A raw SQL UPDATE using a text function (e.g. replace()) on the
+        // `data` column stores its result as TEXT storage class even though
+        // the column is declared BLOB — SQLite doesn't coerce it back.
+        let c = mem();
+        let id = intern_blob(&c, b"require \"fileinto\";\nkeep;").unwrap();
+        c.execute(
+            "UPDATE blobs SET data = replace(data, 'keep', 'discard') WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        assert_eq!(
+            blob_bytes(&c, id).unwrap().as_deref(),
+            Some(&b"require \"fileinto\";\ndiscard;"[..])
+        );
+    }
+
+    #[test]
+    fn repair_stale_hashes_rehashes_rows_edited_by_raw_sql() {
+        let c = mem();
+        let id = intern_blob(&c, b"require \"fileinto\";\nkeep;").unwrap();
+        c.execute(
+            "UPDATE blobs SET data = replace(data, 'keep', 'discard') WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+
+        let repaired = repair_stale_hashes(&c).unwrap();
+        assert_eq!(repaired, 1);
+
+        let expected = blake3::hash(b"require \"fileinto\";\ndiscard;");
+        let stored_hash: Vec<u8> = c
+            .query_row("SELECT hash FROM blobs WHERE id = ?1", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored_hash, expected.as_bytes().as_slice());
+        assert_eq!(
+            blob_bytes(&c, id).unwrap().as_deref(),
+            Some(&b"require \"fileinto\";\ndiscard;"[..])
+        );
+
+        // Second call is a no-op: nothing left with TEXT storage class.
+        assert_eq!(repair_stale_hashes(&c).unwrap(), 0);
+    }
+
+    #[test]
+    fn repair_stale_hashes_skips_rows_that_collide_with_an_existing_blob() {
+        let c = mem();
+        let kept = intern_blob(&c, b"same content").unwrap();
+        let edited = intern_blob(&c, b"will collide").unwrap();
+        c.execute(
+            "UPDATE blobs SET data = 'same content' WHERE id = ?1",
+            params![edited],
+        )
+        .unwrap();
+
+        let repaired = repair_stale_hashes(&c).unwrap();
+        assert_eq!(repaired, 0);
+
+        let edited_hash: Vec<u8> = c
+            .query_row("SELECT hash FROM blobs WHERE id = ?1", params![edited], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            edited_hash,
+            blake3::hash(b"will collide").as_bytes().as_slice(),
+            "colliding row keeps its stale hash for manual resolution"
+        );
+        assert_eq!(
+            blob_bytes(&c, edited).unwrap().as_deref(),
+            Some(&b"same content"[..]),
+            "content is still readable via the TEXT-storage-class tolerance"
+        );
+        assert!(blob_bytes(&c, kept).unwrap().is_some());
     }
 
     #[test]

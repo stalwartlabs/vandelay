@@ -123,6 +123,21 @@ struct GlobalArgs {
 
     #[arg(long, help = "Accept self-signed / invalid TLS certificates")]
     allow_invalid_certs: bool,
+
+    #[arg(
+        long,
+        help = "Re-hash blobs hand-edited outside vandelay before syncing",
+        long_help = "Re-hash blobs hand-edited outside vandelay before syncing.\n\
+            The archive is content-addressed: each blob's id is derived from a \
+            BLAKE3 hash of its bytes. A raw SQL edit against the archive (e.g. \
+            patching a sieve script with an UPDATE statement) changes the bytes \
+            without updating that hash, and also leaves SQLite's `data` column \
+            with TEXT storage class instead of BLOB — vandelay's own writes \
+            never do that, so it's used as the marker for rows to re-hash. \
+            Off by default because this rewrites archive rows before anything \
+            else touches them."
+    )]
+    repair_text_hash: bool,
 }
 
 #[derive(Args)]
@@ -530,7 +545,7 @@ fn resolve_import(source: Source) -> Result<Action, Error> {
 }
 
 fn resolve_managesieve_import(args: ManageSieveImportArgs) -> Result<Action, Error> {
-    let common = common_config(&args.global, args.archive);
+    let common = common_config(&args.global, args.archive)?;
     let auth = resolve_managesieve_auth(
         args.auth_basic.as_deref(),
         args.auth_password.as_deref(),
@@ -636,7 +651,7 @@ pub struct MaildirImportArgs {
 }
 
 fn resolve_maildir_import(args: MaildirImportArgs) -> Result<Action, Error> {
-    let common = common_config(&args.global, args.archive);
+    let common = common_config(&args.global, args.archive)?;
     if !args.folder.is_empty() && (!args.include.is_empty() || !args.exclude.is_empty()) {
         return Err(Error::Usage(
             "--folder is mutually exclusive with --include/--exclude".to_owned(),
@@ -686,7 +701,7 @@ pub struct TakeoutImportArgs {
 }
 
 fn resolve_takeout_import(args: TakeoutImportArgs) -> Result<Action, Error> {
-    let common = common_config(&args.global, args.archive);
+    let common = common_config(&args.global, args.archive)?;
     Ok(Action::ImportTakeout(
         common,
         TakeoutImportConfig {
@@ -698,7 +713,7 @@ fn resolve_takeout_import(args: TakeoutImportArgs) -> Result<Action, Error> {
 }
 
 fn resolve_dav_import(args: DavImportArgs, kind: DavKindArg) -> Result<Action, Error> {
-    let common = common_config(&args.global, args.archive);
+    let common = common_config(&args.global, args.archive)?;
     let auth = resolve_dav_auth(
         args.auth_basic.as_deref(),
         args.auth_password.as_deref(),
@@ -745,7 +760,7 @@ fn resolve_dav_auth(
 }
 
 fn resolve_jmap_import(args: JmapImportArgs) -> Result<Action, Error> {
-    let common = common_config(&args.global, args.archive);
+    let common = common_config(&args.global, args.archive)?;
     let auth = resolve_auth(
         args.auth_basic.as_deref(),
         args.auth_password.as_deref(),
@@ -769,7 +784,7 @@ fn resolve_jmap_import(args: JmapImportArgs) -> Result<Action, Error> {
 }
 
 fn resolve_imap_import(args: ImapImportArgs) -> Result<Action, Error> {
-    let common = common_config(&args.global, args.archive);
+    let common = common_config(&args.global, args.archive)?;
     let auth = resolve_imap_auth(
         args.auth_basic.as_deref(),
         args.auth_password.as_deref(),
@@ -850,7 +865,7 @@ fn resolve_imap_auth(
 }
 
 fn resolve_export(args: ExportArgs) -> Result<Action, Error> {
-    let common = common_config(&args.global, args.archive);
+    let common = common_config(&args.global, args.archive)?;
     let auth = resolve_auth(
         args.auth_basic.as_deref(),
         args.auth_password.as_deref(),
@@ -998,7 +1013,7 @@ pub struct ExchangeEwsImportArgs {
 
 fn resolve_exchange_ews_import(args: ExchangeEwsImportArgs) -> Result<Action, Error> {
     let archive = args.archive.clone();
-    let common = common_config(&args.global, archive);
+    let common = common_config(&args.global, archive)?;
     let mailbox_kind = match args.mailbox_kind.as_str() {
         "primary" => MailboxKind::Primary,
         "archive" => MailboxKind::Archive,
@@ -1195,7 +1210,7 @@ fn parse_event_body_format(s: &str) -> Result<EventBodyFormat, String> {
 }
 
 fn resolve_exchange_graph_import(args: ExchangeGraphImportArgs) -> Result<Action, Error> {
-    let common = common_config(&args.global, args.archive.clone());
+    let common = common_config(&args.global, args.archive.clone())?;
     let mailbox_kind = args.mailbox_kind;
     let event_body_format = args.event_body_format;
     let auth = resolve_graph_auth(
@@ -1253,20 +1268,24 @@ fn resolve_graph_auth(
     })
 }
 
-fn common_config(global: &GlobalArgs, archive: PathBuf) -> CommonConfig {
+fn common_config(global: &GlobalArgs, archive: PathBuf) -> Result<CommonConfig, Error> {
+    if global.repair_text_hash {
+        let conn = crate::db::init::open(&archive)?;
+        crate::db::blobs::repair_stale_hashes(&conn)?;
+    }
     let threads = global
         .threads
         .filter(|n| *n > 0)
         .unwrap_or_else(num_cpus::get)
         .max(1);
-    CommonConfig {
+    Ok(CommonConfig {
         archive,
         threads,
         dry_run: global.dry_run,
         max_retries: global.max_retries,
         allow_invalid_certs: global.allow_invalid_certs,
         logger: Logger::from_flags(global.quiet, global.verbose),
-    }
+    })
 }
 
 fn resolve_auth(
