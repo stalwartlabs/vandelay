@@ -144,15 +144,28 @@ fn format_line(phase: &Phase) -> String {
         Some(total) if total > 0 => {
             let pct = (phase.done as f64 / total as f64 * 100.0).min(100.0);
             format!(
-                "{}: {}/{} ({pct:.0}%) {rate:.1}/s eta {}",
+                "{}: {}/{} ({pct:.0}%) {rate:.1}/s elapsed {} eta {}",
                 phase.label,
                 phase.done,
                 total,
+                mmss(elapsed.round() as u64),
                 eta(phase.done, total, rate),
             )
         }
-        _ => format!("{}: {} ({rate:.1}/s)", phase.label, phase.done),
+        _ => format!(
+            "{}: {} ({rate:.1}/s) elapsed {}",
+            phase.label,
+            phase.done,
+            mmss(elapsed.round() as u64)
+        ),
     }
+}
+
+/// Live elapsed time is shown unconditionally, including while `done` is
+/// still 0 (e.g. a phase blocked on a slow upstream fetch before it has any
+/// item to count), so a long-running phase never looks frozen.
+fn mmss(secs: u64) -> String {
+    format!("{:02}:{:02}", secs / 60, secs % 60)
 }
 
 fn eta(done: u64, total: u64, rate: f64) -> String {
@@ -160,7 +173,7 @@ fn eta(done: u64, total: u64, rate: f64) -> String {
         return "--:--".to_owned();
     }
     let secs = ((total - done) as f64 / rate).round() as u64;
-    format!("{:02}:{:02}", secs / 60, secs % 60)
+    mmss(secs)
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -189,13 +202,21 @@ mod tests {
         let line = format_line(&phase(100, Some(400)));
         assert!(line.starts_with("Email: 100/400 (25%)"), "{line}");
         assert!(line.contains("10.0/s"), "{line}");
+        assert!(line.contains("elapsed 00:10"), "{line}");
         assert!(line.contains("eta 00:30"), "{line}");
     }
 
     #[test]
     fn line_without_total_omits_percentage() {
         let line = format_line(&phase(42, None));
-        assert_eq!(line, "Email: 42 (4.2/s)");
+        assert_eq!(line, "Email: 42 (4.2/s) elapsed 00:10");
+    }
+
+    #[test]
+    fn elapsed_shows_even_while_done_is_zero() {
+        let line = format_line(&phase(0, Some(47_452)));
+        assert!(line.contains("elapsed 00:10"), "{line}");
+        assert!(line.contains("eta --:--"), "{line}");
     }
 
     #[test]
