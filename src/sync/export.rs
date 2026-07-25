@@ -484,6 +484,15 @@ mod common {
         v.get("id").and_then(Value::as_str).map(str::to_owned)
     }
 
+    /// Upper bound on objects per `/set` create batch, so a single network
+    /// round trip cannot take long enough to stall progress reporting for the
+    /// whole phase.
+    const MAX_CREATE_CHUNK: usize = 100;
+
+    pub fn chunk_size(limits: &Limits) -> usize {
+        MAX_CREATE_CHUNK.min(limits.max_objects_in_set.max(1) as usize)
+    }
+
     pub fn create_batch(
         net: &Net,
         ty: ObjectType,

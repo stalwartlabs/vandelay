@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::params;
 use serde_json::Value;
 
-use super::common::{create_batch, jid, retry_if_blob_missing, target_query_get};
+use super::common::{chunk_size, create_batch, jid, retry_if_blob_missing, target_query_get};
 use super::{Net, Plan, Uploader};
 use crate::error::Error;
 use crate::jmap::wire::JmapId;
@@ -221,6 +221,7 @@ pub fn reconcile(
                                 p
                             ));
                             counts.failed += 1;
+                            crate::progress::advance(1);
                             continue;
                         }
                     },
@@ -237,6 +238,7 @@ pub fn reconcile(
                         logger,
                     );
                     counts.skipped += 1;
+                    crate::progress::advance(1);
                     continue;
                 }
                 let cid = format!("c{}", n.local);
@@ -250,6 +252,7 @@ pub fn reconcile(
                             n.local
                         ));
                         counts.failed += 1;
+                        crate::progress::advance(1);
                         continue;
                     }
                 };
@@ -273,6 +276,7 @@ pub fn reconcile(
                             n.local
                         ));
                         counts.failed += 1;
+                        crate::progress::advance(1);
                         continue;
                     }
                 };
@@ -283,6 +287,7 @@ pub fn reconcile(
                         maps.insert(ty, local, JmapId(id));
                         counts.created += 1;
                     }
+                    crate::progress::advance(1);
                 }
                 for (cid, err) in &outcome.not_created {
                     let local = cid.strip_prefix('c').and_then(|s| s.parse::<i64>().ok());
@@ -297,10 +302,12 @@ pub fn reconcile(
                             logger,
                         );
                         counts.skipped += 1;
+                        crate::progress::advance(1);
                         continue;
                     }
                     logger.warn(&format!("{} {cid} not created: {err}", ty.jmap_name()));
                     counts.failed += 1;
+                    crate::progress::advance(1);
                 }
             }
             continue;
@@ -368,32 +375,37 @@ pub fn reconcile(
         if batch.is_empty() {
             continue;
         }
-        let outcome = create_batch(net, ty, batch).map_err(Error::from)?;
-        for (cid, v) in &outcome.created {
-            if let Some(local) = cid.strip_prefix('c').and_then(|s| s.parse::<i64>().ok())
-                && let Some(id) = jid(v)
-            {
-                maps.insert(ty, local, JmapId(id));
-                counts.created += 1;
+        for chunk in batch.chunks(chunk_size(&net.limits)) {
+            let outcome = create_batch(net, ty, chunk.to_vec()).map_err(Error::from)?;
+            for (cid, v) in &outcome.created {
+                if let Some(local) = cid.strip_prefix('c').and_then(|s| s.parse::<i64>().ok())
+                    && let Some(id) = jid(v)
+                {
+                    maps.insert(ty, local, JmapId(id));
+                    counts.created += 1;
+                }
+                crate::progress::advance(1);
             }
-        }
-        for (cid, err) in &outcome.not_created {
-            let local = cid.strip_prefix('c').and_then(|s| s.parse::<i64>().ok());
-            if let (Some(local), Some(existing)) = (local, already_exists_id(err)) {
-                record_merge(
-                    ty,
-                    local,
-                    existing,
-                    "alreadyExists: reusing existing target",
-                    maps,
-                    &mut tmatched,
-                    logger,
-                );
-                counts.skipped += 1;
-                continue;
+            for (cid, err) in &outcome.not_created {
+                let local = cid.strip_prefix('c').and_then(|s| s.parse::<i64>().ok());
+                if let (Some(local), Some(existing)) = (local, already_exists_id(err)) {
+                    record_merge(
+                        ty,
+                        local,
+                        existing,
+                        "alreadyExists: reusing existing target",
+                        maps,
+                        &mut tmatched,
+                        logger,
+                    );
+                    counts.skipped += 1;
+                    crate::progress::advance(1);
+                    continue;
+                }
+                logger.warn(&format!("{} {cid} not created: {err}", ty.jmap_name()));
+                counts.failed += 1;
+                crate::progress::advance(1);
             }
-            logger.warn(&format!("{} {cid} not created: {err}", ty.jmap_name()));
-            counts.failed += 1;
         }
     }
 

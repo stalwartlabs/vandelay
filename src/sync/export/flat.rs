@@ -7,7 +7,7 @@
 use rusqlite::params;
 use serde_json::{Value, json};
 
-use super::common::{create_batch, jid, target_get_all};
+use super::common::{chunk_size, create_batch, jid, target_get_all};
 use super::{Maps, Net, Plan};
 use crate::error::Error;
 use crate::jmap::wire::JmapId;
@@ -92,31 +92,33 @@ pub fn reconcile(
             }
             batch.push((format!("c{local}"), wire));
         }
-        let outcome = create_batch(net, ty, batch).map_err(Error::from)?;
-        for (cid, v) in &outcome.created {
-            if let Some(local) = cid.strip_prefix('c').and_then(|s| s.parse::<i64>().ok())
-                && let Some(id) = jid(v)
-            {
-                maps.insert(ty, local, JmapId(id.clone()));
-                counts.created += 1;
-                crate::progress::advance(1);
-                if to_create.iter().any(|(l, d)| *l == local && *d) {
-                    let mut req = crate::jmap::request::Request::new();
-                    req.call(
-                        format!("{}/set", ty.jmap_name()),
-                        json!({ "accountId": net.account, "onSuccessSetIsDefault": id }),
-                        "d",
-                    );
-                    if let Err(e) = req.send(&net.client, &net.api) {
-                        logger.warn(&format!("{} isDefault not set: {e}", ty.jmap_name()));
+        for chunk in batch.chunks(chunk_size(&net.limits)) {
+            let outcome = create_batch(net, ty, chunk.to_vec()).map_err(Error::from)?;
+            for (cid, v) in &outcome.created {
+                if let Some(local) = cid.strip_prefix('c').and_then(|s| s.parse::<i64>().ok())
+                    && let Some(id) = jid(v)
+                {
+                    maps.insert(ty, local, JmapId(id.clone()));
+                    counts.created += 1;
+                    crate::progress::advance(1);
+                    if to_create.iter().any(|(l, d)| *l == local && *d) {
+                        let mut req = crate::jmap::request::Request::new();
+                        req.call(
+                            format!("{}/set", ty.jmap_name()),
+                            json!({ "accountId": net.account, "onSuccessSetIsDefault": id }),
+                            "d",
+                        );
+                        if let Err(e) = req.send(&net.client, &net.api) {
+                            logger.warn(&format!("{} isDefault not set: {e}", ty.jmap_name()));
+                        }
                     }
                 }
             }
-        }
-        for (cid, err) in &outcome.not_created {
-            logger.warn(&format!("{} {cid} not created: {err}", ty.jmap_name()));
-            counts.failed += 1;
-            crate::progress::advance(1);
+            for (cid, err) in &outcome.not_created {
+                logger.warn(&format!("{} {cid} not created: {err}", ty.jmap_name()));
+                counts.failed += 1;
+                crate::progress::advance(1);
+            }
         }
     }
 
