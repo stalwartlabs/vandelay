@@ -95,6 +95,7 @@ pub fn reconcile(
                         logger.warn(&format!("SieveScript {cid} not created: {err}"));
                     }
                     counts.failed += 1;
+                    crate::progress::advance(1);
                     continue;
                 }
             }
@@ -102,6 +103,7 @@ pub fn reconcile(
         if *is_active {
             active_target = Some(target_id);
         }
+        crate::progress::advance(1);
     }
 
     if active_target.is_none() && locals.iter().all(|(_, _, a, _)| !*a) {

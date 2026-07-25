@@ -184,6 +184,7 @@ pub fn reconcile(
         maps.insert(ty, *l, JmapId(tid.clone()));
     }
     counts.skipped += matched.len() as u64;
+    crate::progress::advance(matched.len() as u64);
 
     let by: HashMap<i64, Option<i64>> = locals.iter().map(|n| (n.local, n.parent)).collect();
     let mut to_create: Vec<&LocalNode> = locals

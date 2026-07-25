@@ -65,6 +65,7 @@ pub fn reconcile(
                 tmatched.insert(tid.clone());
                 maps.insert(ty, *local, JmapId(tid));
                 counts.skipped += 1;
+                crate::progress::advance(1);
             }
             None => to_create.push((*local, *is_default)),
         }
@@ -98,6 +99,7 @@ pub fn reconcile(
             {
                 maps.insert(ty, local, JmapId(id.clone()));
                 counts.created += 1;
+                crate::progress::advance(1);
                 if to_create.iter().any(|(l, d)| *l == local && *d) {
                     let mut req = crate::jmap::request::Request::new();
                     req.call(
@@ -114,6 +116,7 @@ pub fn reconcile(
         for (cid, err) in &outcome.not_created {
             logger.warn(&format!("{} {cid} not created: {err}", ty.jmap_name()));
             counts.failed += 1;
+            crate::progress::advance(1);
         }
     }
 

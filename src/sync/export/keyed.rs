@@ -40,6 +40,7 @@ fn run(
     for (local, key, wire) in local_rows {
         if target_keys.contains(&key) || !seen.insert(key) {
             counts.skipped += 1;
+            crate::progress::advance(1);
             continue;
         }
         batch.push((format!("c{local}"), wire));
@@ -47,12 +48,14 @@ fn run(
     if !batch.is_empty() {
         let outcome = create_batch(net, ty, batch).map_err(Error::from)?;
         counts.created += outcome.created.len() as u64;
+        crate::progress::advance(outcome.created.len() as u64);
         for (cid, err) in &outcome.not_created {
             logger.warn(&format!(
                 "{} {cid} not created (expected for non-owned addresses): {err}",
                 ty.jmap_name()
             ));
             counts.skipped += 1;
+            crate::progress::advance(1);
         }
     }
     Ok(Plan::default())

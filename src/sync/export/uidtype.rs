@@ -103,6 +103,7 @@ pub fn reconcile(
             maps.insert(ty, *local, crate::jmap::wire::JmapId(tid.clone()));
             matched_uids.insert(uid.clone());
             state.counts.skipped += 1;
+            crate::progress::advance(1);
             continue;
         }
         let cid = format!("c{local}");
@@ -112,6 +113,7 @@ pub fn reconcile(
             Err(e) => {
                 logger.warn(&format!("{} local {local} skipped: {e}", ty.jmap_name()));
                 state.counts.failed += 1;
+                crate::progress::advance(1);
                 continue;
             }
         };
@@ -178,6 +180,7 @@ fn handle_result(
             ty.jmap_name()
         ));
         state.counts.failed += 1;
+        crate::progress::advance(1);
         return;
     };
     let outcome = match retry_if_blob_missing(
@@ -193,6 +196,7 @@ fn handle_result(
         Err(e) => {
             logger.warn(&format!("{} local {local} skipped: {e}", ty.jmap_name()));
             state.counts.failed += 1;
+            crate::progress::advance(1);
             return;
         }
     };
@@ -203,10 +207,12 @@ fn handle_result(
             maps.insert(ty, parsed, crate::jmap::wire::JmapId(id));
             state.counts.created += 1;
         }
+        crate::progress::advance(1);
     }
     for (cid, err) in &outcome.not_created {
         logger.warn(&format!("{} {cid} not created: {err}", ty.jmap_name()));
         state.counts.failed += 1;
+        crate::progress::advance(1);
     }
 }
 
