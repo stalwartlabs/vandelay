@@ -127,6 +127,7 @@ All actions accept a set of global flags (verbosity, worker pool size, retry pol
 | `-q, --quiet` | Warnings and errors only. |
 | `--max-retries <N>` | Max retries per request on transient failures (default 5). |
 | `--allow-invalid-certs` | Accept self-signed / invalid TLS certs. |
+| `--repair-text-hash` | Re-hash blobs hand-edited outside vandelay (e.g. a raw SQL `UPDATE` against the archive) before syncing. Off by default. |
 
 Credentials should be supplied via the `VANDELAY_PASSWORD` / `VANDELAY_TOKEN` / `VANDELAY_EWS_CLIENT_SECRET` / `VANDELAY_GRAPH_TOKEN` environment variables, or via an interactive prompt; passing them on the command line is supported but not recommended.
 
