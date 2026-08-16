@@ -617,9 +617,11 @@ fn format_rate_headers(headers: &[(String, String)]) -> Option<String> {
     Some(parts.join("; "))
 }
 
-fn format_retry_wait(d: Duration) -> String {
+pub fn format_retry_wait(d: Duration) -> String {
     let total = d.as_secs();
-    if total < 60 {
+    if total == 0 {
+        format!("{}ms", d.as_millis())
+    } else if total < 60 {
         format!("{total}s")
     } else if total < 3600 {
         format!("{}m{:02}s", total / 60, total % 60)
@@ -826,6 +828,7 @@ mod tests {
 
     #[test]
     fn format_retry_wait_short_medium_long() {
+        assert_eq!(format_retry_wait(Duration::from_millis(250)), "250ms");
         assert_eq!(format_retry_wait(Duration::from_secs(7)), "7s");
         assert_eq!(format_retry_wait(Duration::from_secs(67)), "1m07s");
         assert_eq!(format_retry_wait(Duration::from_secs(1427)), "23m47s");

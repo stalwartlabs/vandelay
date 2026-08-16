@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 use crate::db::exchange_graph_ids;
 use crate::error::Error;
+use crate::exchange::jscalendar::override_patch_from_event;
 use crate::exchange_graph::api::{self, PREFER_BODY_HTML, PREFER_BODY_TEXT, PREFER_TIMEZONE_UTC};
 use crate::exchange_graph::calendar_map::{
     ConvertedEvent, EventType, classify_event_type, convert_event,
@@ -185,7 +186,7 @@ fn merge_exception_into(master: &mut ConvertedEvent, ex: &ConvertedEvent) {
     let Value::Object(overrides) = overrides else {
         return;
     };
-    overrides.insert(key, ex.data.clone());
+    overrides.insert(key, override_patch_from_event(&ex.data));
 }
 
 fn merge_exception_into_existing(
@@ -253,7 +254,7 @@ fn merge_persisted_master(
             .entry("recurrenceOverrides".to_owned())
             .or_insert_with(|| Value::Object(serde_json::Map::new()));
         if let Value::Object(overrides) = entry {
-            overrides.insert(key, ex_data.clone());
+            overrides.insert(key, override_patch_from_event(ex_data));
         }
     }
     tx.execute(

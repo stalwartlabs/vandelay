@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.8] - 2026-08-15
+
+### Added
+- A warning when the session advertises `apiUrl`, `uploadUrl` or `downloadUrl` on a different origin than the one connected to, naming both origins (#29).
+- The per-type report is printed when a run aborts.
+
+### Changed
+
+### Fixed
+- A transient `serverUnavailable` from `Email/import` permanently dropped that message from the migration instead of retrying it.
+- The Exchange Graph importer stored a whole converted event as a `recurrenceOverrides` value (#31).
+- Exporting a ContactCard carrying a photo blob failed against Stalwart, and a CalendarEvent enclosure sent as a `blobId` was silently dropped by the server; the bytes of both are now inlined as a base64 `data:` URI (#30).
+- A connection failure against the session-advertised `apiUrl` was reported as a per-type partial failure (exit 5, "consistent and resumable") instead of aborting (#29).
+- Session `apiUrl`, `uploadUrl` and `downloadUrl` given as relative references were used unresolved (#29).
+
 ## [1.0.7] - 2026-07-26
 
 ### Added

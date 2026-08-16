@@ -12,7 +12,10 @@ use super::common::{jid, target_query_get};
 use super::{Maps, Net, Plan, Uploader};
 use crate::error::Error;
 use crate::jmap::error::JmapError;
-use crate::jmap::request::{Request, check_method_error, get_objects};
+use crate::jmap::request::{
+    MethodCall, Request, check_method_error, get_objects, retry_method_call,
+};
+use crate::jmap::retry::MethodCallKind;
 use crate::jmap::wire::JmapId;
 use crate::logging::Logger;
 use crate::sync::import_jmap::mapping::{EMAIL_SELECT, EmailRow, TargetResolver, row_to_email};
@@ -219,7 +222,7 @@ fn export_one(
         return;
     }
     let item = import_item(blob, mids, build_keywords(row), &row.received_at);
-    match send_single_import(net, &cid, item) {
+    match send_single_import(net, &cid, item, logger) {
         Ok(SingleImport::Created) => counts.created += 1,
         Ok(SingleImport::Skipped) => counts.skipped += 1,
         Ok(SingleImport::NotCreated { error_type, .. }) if error_type == "blobNotFound" => {
@@ -277,7 +280,7 @@ fn retry_after_reupload(
         }
     };
     let item = import_item(blob, mids, build_keywords(row), &row.received_at);
-    match send_single_import(net, cid, item) {
+    match send_single_import(net, cid, item, logger) {
         Ok(SingleImport::Created) => counts.created += 1,
         Ok(SingleImport::Skipped) => counts.skipped += 1,
         Ok(SingleImport::NotCreated { detail, .. }) => {
@@ -304,7 +307,12 @@ enum SingleImport {
     NotCreated { error_type: String, detail: String },
 }
 
-fn send_single_import(net: &Net, cid: &str, item: Value) -> Result<SingleImport, JmapError> {
+fn send_single_import(
+    net: &Net,
+    cid: &str,
+    item: Value,
+    logger: &Logger,
+) -> Result<SingleImport, JmapError> {
     let mut emails = Map::new();
     emails.insert(cid.to_owned(), item);
     let mut req = Request::new();
@@ -314,8 +322,15 @@ fn send_single_import(net: &Net, cid: &str, item: Value) -> Result<SingleImport,
         "i",
     );
     req.fits(&net.limits)?;
-    let resp = req.send(&net.client, &net.api)?;
-    let mr = resp.first()?;
+    retry_method_call(
+        &net.client,
+        MethodCallKind::SingleObjectWrite,
+        logger,
+        || interpret_import(req.send(&net.client, &net.api)?.first()?, cid),
+    )
+}
+
+fn interpret_import(mr: &MethodCall, cid: &str) -> Result<SingleImport, JmapError> {
     check_method_error(mr)?;
     if let Some(err) = mr
         .args

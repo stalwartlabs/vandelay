@@ -1762,6 +1762,449 @@ fn export_calendar_creates_only_missing() {
 }
 
 #[test]
+fn export_contact_and_event_blobs_are_inlined_never_blob_ids() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    let photo: &[u8] = b"\x89PNG\r\n\x1a\nfake-photo-bytes";
+    let agenda: &[u8] = b"agenda for the review meeting";
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO address_books (id,name,is_default) VALUES (1,'Personal',1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendars (id,name,is_default) VALUES (1,'Work',1)",
+            [],
+        )
+        .unwrap();
+        let photo_blob = db::blobs::intern_blob(&conn, photo).unwrap();
+        let agenda_blob = db::blobs::intern_blob(&conn, agenda).unwrap();
+        let card = json!({
+            "@type": "Card",
+            "version": "1.0",
+            "name": { "full": "Photo Person" },
+            "media": { "photo": {
+                "@type": "Media", "kind": "photo",
+                "@blob": photo_blob, "mediaType": "image/png"
+            } }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO contact_cards (id,uid,address_book_ids,data)
+             VALUES (1,'card-uid-1','[1]',?1)",
+            [card.as_str()],
+        )
+        .unwrap();
+        let event = json!({
+            "@type": "Event",
+            "uid": "event-uid-1",
+            "title": "Review",
+            "start": "2026-03-01T09:00:00",
+            "duration": "PT1H",
+            "timeZone": "Etc/UTC",
+            "links": { "1": {
+                "@type": "Link", "rel": "enclosure",
+                "@blob": agenda_blob, "contentType": "text/plain", "title": "agenda.txt"
+            } }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO calendar_events (id,calendar_ids,is_draft,use_default_alerts,data)
+             VALUES (1,'[1]',0,0,?1)",
+            [event.as_str()],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+
+    let no_blob_id_in_card = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("ContactCard/set".into()),
+            Matcher::Regex("blobId".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["ContactCard/set",{"accountId":"w",
+                "created":{"c1":{"id":"TCARD"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(0)
+        .create();
+    let no_blob_id_in_event = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("CalendarEvent/set".into()),
+            Matcher::Regex("blobId".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["CalendarEvent/set",{"accountId":"w",
+                "created":{"c1":{"id":"TEVENT"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(0)
+        .create();
+
+    let _ab_get = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("AddressBook/get".into()))
+        .with_body(
+            json!({"methodResponses":[["AddressBook/get",{"accountId":"w","list":[],
+                "notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let _ab_set = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("AddressBook/set".into()))
+        .with_body(
+            json!({"methodResponses":[["AddressBook/set",{"accountId":"w",
+                "created":{"c1":{"id":"TAB"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _cal_get = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/get",{"accountId":"w","list":[],
+                "notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let _cal_set = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/set".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/set",{"accountId":"w",
+                "created":{"c1":{"id":"TCAL"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _cc_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("ContactCard/query".into()))
+        .with_body(
+            json!({"methodResponses":[["ContactCard/query",{"accountId":"w","ids":[]},"q"]]})
+                .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let _ce_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("CalendarEvent/query".into()))
+        .with_body(
+            json!({"methodResponses":[["CalendarEvent/query",{"accountId":"w","ids":[]},"q"]]})
+                .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+
+    let card_inlined = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("ContactCard/set".into()),
+            Matcher::Regex("data:image/png;base64,".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["ContactCard/set",{"accountId":"w",
+                "created":{"c1":{"id":"TCARD"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let event_inlined = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("CalendarEvent/set".into()),
+            Matcher::Regex("data:text/plain;base64,".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["CalendarEvent/set",{"accountId":"w",
+                "created":{"c1":{"id":"TEVENT"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(
+            &base,
+            vec![
+                ObjectType::AddressBook,
+                ObjectType::Calendar,
+                ObjectType::ContactCard,
+                ObjectType::CalendarEvent,
+            ],
+        ),
+    )
+    .expect("export");
+
+    no_blob_id_in_card.assert();
+    no_blob_id_in_event.assert();
+    card_inlined.assert();
+    event_inlined.assert();
+
+    for name in ["ContactCard", "CalendarEvent"] {
+        let counts = summary
+            .per_type
+            .iter()
+            .find(|(t, _)| *t == name)
+            .map(|(_, c)| c.clone())
+            .unwrap_or_else(|| panic!("{name} counts"));
+        assert_eq!(counts.created, 1, "{name} created: {counts:?}");
+        assert_eq!(counts.failed, 0, "{name} failed: {counts:?}");
+    }
+    let _ = std::fs::remove_file(&archive);
+}
+
+fn session_body_small_request(base: &str, max_size_request: u64) -> String {
+    json!({
+        "apiUrl": format!("{base}/jmap/api"),
+        "uploadUrl": format!("{base}/jmap/upload/{{accountId}}/"),
+        "downloadUrl": format!("{base}/jmap/dl/{{accountId}}/{{blobId}}/{{type}}/{{name}}"),
+        "capabilities": { "urn:ietf:params:jmap:core": {
+            "maxObjectsInGet": 500, "maxObjectsInSet": 500, "maxCallsInRequest": 16,
+            "maxConcurrentRequests": 4, "maxConcurrentUpload": 4,
+            "maxSizeRequest": max_size_request, "maxSizeUpload": 50000000
+        } },
+        "accounts": { "w": { "name": "alice",
+            "accountCapabilities": {
+                "urn:ietf:params:jmap:mail": {},
+                "urn:ietf:params:jmap:contacts": {},
+                "urn:ietf:params:jmap:calendars": {}
+            } } }
+    })
+    .to_string()
+}
+
+#[test]
+fn export_oversized_contact_card_fails_alone_and_the_type_keeps_going() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO address_books (id,name,is_default) VALUES (1,'Personal',1)",
+            [],
+        )
+        .unwrap();
+        let photo = vec![b'P'; 8000];
+        let photo_blob = db::blobs::intern_blob(&conn, &photo).unwrap();
+        let huge = json!({
+            "@type": "Card",
+            "name": { "full": "Photo Person" },
+            "media": { "photo": {
+                "@type": "Media", "kind": "photo",
+                "@blob": photo_blob, "mediaType": "image/png"
+            } }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO contact_cards (id,uid,address_book_ids,data)
+             VALUES (1,'huge-card','[1]',?1)",
+            [huge.as_str()],
+        )
+        .unwrap();
+        let small = json!({ "@type": "Card", "name": { "full": "Small Person" } }).to_string();
+        conn.execute(
+            "INSERT INTO contact_cards (id,uid,address_book_ids,data)
+             VALUES (2,'small-card','[1]',?1)",
+            [small.as_str()],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_small_request(&base, 4000))
+        .expect_at_least(1)
+        .create();
+    let _ccterm = anchor_terminator(&mut server, api, "ContactCard");
+
+    let _ab_get = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("AddressBook/get".into()))
+        .with_body(
+            json!({"methodResponses":[["AddressBook/get",{"accountId":"w","list":[],
+                "notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let _ab_set = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("AddressBook/set".into()))
+        .with_body(
+            json!({"methodResponses":[["AddressBook/set",{"accountId":"w",
+                "created":{"c1":{"id":"TAB"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _cc_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("ContactCard/query".into()))
+        .with_body(
+            json!({"methodResponses":[["ContactCard/query",{"accountId":"w",
+                "ids":["TSTALE"]},"q"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let _cc_get = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("ContactCard/get".into()))
+        .with_body(
+            json!({"methodResponses":[["ContactCard/get",{"accountId":"w","list":[
+                {"id":"TSTALE","uid":"stale-card"}
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let destroyed = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("ContactCard/set".into()),
+            Matcher::Regex("destroy".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["ContactCard/set",{"accountId":"w",
+                "destroyed":["TSTALE"]},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let created = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("ContactCard/set".into()),
+            Matcher::Regex("Small Person".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["ContactCard/set",{"accountId":"w",
+                "created":{"c2":{"id":"TSMALL"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        ExportConfig {
+            prune: true,
+            ..export_cfg_objects(
+                &base,
+                vec![ObjectType::AddressBook, ObjectType::ContactCard],
+            )
+        },
+    )
+    .expect("the oversized card must not abort the run");
+
+    created.assert();
+    destroyed.assert();
+    let counts = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "ContactCard")
+        .map(|(_, c)| c.clone())
+        .expect("ContactCard counts");
+    assert_eq!(counts.created, 1, "{counts:?}");
+    assert_eq!(counts.failed, 1, "{counts:?}");
+    assert_eq!(
+        counts.deleted, 1,
+        "the prune plan stays complete: {counts:?}"
+    );
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_archive_read_failure_while_inlining_exits_seven() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO address_books (id,name,is_default) VALUES (1,'Personal',1)",
+            [],
+        )
+        .unwrap();
+        let photo_blob = db::blobs::intern_blob(&conn, b"photo-bytes").unwrap();
+        let card = json!({
+            "@type": "Card",
+            "media": { "photo": { "@type": "Media", "kind": "photo",
+                "@blob": photo_blob, "mediaType": "image/png" } }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO contact_cards (id,uid,address_book_ids,data)
+             VALUES (1,'card-uid-1','[1]',?1)",
+            [card.as_str()],
+        )
+        .unwrap();
+        conn.execute("ALTER TABLE blobs RENAME COLUMN data TO payload", [])
+            .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _cc_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("ContactCard/query".into()))
+        .with_body(
+            json!({"methodResponses":[["ContactCard/query",{"accountId":"w","ids":[]},"q"]]})
+                .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let no_create = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("ContactCard/set".into()))
+        .with_body(
+            json!({"methodResponses":[["ContactCard/set",{"accountId":"w",
+                "created":{"c1":{"id":"TCARD"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(0)
+        .create();
+
+    let err = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::ContactCard]),
+    )
+    .expect_err("an unreadable blobs table must abort the run");
+
+    no_create.assert();
+    assert!(err.aborts_run(), "{err}");
+    assert_eq!(err.exit_code(), 7, "{err}");
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
 fn export_sieve_script_matches_by_name_not_content() {
     let mut server = mockito::Server::new();
     let base = server.url();
@@ -3262,5 +3705,371 @@ fn import_jmap_duplicate_role_is_deduplicated_to_single_mailbox() {
         .unwrap();
     assert_eq!(null_roles, 2, "the surplus duplicates become plain folders");
     drop(conn);
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_aborts_with_exit_two_when_the_advertised_api_url_is_unreachable() {
+    let mut session_host = mockito::Server::new();
+    let mut api_host = mockito::Server::new();
+    let session_base = session_host.url();
+    let api_base = api_host.url();
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role,sort_order,is_subscribed)
+             VALUES (1,'Inbox',NULL,'inbox',0,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO address_books (id,name,description,is_default)
+             VALUES (1,'Personal',NULL,1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let _root = session_host.mock("GET", "/").with_status(404).create();
+    let _wk = session_host
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&api_base))
+        .expect_at_least(1)
+        .create();
+    let nginx = api_host
+        .mock("POST", "/jmap/api")
+        .with_status(404)
+        .with_header("content-type", "text/html")
+        .with_body("<html><head><title>404 Not Found</title></head><body>nginx</body></html>")
+        .expect(1)
+        .create();
+
+    let err = sync::export::run(
+        CommonConfig {
+            archive: archive.clone(),
+            threads: 1,
+            dry_run: false,
+            max_retries: 0,
+            allow_invalid_certs: false,
+            logger: Logger::from_flags(true, 0),
+        },
+        export_cfg_objects(
+            &session_base,
+            vec![ObjectType::Mailbox, ObjectType::AddressBook],
+        ),
+    )
+    .expect_err("an unreachable apiUrl must abort the run");
+
+    assert!(
+        matches!(err, vandelay::error::Error::Connection(_)),
+        "a 404 from the advertised apiUrl is a whole-run connection failure, got {err:?}"
+    );
+    assert_eq!(err.exit_code(), 2, "must not report a partial failure");
+    nginx.assert();
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn aborting_import_still_reports_the_types_that_finished() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _term = anchor_terminator(&mut server, api, "Mailbox");
+
+    let _mq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",
+                {"accountId":"w","ids":["A"]},"q"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let _mg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"s1","list":[
+                {"id":"A","name":"alpha","parentId":null,"role":null,"sortOrder":0,"isSubscribed":true}
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let _dead_endpoint = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_status(404)
+        .with_header("content-type", "text/html")
+        .with_body("<html><head><title>404 Not Found</title></head><body>nginx</body></html>")
+        .expect_at_least(1)
+        .create();
+
+    let outcome = sync::import_jmap::run_reporting(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+    );
+
+    let err = outcome
+        .error
+        .as_ref()
+        .expect("a 404 from the api endpoint aborts the run");
+    assert!(
+        matches!(err, vandelay::error::Error::Connection(_)),
+        "the abort must keep its own exit code, got {err:?}"
+    );
+    assert_eq!(err.exit_code(), 2);
+
+    let mailbox = outcome
+        .summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Mailbox")
+        .map(|(_, c)| c.clone())
+        .expect("the type that finished before the abort must still be reported");
+    assert_eq!(mailbox.fetched, 1);
+    assert!(
+        !outcome.summary.per_type.iter().any(|(t, _)| *t == "Email"),
+        "the type that aborted contributes no counts"
+    );
+    let _ = std::fs::remove_file(&archive);
+}
+
+fn seed_single_email(archive: &Path) {
+    let conn = db::init::open(archive).unwrap();
+    conn.execute(
+        "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
+        [],
+    )
+    .unwrap();
+    let blob = db::blobs::intern_blob(
+        &conn,
+        b"From: a@x\r\nSubject: hi\r\nMessage-ID: <m-9@h>\r\n\r\nbody",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
+         VALUES (?1,'2020-01-01T00:00:00Z','[1]','[\"$seen\"]')",
+        rusqlite::params![blob],
+    )
+    .unwrap();
+}
+
+fn mock_reconcile_for_single_email(server: &mut mockito::ServerGuard, base: &str, api: &str) {
+    server.mock("GET", "/").with_status(404).create();
+    server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(base))
+        .create();
+    server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",
+            {"accountId":"w","ids":["t1"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",
+            {"accountId":"w","ids":[]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
+            {"id":"t1","name":"Inbox","role":"inbox","parentId":null,
+             "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/query",
+            {"accountId":"w","ids":[]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+}
+
+fn run_export(archive: &Path, base: &str, max_retries: u32) -> sync::Summary {
+    sync::export::run(
+        CommonConfig {
+            archive: archive.to_path_buf(),
+            threads: 1,
+            dry_run: false,
+            max_retries,
+            allow_invalid_certs: false,
+            logger: Logger::from_flags(true, 0),
+        },
+        ExportConfig {
+            connect: ConnectConfig {
+                url: base.to_owned(),
+                auth: Auth::Basic {
+                    user: "u".into(),
+                    password: "p".into(),
+                },
+                account: AccountSelector::Id("w".into()),
+            },
+            objects: None,
+            prune: false,
+            yes: true,
+        },
+    )
+    .expect("export run")
+}
+
+fn email_counts(summary: &sync::Summary) -> sync::TypeCounts {
+    summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.clone())
+        .expect("email counts")
+}
+
+fn method_error_body(error_type: &str) -> String {
+    json!({"methodResponses":[["error",
+        {"type": error_type,
+         "description":"This server is temporarily unavailable. \
+                        Attempting this same operation later may succeed."},
+        "i"]]})
+    .to_string()
+}
+
+#[test]
+fn export_email_server_unavailable_is_retried_not_dropped() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    seed_single_email(&archive);
+    mock_reconcile_for_single_email(&mut server, &base, api);
+
+    let up = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UPLOADED"}).to_string())
+        .expect(1)
+        .create();
+    let failing = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/import".into()))
+        .with_body(method_error_body("serverUnavailable"))
+        .expect(2)
+        .create();
+    let succeeding = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/import".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/import",{"accountId":"w",
+                "created":{"e1":{"id":"E1","blobId":"UPLOADED","threadId":"T1","size":48}}},"i"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = run_export(&archive, &base, 3);
+    let email = email_counts(&summary);
+
+    failing.assert();
+    succeeding.assert();
+    up.assert();
+    assert_eq!(email.created, 1, "the message must survive a transient error");
+    assert_eq!(email.failed, 0, "a retried message is not a failure");
+    assert!(!summary.any_failed());
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_email_exhausted_method_retries_stay_per_message() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    seed_single_email(&archive);
+    mock_reconcile_for_single_email(&mut server, &base, api);
+
+    let _up = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UPLOADED"}).to_string())
+        .expect(1)
+        .create();
+    let failing = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/import".into()))
+        .with_body(method_error_body("serverUnavailable"))
+        .expect(3)
+        .create();
+
+    let summary = run_export(&archive, &base, 2);
+    let email = email_counts(&summary);
+
+    failing.assert();
+    assert_eq!(email.created, 0);
+    assert_eq!(
+        email.failed, 1,
+        "exhausting the retries stays a per-message failure, not a run abort"
+    );
+    assert!(summary.any_failed(), "the run must still exit 5");
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_email_fatal_method_error_is_not_retried() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    seed_single_email(&archive);
+    mock_reconcile_for_single_email(&mut server, &base, api);
+
+    let _up = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UPLOADED"}).to_string())
+        .expect(1)
+        .create();
+    let failing = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/import".into()))
+        .with_body(method_error_body("invalidArguments"))
+        .expect(1)
+        .create();
+
+    let summary = run_export(&archive, &base, 5);
+    let email = email_counts(&summary);
+
+    failing.assert();
+    assert_eq!(
+        email.failed, 1,
+        "a permanent method error must not consume retries"
+    );
+
     let _ = std::fs::remove_file(&archive);
 }

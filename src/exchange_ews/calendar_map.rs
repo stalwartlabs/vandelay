@@ -6,6 +6,9 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::exchange::jscalendar::{
+    drop_calendar_address_dependents, is_override_ignored, synthetic_attendee_address,
+};
 use crate::exchange_ews::parse::{CalendarItemRaw, RawAttendee, RawOccurrence};
 use crate::exchange_ews::recurrence::to_jscalendar_rule;
 use crate::exchange_ews::tz::resolve_to_iana;
@@ -181,6 +184,9 @@ fn build_event_map(raw: &CalendarItemRaw, iana: Option<&str>) -> Map<String, Val
         AttendeeRole::Resource,
     );
     if !participants.is_empty() {
+        if !event.contains_key("organizerCalendarAddress") {
+            drop_calendar_address_dependents(&mut participants);
+        }
         event.insert("participants".to_owned(), Value::Object(participants));
     }
     if let Some(rec) = raw.recurrence.as_ref()
@@ -227,13 +233,6 @@ fn build_event_map(raw: &CalendarItemRaw, iana: Option<&str>) -> Map<String, Val
         );
     }
     event
-}
-
-fn synthetic_attendee_address(identifier: &str) -> String {
-    format!(
-        "urn:x-vandelay:attendee:{}",
-        blake3::hash(identifier.as_bytes()).to_hex()
-    )
 }
 
 fn is_smtp_routing(routing_type: Option<&str>) -> bool {
@@ -320,21 +319,11 @@ fn add_attendees(
     }
 }
 
-const OVERRIDE_IGNORED_POINTERS: &[&str] = &[
-    "@type",
-    "uid",
-    "recurrenceRule",
-    "recurrenceOverrides",
-    "recurrenceId",
-    "recurrenceIdTimeZone",
-    "method",
-    "organizerCalendarAddress",
-    "privacy",
-    "prodId",
-    "relatedTo",
-    "created",
-    "updated",
-];
+const NOT_PATCHED_PER_OCCURRENCE: &[&str] = &["created", "updated"];
+
+fn is_override_excluded(key: &str) -> bool {
+    is_override_ignored(key) || NOT_PATCHED_PER_OCCURRENCE.contains(&key)
+}
 
 fn build_recurrence_overrides(
     base_event: &Map<String, Value>,
@@ -388,7 +377,7 @@ fn override_patch(
     let mut patch = Map::new();
     let inherited_start = Value::String(recurrence_id.to_owned());
     for (k, v) in occ_event {
-        if OVERRIDE_IGNORED_POINTERS.contains(&k.as_str()) {
+        if is_override_excluded(k) {
             continue;
         }
         let baseline = if k == "start" {
@@ -401,7 +390,7 @@ fn override_patch(
         }
     }
     for k in base_event.keys() {
-        if k == "start" || OVERRIDE_IGNORED_POINTERS.contains(&k.as_str()) {
+        if k == "start" || is_override_excluded(k) {
             continue;
         }
         if !occ_event.contains_key(k) {
@@ -710,6 +699,7 @@ mod tests {
             uid: Some("u".to_owned()),
             start: Some("2025-06-15T14:00:00Z".to_owned()),
             end: Some("2025-06-15T15:00:00Z".to_owned()),
+            organizer_smtp: Some("alice@example.com".to_owned()),
             required_attendees: vec![crate::exchange_ews::parse::RawAttendee {
                 email: None,
                 routing_type: None,
@@ -796,6 +786,7 @@ mod tests {
             uid: Some("u".to_owned()),
             start: Some("2025-06-15T14:00:00Z".to_owned()),
             end: Some("2025-06-15T15:00:00Z".to_owned()),
+            organizer_smtp: Some("alice@example.com".to_owned()),
             required_attendees: vec![RawAttendee {
                 email: Some("bob@example.com".to_owned()),
                 routing_type: Some("SMTP".to_owned()),
@@ -809,7 +800,7 @@ mod tests {
             .as_object()
             .unwrap()
             .values()
-            .next()
+            .find(|p| p["email"] == "bob@example.com")
             .unwrap();
         assert_eq!(att["calendarAddress"], "mailto:bob@example.com");
         assert_eq!(att["email"], "bob@example.com");
@@ -984,6 +975,7 @@ mod tests {
             uid: Some("uid-res".to_owned()),
             start: Some("2025-06-15T14:00:00Z".to_owned()),
             end: Some("2025-06-15T15:00:00Z".to_owned()),
+            organizer_smtp: Some("alice@example.com".to_owned()),
             resources: vec![crate::exchange_ews::parse::RawAttendee {
                 email: Some("room-7@x".to_owned()),
                 routing_type: None,
@@ -1011,6 +1003,7 @@ mod tests {
             uid: Some("uid-rsvp".to_owned()),
             start: Some("2025-06-15T14:00:00Z".to_owned()),
             end: Some("2025-06-15T15:00:00Z".to_owned()),
+            organizer_smtp: Some("alice@example.com".to_owned()),
             required_attendees: vec![crate::exchange_ews::parse::RawAttendee {
                 email: Some("bob@x".to_owned()),
                 routing_type: None,
@@ -1029,6 +1022,36 @@ mod tests {
         assert_eq!(bob["expectReply"], true);
         assert_eq!(bob["participationStatus"], "tentative");
         assert_eq!(bob["roles"]["required"], true);
+    }
+
+    #[test]
+    fn attendees_lose_calendar_addresses_when_no_organizer_is_known() {
+        let raw = CalendarItemRaw {
+            uid: Some("uid-no-organizer".to_owned()),
+            start: Some("2025-06-15T14:00:00Z".to_owned()),
+            end: Some("2025-06-15T15:00:00Z".to_owned()),
+            required_attendees: vec![crate::exchange_ews::parse::RawAttendee {
+                email: Some("bob@x".to_owned()),
+                routing_type: None,
+                name: Some("Bob".to_owned()),
+                response_type: Some("Accept".to_owned()),
+            }],
+            ..CalendarItemRaw::default()
+        };
+        let v = to_jscalendar(&raw).data;
+        assert!(v.get("organizerCalendarAddress").is_none());
+        let bob = v["participants"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|p| p["name"] == "Bob")
+            .unwrap();
+        for key in ["calendarAddress", "email", "roles", "participationStatus"] {
+            assert!(
+                bob.get(key).is_none(),
+                "{key} requires calendarAddress, which requires organizerCalendarAddress"
+            );
+        }
     }
 
     #[test]

@@ -9,9 +9,11 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
 use crate::jmap::error::JmapError;
-use crate::jmap::http::HttpClient;
+use crate::jmap::http::{HttpClient, format_retry_wait};
+use crate::jmap::retry::{Disposition, MethodCallKind, backoff_delay, jmap_method_disposition};
 use crate::jmap::session::Limits;
 use crate::jmap::wire::JmapId;
+use crate::logging::Logger;
 
 pub const URN_CORE: &str = "urn:ietf:params:jmap:core";
 
@@ -182,6 +184,43 @@ pub fn check_method_error(mr: &MethodCall) -> Result<(), JmapError> {
         error_type,
         description,
     })
+}
+
+fn method_error_is_retryable(err: &JmapError, kind: MethodCallKind) -> bool {
+    match err {
+        JmapError::Method { error_type, .. } => {
+            jmap_method_disposition(error_type, kind) == Disposition::Retryable
+        }
+        _ => false,
+    }
+}
+
+pub fn retry_method_call<T>(
+    client: &HttpClient,
+    kind: MethodCallKind,
+    logger: &Logger,
+    mut attempt: impl FnMut() -> Result<T, JmapError>,
+) -> Result<T, JmapError> {
+    let policy = *client.retry();
+    let mut tries = 0u32;
+    loop {
+        let err = match attempt() {
+            Ok(value) => return Ok(value),
+            Err(e) => e,
+        };
+        if tries >= policy.max_retries || !method_error_is_retryable(&err, kind) {
+            return Err(err);
+        }
+        tries += 1;
+        let delay = backoff_delay(&policy, tries);
+        client.rate_limit().cooldown().arm(delay);
+        logger.warn(&format!(
+            "{err}; retrying in {} ({tries}/{})",
+            format_retry_wait(delay),
+            policy.max_retries
+        ));
+        std::thread::sleep(delay);
+    }
 }
 
 fn ids_array(ids: &[JmapId]) -> Value {
@@ -720,7 +759,96 @@ fn decode_set(mr: &MethodCall) -> SetOutcome {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+    use crate::error::Error;
+    use crate::jmap::http::{Auth, RetryPolicy};
+
+    fn test_client(max_retries: u32) -> HttpClient {
+        HttpClient::new(
+            Auth::Bearer {
+                token: "t".to_owned(),
+            },
+            RetryPolicy::new(max_retries),
+            false,
+        )
+    }
+
+    fn method_error(error_type: &str) -> JmapError {
+        JmapError::Method {
+            call_id: "i".to_owned(),
+            error_type: error_type.to_owned(),
+            description: None,
+        }
+    }
+
+    fn drive(
+        max_retries: u32,
+        outcome: impl Fn(u32) -> Result<&'static str, JmapError>,
+    ) -> (Result<&'static str, JmapError>, u32) {
+        let client = test_client(max_retries);
+        let calls = Cell::new(0u32);
+        let result = retry_method_call(
+            &client,
+            MethodCallKind::SingleObjectWrite,
+            &Logger::from_flags(true, 0),
+            || {
+                calls.set(calls.get() + 1);
+                outcome(calls.get())
+            },
+        );
+        (result, calls.get())
+    }
+
+    #[test]
+    fn transient_method_error_is_retried_until_it_succeeds() {
+        let (result, calls) = drive(3, |n| {
+            if n < 3 {
+                Err(method_error("serverUnavailable"))
+            } else {
+                Ok("created")
+            }
+        });
+        assert_eq!(result.unwrap(), "created");
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn exhausting_the_budget_returns_the_original_method_error() {
+        let (result, calls) = drive(2, |_| Err(method_error("serverUnavailable")));
+        assert_eq!(calls, 3, "one initial attempt plus max_retries");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, JmapError::Method { error_type, .. } if error_type == "serverUnavailable"),
+            "the caller must still see the method error, not RetriesExhausted: {err}"
+        );
+        assert!(
+            !Error::from(err).aborts_run(),
+            "an exhausted method retry stays a per-unit failure"
+        );
+    }
+
+    #[test]
+    fn permanent_method_error_consumes_no_attempt() {
+        let (result, calls) = drive(5, |_| Err(method_error("invalidArguments")));
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn partial_fail_is_not_retried_for_a_write() {
+        let (result, calls) = drive(5, |_| Err(method_error("serverPartialFail")));
+        assert!(result.is_err());
+        assert_eq!(calls, 1, "retrying a partial write could duplicate it");
+    }
+
+    #[test]
+    fn non_method_errors_are_left_to_the_http_layer() {
+        let (result, calls) = drive(5, |_| Err(JmapError::Transport("reset".to_owned())));
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
 
     #[test]
     fn using_union_includes_core_and_dedups() {

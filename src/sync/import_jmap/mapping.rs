@@ -8,7 +8,7 @@ use indexmap::IndexMap;
 use rusqlite::{Connection, Row, params};
 use serde_json::{Map, Value};
 
-use crate::jmap::blob::{export_blob_ids, import_blob_ids};
+use crate::jmap::blob::{BlobWalkError, InlineShape, import_blob_ids, inline_blob_data_uris};
 use crate::jmap::error::JmapError;
 use crate::jmap::wire::JmapId;
 use crate::jmap::wire::address_book::AddressBook;
@@ -35,8 +35,8 @@ pub trait BlobIntern {
     fn intern(&mut self, jmap_blob_id: &str) -> Result<i64, JmapError>;
 }
 
-pub trait BlobUpload {
-    fn upload(&mut self, local_id: i64) -> Result<JmapId, JmapError>;
+pub trait BlobBytes {
+    fn bytes(&self, local_id: i64) -> Result<Vec<u8>, JmapError>;
 }
 
 fn translate_in(
@@ -662,10 +662,10 @@ pub fn contact_card_to_wire(
     address_book_ids: &str,
     data: &str,
     resolver: &impl TargetResolver,
-    blobs: &mut impl BlobUpload,
+    blobs: &impl BlobBytes,
 ) -> Result<Value, JmapError> {
     let mut value: Value = serde_json::from_str(data)?;
-    restore_blobs_in(&mut value, blobs)?;
+    inline_blobs_in(&mut value, InlineShape::JsContactResource, blobs)?;
     let locals = parse_local_id_array(address_book_ids)?;
     let abids = translate_out(&locals, ObjectType::AddressBook, resolver)?;
     if let Value::Object(map) = &mut value {
@@ -681,10 +681,10 @@ pub fn calendar_event_to_wire(
     use_default_alerts: bool,
     data: &str,
     resolver: &impl TargetResolver,
-    blobs: &mut impl BlobUpload,
+    blobs: &impl BlobBytes,
 ) -> Result<Value, JmapError> {
     let mut value: Value = serde_json::from_str(data)?;
-    restore_blobs_in(&mut value, blobs)?;
+    inline_blobs_in(&mut value, InlineShape::JsCalendarLink, blobs)?;
     let locals = parse_local_id_array(calendar_ids)?;
     let calids = translate_out(&locals, ObjectType::Calendar, resolver)?;
     if let Value::Object(map) = &mut value {
@@ -725,21 +725,20 @@ fn take_string(value: &mut Value, key: &str) -> Option<String> {
 
 fn rewrite_blobs_in(data: &mut Value, blobs: &mut impl BlobIntern) -> Result<(), JmapError> {
     import_blob_ids(data, |jmap_blob_id| {
-        blobs
-            .intern(jmap_blob_id)
-            .map_err(|e| crate::jmap::blob::BlobWalkError::Resolver(e.to_string()))
+        blobs.intern(jmap_blob_id).map_err(BlobWalkError::resolver)
     })
-    .map_err(JmapError::from)
+    .map_err(BlobWalkError::into_source)
 }
 
-fn restore_blobs_in(data: &mut Value, blobs: &mut impl BlobUpload) -> Result<(), JmapError> {
-    export_blob_ids(data, |local_id| {
-        blobs
-            .upload(local_id)
-            .map(|id| id.0)
-            .map_err(|e| crate::jmap::blob::BlobWalkError::Resolver(e.to_string()))
+fn inline_blobs_in(
+    data: &mut Value,
+    shape: InlineShape,
+    blobs: &impl BlobBytes,
+) -> Result<(), JmapError> {
+    inline_blob_data_uris(data, shape, |local_id| {
+        blobs.bytes(local_id).map_err(BlobWalkError::resolver)
     })
-    .map_err(JmapError::from)
+    .map_err(BlobWalkError::into_source)
 }
 
 fn opt_json<T: serde::Serialize>(value: &Option<T>) -> Result<Option<String>, JmapError> {
@@ -904,9 +903,35 @@ mod tests {
             Ok(42)
         }
     }
-    impl BlobUpload for FakeBlobs {
-        fn upload(&mut self, local_id: i64) -> Result<JmapId, JmapError> {
-            Ok(JmapId(format!("T{local_id}")))
+    impl BlobBytes for FakeBlobs {
+        fn bytes(&self, local_id: i64) -> Result<Vec<u8>, JmapError> {
+            Ok(format!("payload-{local_id}").into_bytes())
+        }
+    }
+
+    fn decode_data_uri(value: &Value, media_type: &str) -> Vec<u8> {
+        use base64::Engine;
+        let uri = value.as_str().unwrap_or_else(|| panic!("{value} is a URI"));
+        let prefix = format!("data:{media_type};base64,");
+        let payload = uri
+            .strip_prefix(&prefix)
+            .unwrap_or_else(|| panic!("{uri} does not start with {prefix}"));
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .expect("base64 payload")
+    }
+
+    fn assert_no_blob_id(value: &Value) {
+        match value {
+            Value::Object(map) => {
+                assert!(map.get("blobId").is_none(), "blobId present in {value}");
+                assert!(map.get("@blob").is_none(), "@blob present in {value}");
+                for child in map.values() {
+                    assert_no_blob_id(child);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(assert_no_blob_id),
+            _ => {}
         }
     }
 
@@ -1032,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn contact_card_strips_uid_and_rewrites_blob() {
+    fn contact_card_strips_uid_and_inlines_media_as_data_uri() {
         let c = mem();
         let res = MapResolver {
             to_local: HashMap::from([((ObjectType::AddressBook, "AB".to_owned()), 1)]),
@@ -1043,7 +1068,10 @@ mod tests {
             "addressBookIds": { "AB": true },
             "uid": "urn:uuid:42",
             "name": { "full": "Jane" },
-            "photos": { "p1": { "blobId": "PB", "mediaType": "image/png" } }
+            "media": { "photo": {
+                "@type": "Media", "kind": "photo",
+                "blobId": "PB", "mediaType": "image/png"
+            } }
         }))
         .unwrap();
         let mut blobs = FakeBlobs;
@@ -1058,14 +1086,127 @@ mod tests {
         assert_eq!(uid, "urn:uuid:42");
         let stored: Value = serde_json::from_str(&data).unwrap();
         assert!(stored.get("uid").is_none());
-        assert_eq!(stored["photos"]["p1"]["@blob"], Value::from(42));
+        assert_eq!(stored["media"]["photo"]["@blob"], Value::from(42));
 
-        let mut up = FakeBlobs;
-        let wire = contact_card_to_wire(&uid, &abids, &data, &res, &mut up).unwrap();
+        let up = FakeBlobs;
+        let wire = contact_card_to_wire(&uid, &abids, &data, &res, &up).unwrap();
         assert_eq!(wire["uid"], Value::from("urn:uuid:42"));
         assert_eq!(wire["addressBookIds"]["TAB"], Value::Bool(true));
-        assert_eq!(wire["photos"]["p1"]["blobId"], Value::from("T42"));
-        assert!(wire["photos"]["p1"].get("@blob").is_none());
+        assert_eq!(
+            decode_data_uri(&wire["media"]["photo"]["uri"], "image/png"),
+            b"payload-42"
+        );
+        assert_eq!(
+            wire["media"]["photo"]["mediaType"],
+            Value::from("image/png")
+        );
+        assert!(wire["media"]["photo"].get("href").is_none());
+        assert_no_blob_id(&wire);
+    }
+
+    #[test]
+    fn calendar_event_inlines_link_enclosure_as_data_uri() {
+        let c = mem();
+        let res = MapResolver {
+            to_local: HashMap::from([((ObjectType::Calendar, "CAL".to_owned()), 5)]),
+            to_target: HashMap::from([((ObjectType::Calendar, 5), "TCAL".to_owned())]),
+        };
+        let ev: CalendarEvent = serde_json::from_value(serde_json::json!({
+            "id": "EV1",
+            "calendarIds": { "CAL": true },
+            "uid": "ev-with-enclosure",
+            "title": "Review",
+            "@type": "Event",
+            "links": { "1": {
+                "@type": "Link", "rel": "enclosure",
+                "blobId": "AB", "contentType": "text/plain", "title": "agenda.txt"
+            } }
+        }))
+        .unwrap();
+        let mut blobs = FakeBlobs;
+        let local = insert_calendar_event(&c, &ev, &res, &mut blobs).unwrap();
+        let (cal, dr, ud, data): (String, i64, i64, String) = c
+            .query_row(
+                &format!("{CALENDAR_EVENT_SELECT} AND id = ?1"),
+                params![local],
+                |r| Ok((r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        let stored: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(stored["links"]["1"]["@blob"], Value::from(42));
+
+        let up = FakeBlobs;
+        let wire = calendar_event_to_wire(&cal, dr != 0, ud != 0, &data, &res, &up).unwrap();
+        assert_eq!(
+            decode_data_uri(&wire["links"]["1"]["href"], "text/plain"),
+            b"payload-42"
+        );
+        assert_eq!(wire["links"]["1"]["contentType"], Value::from("text/plain"));
+        assert_eq!(wire["links"]["1"]["rel"], Value::from("enclosure"));
+        assert!(wire["links"]["1"].get("uri").is_none());
+        assert_no_blob_id(&wire);
+    }
+
+    #[test]
+    fn contact_card_media_without_media_type_defaults_to_octet_stream() {
+        let c = mem();
+        let res = MapResolver {
+            to_local: HashMap::from([((ObjectType::AddressBook, "AB".to_owned()), 1)]),
+            to_target: HashMap::from([((ObjectType::AddressBook, 1), "TAB".to_owned())]),
+        };
+        c.execute(
+            "INSERT INTO contact_cards (id,uid,address_book_ids,data)
+             VALUES (1,'u-1','[1]',?1)",
+            params![
+                serde_json::json!({ "@type": "Card", "media": { "photo": { "@blob": 9 } } })
+                    .to_string()
+            ],
+        )
+        .unwrap();
+        let (uid, abids, data): (String, String, String) = c
+            .query_row(&format!("{CONTACT_CARD_SELECT} WHERE id = 1"), [], |r| {
+                Ok((r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap();
+        let up = FakeBlobs;
+        let wire = contact_card_to_wire(&uid, &abids, &data, &res, &up).unwrap();
+        assert_eq!(
+            decode_data_uri(&wire["media"]["photo"]["uri"], "application/octet-stream"),
+            b"payload-9"
+        );
+        assert_no_blob_id(&wire);
+    }
+
+    #[test]
+    fn an_archive_read_failure_while_inlining_is_an_archive_error_not_a_unit_failure() {
+        struct BrokenBlobs;
+        impl BlobBytes for BrokenBlobs {
+            fn bytes(&self, _local_id: i64) -> Result<Vec<u8>, JmapError> {
+                Err(JmapError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+            }
+        }
+        let res = MapResolver {
+            to_local: HashMap::new(),
+            to_target: HashMap::from([
+                ((ObjectType::AddressBook, 1), "TAB".to_owned()),
+                ((ObjectType::Calendar, 1), "TCAL".to_owned()),
+            ]),
+        };
+        let card = serde_json::json!({ "@type": "Card", "media": { "photo": { "@blob": 9 } } })
+            .to_string();
+        let event =
+            serde_json::json!({ "@type": "Event", "links": { "1": { "@blob": 9 } } }).to_string();
+        let failures = [
+            contact_card_to_wire("u-1", "[1]", &card, &res, &BrokenBlobs).expect_err("card"),
+            calendar_event_to_wire("[1]", false, false, &event, &res, &BrokenBlobs)
+                .expect_err("event"),
+        ];
+        for err in failures {
+            assert!(matches!(err, JmapError::Sqlite(_)), "{err:?}");
+            let mapped = crate::error::Error::from(err);
+            assert!(mapped.aborts_run(), "{mapped} must abort the run");
+            assert_eq!(mapped.exit_code(), 7);
+        }
     }
 
     #[test]
@@ -1103,8 +1244,8 @@ mod tests {
         assert!(stored.get("calendarIds").is_none());
         assert_eq!(stored["title"], Value::from("Sprint"));
 
-        let mut up = FakeBlobs;
-        let wire = calendar_event_to_wire(&cal, dr != 0, ud != 0, &data, &res, &mut up).unwrap();
+        let up = FakeBlobs;
+        let wire = calendar_event_to_wire(&cal, dr != 0, ud != 0, &data, &res, &up).unwrap();
         assert_eq!(wire["calendarIds"]["TCAL"], Value::Bool(true));
         assert_eq!(wire["isDraft"], Value::Bool(true));
         assert_eq!(wire["title"], Value::from("Sprint"));

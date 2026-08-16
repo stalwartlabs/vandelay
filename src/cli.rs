@@ -12,7 +12,7 @@ use regex::Regex;
 use crate::error::Error;
 use crate::exchange_ews::oauth::OAuthFlow;
 use crate::exchange_ews::types::MailboxKind;
-use crate::exchange_graph::types::{EventBodyFormat, MailboxKind as GraphMailboxKind};
+use crate::exchange_graph::types::{EventBodyFormat, MailboxKind as GraphMailboxKind, Surfaces};
 use crate::inspect::InspectConfig;
 use crate::jmap::account::AccountSelector;
 use crate::jmap::http::Auth;
@@ -1132,7 +1132,7 @@ pub struct ExchangeGraphImportArgs {
     #[arg(
         long,
         value_name = "LIST",
-        help = "Comma-separated surface list (mail,calendar,contacts; default all)"
+        help = "Comma-separated surface list: mail | calendar | contacts (default: all three)"
     )]
     objects: Option<String>,
 
@@ -1203,11 +1203,12 @@ fn resolve_exchange_graph_import(args: ExchangeGraphImportArgs) -> Result<Action
         args.client_id.as_deref(),
         &args.tenant,
     )?;
-    let objects = args
+    let surfaces = args
         .objects
         .as_deref()
-        .map(crate::types::parse_object_list)
-        .transpose()?;
+        .map(Surfaces::parse_list)
+        .transpose()?
+        .unwrap_or_default();
     let top = args.top.clamp(1, 1000);
     let graph_connections = args
         .graph_connections
@@ -1220,7 +1221,7 @@ fn resolve_exchange_graph_import(args: ExchangeGraphImportArgs) -> Result<Action
             api_base: args.api_base,
             user_target: args.user,
             mailbox_kind,
-            objects,
+            surfaces,
             event_body_format,
             graph_connections,
             top,
@@ -1360,5 +1361,58 @@ mod tests {
         let bearer: Option<String> = Some("t".to_owned());
         let auth = resolve_auth(None, None, Some(&bearer)).unwrap();
         assert!(matches!(auth, Auth::Bearer { token } if token == "t"));
+    }
+
+    fn graph_config(objects: &[&str]) -> Result<GraphImportConfig, Error> {
+        let mut argv = vec![
+            "vandelay",
+            "import",
+            "exchange-graph",
+            "--access-token",
+            "tok",
+        ];
+        argv.extend_from_slice(objects);
+        argv.push("archive.sqlite");
+        let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("clap rejected args: {e}"));
+        match cli.resolve()? {
+            Action::ImportExchangeGraph(_, config) => Ok(config),
+            _ => panic!("expected ImportExchangeGraph"),
+        }
+    }
+
+    #[test]
+    fn graph_objects_contacts_selects_only_contacts() {
+        let _g = lock();
+        let config = graph_config(&["--objects", "contacts"]).unwrap();
+        assert_eq!(
+            config.surfaces,
+            Surfaces {
+                mail: false,
+                calendar: false,
+                contacts: true
+            }
+        );
+    }
+
+    #[test]
+    fn graph_objects_absent_selects_every_surface() {
+        let _g = lock();
+        let config = graph_config(&[]).unwrap();
+        assert_eq!(config.surfaces, Surfaces::ALL);
+    }
+
+    #[test]
+    fn graph_objects_rejects_jmap_type_names() {
+        let _g = lock();
+        match graph_config(&["--objects", "contactcard"]) {
+            Err(Error::Usage(m)) => {
+                assert!(m.contains("unknown surface: contactcard"), "msg was: {m}");
+                assert!(
+                    m.contains("valid: mail, calendar, contacts"),
+                    "msg was: {m}"
+                );
+            }
+            other => panic!("expected Usage error, got {:?}", other.map(|_| ())),
+        }
     }
 }

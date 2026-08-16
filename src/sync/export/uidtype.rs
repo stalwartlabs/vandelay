@@ -5,10 +5,11 @@
  */
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
 use serde_json::Value;
 
-use super::common::{create_batch, jid, retry_if_blob_missing, target_query_get};
+use super::common::{create_batch, jid, target_query_get};
 use super::{Maps, Net, Plan, Uploader};
 use crate::error::Error;
 use crate::logging::Logger;
@@ -21,6 +22,15 @@ use crate::types::ObjectType;
 
 fn target_uid(v: &Value) -> Option<String> {
     v.get("uid").and_then(Value::as_str).map(str::to_owned)
+}
+
+fn describe(ty: ObjectType, local: i64, uid: &str) -> String {
+    let mut out = String::new();
+    let _ = write!(out, "{} local {local}", ty.jmap_name());
+    if !uid.is_empty() {
+        let _ = write!(out, " (uid {uid})");
+    }
+    out
 }
 
 pub fn reconcile(
@@ -66,7 +76,7 @@ pub fn reconcile(
     };
 
     let mut matched_uids: HashSet<String> = HashSet::new();
-    let mut uploader = Uploader::new(net, &ctx.conn);
+    let blobs = Uploader::new(net, &ctx.conn);
     for (local, uid) in &rows {
         if let Some(tid) = by_uid.get(uid) {
             maps.insert(ty, *local, crate::jmap::wire::JmapId(tid.clone()));
@@ -75,28 +85,30 @@ pub fn reconcile(
             continue;
         }
         let cid = format!("c{local}");
-        let _ = uploader.take_touched();
-        let wire = match build_wire(ctx, ty, *local, maps, &mut uploader) {
+        let wire = match build_wire(ctx, ty, *local, maps, &blobs) {
             Ok(w) => w,
+            Err(e) if e.aborts_run() => return Err(e),
             Err(e) => {
-                logger.warn(&format!("{} local {local} skipped: {e}", ty.jmap_name()));
+                logger.warn(&format!("{} skipped: {e}", describe(ty, *local, uid)));
                 counts.failed += 1;
                 continue;
             }
         };
-        let touched = uploader.take_touched();
-        let outcome = create_batch(net, ty, vec![(cid.clone(), wire)]).map_err(Error::from)?;
-        let outcome =
-            match retry_if_blob_missing(net, ty, &cid, &mut uploader, touched, outcome, |up| {
-                build_wire(ctx, ty, *local, maps, up)
-            }) {
-                Ok(o) => o,
-                Err(e) => {
-                    logger.warn(&format!("{} local {local} skipped: {e}", ty.jmap_name()));
-                    counts.failed += 1;
-                    continue;
+        let outcome = match create_batch(net, ty, vec![(cid.clone(), wire)]) {
+            Ok(o) => o,
+            Err(e) => {
+                let mapped = Error::from(e);
+                if mapped.aborts_run() {
+                    return Err(mapped);
                 }
-            };
+                logger.warn(&format!(
+                    "{} not created: {mapped}",
+                    describe(ty, *local, uid)
+                ));
+                counts.failed += 1;
+                continue;
+            }
+        };
         for (cid, v) in &outcome.created {
             if let Some(parsed) = cid.strip_prefix('c').and_then(|s| s.parse::<i64>().ok())
                 && let Some(id) = jid(v)
@@ -136,7 +148,7 @@ fn build_wire(
     ty: ObjectType,
     local: i64,
     maps: &Maps,
-    up: &mut Uploader<'_>,
+    blobs: &Uploader<'_>,
 ) -> Result<Value, Error> {
     if ty == ObjectType::ContactCard {
         let (uid, abids, data): (String, String, String) = ctx
@@ -147,7 +159,7 @@ fn build_wire(
                 |r| Ok((r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .map_err(|e| Error::Partial(e.to_string()))?;
-        contact_card_to_wire(&uid, &abids, &data, maps, up).map_err(Error::from)
+        contact_card_to_wire(&uid, &abids, &data, maps, blobs).map_err(Error::from)
     } else {
         let (cal, dr, ud, data): (String, i64, i64, String) = ctx
             .conn
@@ -157,6 +169,6 @@ fn build_wire(
                 |r| Ok((r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .map_err(|e| Error::Partial(e.to_string()))?;
-        calendar_event_to_wire(&cal, dr != 0, ud != 0, &data, maps, up).map_err(Error::from)
+        calendar_event_to_wire(&cal, dr != 0, ud != 0, &data, maps, blobs).map_err(Error::from)
     }
 }

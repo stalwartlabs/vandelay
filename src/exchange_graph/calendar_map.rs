@@ -6,6 +6,7 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::exchange::jscalendar::{drop_calendar_address_dependents, synthetic_attendee_address};
 use crate::exchange::tz::resolve_to_iana;
 use crate::exchange_graph::error::GraphError;
 use crate::exchange_graph::recurrence::convert_patterned_recurrence_rule;
@@ -242,13 +243,8 @@ pub fn convert_event(
         .get("organizer")
         .and_then(|o| o.get("emailAddress"))
     {
-        if let Some(addr) = org.get("address").and_then(Value::as_str)
-            && !addr.is_empty()
-        {
-            card.insert(
-                "organizerCalendarAddress".to_owned(),
-                Value::from(format!("mailto:{addr}")),
-            );
+        if let Some((cal_addr, _)) = resolve_calendar_address(org) {
+            card.insert("organizerCalendarAddress".to_owned(), Value::from(cal_addr));
         }
         let p = build_participant(org, &["owner", "chair"], None, None);
         participants.push(("organizer".to_owned(), p));
@@ -275,7 +271,10 @@ pub fn convert_event(
         }
     }
     if !participants.is_empty() {
-        let map: Map<String, Value> = participants.into_iter().collect();
+        let mut map: Map<String, Value> = participants.into_iter().collect();
+        if !card.contains_key("organizerCalendarAddress") {
+            drop_calendar_address_dependents(&mut map);
+        }
         card.insert("participants".to_owned(), Value::Object(map));
     }
 
@@ -346,6 +345,23 @@ fn extract_local_datetime(slot: Option<&Value>) -> Option<String> {
     Some(dt.to_owned())
 }
 
+fn non_empty(email: &Value, key: &str) -> Option<String> {
+    email
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+fn resolve_calendar_address(email: &Value) -> Option<(String, Option<String>)> {
+    if let Some(addr) = non_empty(email, "address") {
+        let cal_addr = format!("mailto:{addr}");
+        return Some((cal_addr, Some(addr)));
+    }
+    non_empty(email, "name").map(|name| (synthetic_attendee_address(&name), None))
+}
+
 fn build_participant(
     email: &Value,
     roles: &[&str],
@@ -354,31 +370,28 @@ fn build_participant(
 ) -> Value {
     let mut map = Map::new();
     map.insert("@type".to_owned(), Value::from("Participant"));
-    if let Some(addr) = email.get("address").and_then(Value::as_str) {
-        map.insert(
-            "calendarAddress".to_owned(),
-            Value::from(format!("mailto:{addr}")),
-        );
-        map.insert("email".to_owned(), Value::from(addr.to_owned()));
+    if let Some(name) = non_empty(email, "name") {
+        map.insert("name".to_owned(), Value::from(name));
     }
-    if let Some(name) = email.get("name").and_then(Value::as_str)
-        && !name.is_empty()
-    {
-        map.insert("name".to_owned(), Value::from(name.to_owned()));
-    }
-    let role_map: Map<String, Value> = roles
-        .iter()
-        .map(|r| ((*r).to_owned(), Value::Bool(true)))
-        .collect();
-    map.insert("roles".to_owned(), Value::Object(role_map));
-    if let Some(status) = participation_status {
-        map.insert(
-            "participationStatus".to_owned(),
-            Value::from(status.to_owned()),
-        );
-    }
-    if let Some(b) = expect_reply {
-        map.insert("expectReply".to_owned(), Value::Bool(b));
+    if let Some((cal_addr, smtp)) = resolve_calendar_address(email) {
+        map.insert("calendarAddress".to_owned(), Value::from(cal_addr));
+        if let Some(addr) = smtp {
+            map.insert("email".to_owned(), Value::from(addr));
+        }
+        let role_map: Map<String, Value> = roles
+            .iter()
+            .map(|r| ((*r).to_owned(), Value::Bool(true)))
+            .collect();
+        map.insert("roles".to_owned(), Value::Object(role_map));
+        if let Some(status) = participation_status {
+            map.insert(
+                "participationStatus".to_owned(),
+                Value::from(status.to_owned()),
+            );
+        }
+        if let Some(b) = expect_reply {
+            map.insert("expectReply".to_owned(), Value::Bool(b));
+        }
     }
     Value::Object(map)
 }
@@ -648,6 +661,91 @@ mod tests {
         assert!(participants.contains_key("att-1"));
         assert_eq!(participants["att-1"]["email"], "bob@x.com");
         assert_eq!(participants["att-1"]["roles"]["required"], true);
+    }
+
+    #[test]
+    fn a_name_only_attendee_gets_a_stable_synthetic_calendar_address() {
+        let mut v = sample();
+        v["attendees"] = json!([
+            {
+                "emailAddress": {"name": "Room 4"},
+                "type": "resource",
+                "status": {"response": "accepted"}
+            }
+        ]);
+        let conv = convert_event(&v, None).unwrap();
+        let p = &conv.data["participants"]["att-1"];
+        let addr = p["calendarAddress"].as_str().unwrap();
+        assert!(
+            addr.starts_with("urn:x-vandelay:attendee:"),
+            "a name-only attendee needs a synthetic calendarAddress, got {addr}"
+        );
+        assert!(
+            p.get("email").is_none(),
+            "there is no SMTP address to report as email"
+        );
+        assert_eq!(p["participationStatus"], "accepted");
+        assert_eq!(p["roles"]["informational"], true);
+        assert_eq!(
+            addr,
+            convert_event(&v, None).unwrap().data["participants"]["att-1"]["calendarAddress"]
+        );
+    }
+
+    #[test]
+    fn an_unidentifiable_attendee_keeps_no_calendar_address_dependent_property() {
+        let mut v = sample();
+        v["attendees"] = json!([
+            {"emailAddress": {}, "type": "required", "status": {"response": "accepted"}}
+        ]);
+        let conv = convert_event(&v, None).unwrap();
+        let p = &conv.data["participants"]["att-1"];
+        for key in [
+            "calendarAddress",
+            "email",
+            "roles",
+            "participationStatus",
+            "expectReply",
+        ] {
+            assert!(
+                p.get(key).is_none(),
+                "{key} requires calendarAddress (jscalendarbis 3.4.6)"
+            );
+        }
+        assert_eq!(p["@type"], "Participant");
+    }
+
+    #[test]
+    fn an_organizer_without_an_address_still_yields_a_calendar_address() {
+        let mut v = sample();
+        v["organizer"] = json!({"emailAddress": {"name": "Alice Example"}});
+        let conv = convert_event(&v, None).unwrap();
+        let organizer_address = conv.data["organizerCalendarAddress"].as_str().unwrap();
+        assert!(organizer_address.starts_with("urn:x-vandelay:attendee:"));
+        assert_eq!(
+            conv.data["participants"]["organizer"]["calendarAddress"],
+            organizer_address
+        );
+    }
+
+    #[test]
+    fn participants_drop_calendar_addresses_when_no_organizer_is_known() {
+        let mut v = sample();
+        v.as_object_mut().unwrap().remove("organizer");
+        let conv = convert_event(&v, None).unwrap();
+        assert!(
+            conv.data.get("organizerCalendarAddress").is_none(),
+            "no organizer is derivable from the source event"
+        );
+        let participants = conv.data["participants"].as_object().unwrap();
+        assert!(!participants.is_empty());
+        for (key, participant) in participants {
+            assert!(
+                participant.get("calendarAddress").is_none(),
+                "{key} may not carry a calendarAddress without organizerCalendarAddress"
+            );
+            assert!(participant.get("roles").is_none(), "{key} kept roles");
+        }
     }
 
     #[test]

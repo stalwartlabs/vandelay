@@ -20,7 +20,7 @@ use crate::jmap::request::{Request, SetRequest, get_all, get_objects, query_all_
 use crate::jmap::session::{Limits, Session};
 use crate::jmap::wire::JmapId;
 use crate::logging::{LEVEL_DEFAULT, Logger};
-use crate::sync::import_jmap::mapping::{BlobUpload, TargetResolver};
+use crate::sync::import_jmap::mapping::{BlobBytes, TargetResolver};
 use crate::sync::{CommonConfig, Context, ExportConfig, Summary, TypeCounts};
 use crate::types::ObjectType;
 
@@ -110,9 +110,10 @@ impl<'a> Uploader<'a> {
     }
 }
 
-impl BlobUpload for Uploader<'_> {
-    fn upload(&mut self, local_id: i64) -> Result<JmapId, JmapError> {
-        self.upload_with(local_id, "application/octet-stream")
+impl BlobBytes for Uploader<'_> {
+    fn bytes(&self, local_id: i64) -> Result<Vec<u8>, JmapError> {
+        db::blobs::blob_bytes(self.conn, local_id)?
+            .ok_or_else(|| JmapError::malformed(format!("blob local id {local_id} missing")))
     }
 }
 
@@ -172,6 +173,7 @@ pub fn run(common: CommonConfig, config: ExportConfig) -> Result<Summary, Error>
         );
         let plan = match res {
             Ok(p) => p,
+            Err(e) if e.aborts_run() => return Err(e),
             Err(e) => {
                 logger.warn(&format!("type {} aborted: {e}", ty.jmap_name()));
                 counts.failed += 1;

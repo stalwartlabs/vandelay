@@ -20,6 +20,7 @@ use vandelay::exchange_graph::oauth::{
 };
 use vandelay::exchange_graph::recurrence::convert_patterned_recurrence;
 use vandelay::exchange_graph::retry::{HttpClass, classify_http_status};
+use vandelay::exchange_graph::types::Surfaces;
 use vandelay::jmap::http::RetryPolicy;
 
 static INIT: Once = Once::new();
@@ -584,7 +585,7 @@ fn integration_dry_run_against_mock_server_lists_three_surfaces() {
         api_base: base.clone(),
         user_target: None,
         mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        objects: None,
+        surfaces: Surfaces::ALL,
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
@@ -693,10 +694,7 @@ fn integration_full_run_mail_only_imports_mime_via_value() {
         api_base: server.url(),
         user_target: None,
         mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        objects: Some(vec![
-            vandelay::types::ObjectType::Mailbox,
-            vandelay::types::ObjectType::Email,
-        ]),
+        surfaces: surfaces("mail"),
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
@@ -792,10 +790,7 @@ fn integration_duplicate_message_id_does_not_abort_run() {
         api_base: server.url(),
         user_target: None,
         mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        objects: Some(vec![
-            vandelay::types::ObjectType::Mailbox,
-            vandelay::types::ObjectType::Email,
-        ]),
+        surfaces: surfaces("mail"),
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
@@ -884,10 +879,7 @@ fn integration_full_run_is_convergent_on_second_invocation() {
         api_base: api_base.clone(),
         user_target: None,
         mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        objects: Some(vec![
-            vandelay::types::ObjectType::Mailbox,
-            vandelay::types::ObjectType::Email,
-        ]),
+        surfaces: surfaces("mail"),
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
@@ -966,7 +958,7 @@ fn source_change_protection_refuses_a_different_account() {
         api_base: server.url(),
         user_target: None,
         mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        objects: None,
+        surfaces: Surfaces::ALL,
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
@@ -1016,10 +1008,14 @@ fn make_common(archive: std::path::PathBuf) -> vandelay::sync::CommonConfig {
     }
 }
 
+fn surfaces(list: &str) -> vandelay::exchange_graph::types::Surfaces {
+    vandelay::exchange_graph::types::Surfaces::parse_list(list).unwrap()
+}
+
 fn make_config(
     api_base: String,
     user_target: Option<String>,
-    objects: Option<Vec<vandelay::types::ObjectType>>,
+    surfaces: vandelay::exchange_graph::types::Surfaces,
 ) -> vandelay::sync::import_exchange_graph::GraphImportConfig {
     vandelay::sync::import_exchange_graph::GraphImportConfig {
         auth: vandelay::sync::import_exchange_graph::GraphAuth::PreAcquired {
@@ -1028,7 +1024,7 @@ fn make_config(
         api_base,
         user_target,
         mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        objects,
+        surfaces,
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
@@ -1094,7 +1090,7 @@ fn users_upn_routes_through_users_segment_not_me() {
     };
     let summary = vandelay::sync::import_exchange_graph::run(
         common,
-        make_config(base, Some("alice@x.com".to_owned()), None),
+        make_config(base, Some("alice@x.com".to_owned()), Surfaces::ALL),
     )
     .unwrap();
     let mailbox = summary
@@ -1193,14 +1189,7 @@ fn series_master_with_exception_merges_into_recurrence_overrides() {
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
     let summary = vandelay::sync::import_exchange_graph::run(
         make_common(archive.clone()),
-        make_config(
-            base,
-            None,
-            Some(vec![
-                vandelay::types::ObjectType::Calendar,
-                vandelay::types::ObjectType::CalendarEvent,
-            ]),
-        ),
+        make_config(base, None, surfaces("calendar")),
     )
     .unwrap();
     let events = summary
@@ -1227,6 +1216,26 @@ fn series_master_with_exception_merges_into_recurrence_overrides() {
     );
     let override_data = &overrides["2026-05-11T15:00:00"];
     assert_eq!(override_data["title"], "Moved sync");
+    assert_eq!(override_data["start"], "2026-05-11T16:00:00");
+    for ignored in [
+        "@type",
+        "uid",
+        "method",
+        "organizerCalendarAddress",
+        "privacy",
+        "prodId",
+        "recurrenceId",
+        "recurrenceIdTimeZone",
+        "sentBy",
+        "recurrenceRule",
+        "recurrenceOverrides",
+        "relatedTo",
+    ] {
+        assert!(
+            override_data.get(ignored).is_none(),
+            "{ignored} must not appear in a PatchObject (jscalendarbis 3.3.4); got {override_data}"
+        );
+    }
 }
 
 #[test]
@@ -1285,14 +1294,7 @@ fn occurrence_event_is_skipped_no_row_no_id_mapping() {
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
     let summary = vandelay::sync::import_exchange_graph::run(
         make_common(archive.clone()),
-        make_config(
-            base,
-            None,
-            Some(vec![
-                vandelay::types::ObjectType::Calendar,
-                vandelay::types::ObjectType::CalendarEvent,
-            ]),
-        ),
+        make_config(base, None, surfaces("calendar")),
     )
     .unwrap();
     let events = summary
@@ -1372,14 +1374,7 @@ fn hidden_mail_folder_has_is_subscribed_zero() {
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
     let _ = vandelay::sync::import_exchange_graph::run(
         make_common(archive.clone()),
-        make_config(
-            base,
-            None,
-            Some(vec![
-                vandelay::types::ObjectType::Mailbox,
-                vandelay::types::ObjectType::Email,
-            ]),
-        ),
+        make_config(base, None, surfaces("mail")),
     )
     .unwrap();
     let conn = vandelay::db::init::open(&archive).unwrap();
@@ -1473,14 +1468,7 @@ fn well_known_folder_probes_assign_jmap_roles() {
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
     let _ = vandelay::sync::import_exchange_graph::run(
         make_common(archive.clone()),
-        make_config(
-            base,
-            None,
-            Some(vec![
-                vandelay::types::ObjectType::Mailbox,
-                vandelay::types::ObjectType::Email,
-            ]),
-        ),
+        make_config(base, None, surfaces("mail")),
     )
     .unwrap();
     let conn = vandelay::db::init::open(&archive).unwrap();
@@ -1557,14 +1545,7 @@ SGVsbG8=\r\n--X--\r\n";
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
     let summary = vandelay::sync::import_exchange_graph::run(
         make_common(archive),
-        make_config(
-            base,
-            None,
-            Some(vec![
-                vandelay::types::ObjectType::Mailbox,
-                vandelay::types::ObjectType::Email,
-            ]),
-        ),
+        make_config(base, None, surfaces("mail")),
     )
     .unwrap();
     let emails = summary
@@ -1652,14 +1633,7 @@ fn event_get_carries_outlook_timezone_and_body_content_type_prefer() {
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
     let _ = vandelay::sync::import_exchange_graph::run(
         make_common(archive),
-        make_config(
-            base,
-            None,
-            Some(vec![
-                vandelay::types::ObjectType::Calendar,
-                vandelay::types::ObjectType::CalendarEvent,
-            ]),
-        ),
+        make_config(base, None, surfaces("calendar")),
     )
     .unwrap();
 }
@@ -1758,7 +1732,7 @@ fn full_run_records_graph_id_in_sync_id_exchange_graph_with_padding() {
         api_base: server.url(),
         user_target: None,
         mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        objects: Some(vec![vandelay::types::ObjectType::Mailbox]),
+        surfaces: surfaces("mail"),
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
@@ -1828,7 +1802,7 @@ fn archive_mailbox_kind_encodes_synthetic_suffix_in_account_id() {
         api_base: server.url(),
         user_target: None,
         mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Archive,
-        objects: Some(vec![vandelay::types::ObjectType::Mailbox]),
+        surfaces: surfaces("mail"),
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
@@ -1893,7 +1867,7 @@ fn allow_source_change_permits_overwriting_a_different_account() {
         api_base: server.url(),
         user_target: None,
         mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        objects: Some(vec![vandelay::types::ObjectType::Mailbox]),
+        surfaces: surfaces("mail"),
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
@@ -1974,7 +1948,7 @@ fn dry_run_makes_no_per_item_get_and_no_sqlite_writes() {
         api_base: server.url(),
         user_target: None,
         mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        objects: None,
+        surfaces: Surfaces::ALL,
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
@@ -2142,10 +2116,7 @@ fn folder_enumeration_failure_skips_vanished_deletion() {
         api_base: server.url(),
         user_target: None,
         mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        objects: Some(vec![
-            vandelay::types::ObjectType::Mailbox,
-            vandelay::types::ObjectType::Email,
-        ]),
+        surfaces: surfaces("mail"),
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
@@ -2162,4 +2133,212 @@ fn folder_enumeration_failure_skips_vanished_deletion() {
         remaining, 1,
         "transient folder-enumeration failure must NOT delete the locally-known message"
     );
+}
+
+fn row_count(conn: &rusqlite::Connection, table: &str) -> i64 {
+    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+fn stub_contacts_surface(server: &mut Server) {
+    server
+        .mock("GET", "/me/contactFolders?$top=100")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[{"id":"CON1","displayName":"Contacts"}]}"#)
+        .expect_at_least(0)
+        .create();
+    server
+        .mock("GET", "/me/contactFolders/CON1/childFolders?$top=100")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[]}"#)
+        .expect_at_least(0)
+        .create();
+    server
+        .mock(
+            "GET",
+            "/me/contactFolders/CON1/contacts?$top=100&$select=id",
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[{"id":"CT1"}]}"#)
+        .expect_at_least(0)
+        .create();
+    server
+        .mock("GET", "/me/contacts/CT1")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"CT1","displayName":"Alice Liddell","givenName":"Alice",
+                "surname":"Liddell","emailAddresses":[{"name":"Alice","address":"alice@x.com"}]}"#,
+        )
+        .expect_at_least(0)
+        .create();
+}
+
+fn stub_mail_surface(server: &mut Server) {
+    server
+        .mock("GET", "/me/mailFolders?$top=100&includeHiddenFolders=true")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[{"id":"FMAIL","displayName":"Inbox","isHidden":false}]}"#)
+        .expect_at_least(0)
+        .create();
+    server
+        .mock(
+            "GET",
+            "/me/mailFolders/FMAIL/childFolders?$top=100&includeHiddenFolders=true",
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[]}"#)
+        .expect_at_least(0)
+        .create();
+    stub_well_known_folders(server, "FMAIL");
+    server
+        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[{"id":"MSG-S"}]}"#)
+        .expect_at_least(0)
+        .create();
+    server
+        .mock("GET", "/me/messages/MSG-S/$value")
+        .with_status(200)
+        .with_header("content-type", "text/plain")
+        .with_body(
+            "From: a@x\r\nTo: b@x\r\nSubject: surface\r\n\
+             Date: Tue, 27 May 2026 10:00:00 +0000\r\nMessage-ID: <surface@x>\r\n\r\nbody",
+        )
+        .expect_at_least(0)
+        .create();
+}
+
+fn stub_calendar_surface(server: &mut Server) {
+    server
+        .mock("GET", "/me/mailboxSettings?$select=timeZone")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"timeZone":"UTC"}"#)
+        .expect_at_least(0)
+        .create();
+    server
+        .mock("GET", "/me/calendars?$top=100")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[{"id":"CAL1","name":"Calendar","isDefaultCalendar":true}]}"#)
+        .expect_at_least(0)
+        .create();
+    server
+        .mock(
+            "GET",
+            "/me/calendars/CAL1/events?$top=100&$select=id,type,seriesMasterId",
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[{"id":"EV1","type":"singleInstance","iCalUId":"uid-ev1"}]}"#)
+        .expect_at_least(0)
+        .create();
+    server
+        .mock("GET", "/me/events/EV1")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"EV1","iCalUId":"uid-ev1","type":"singleInstance","subject":"Standup",
+                "start":{"dateTime":"2026-05-04T15:00:00.0000000","timeZone":"UTC"},
+                "end":{"dateTime":"2026-05-04T16:00:00.0000000","timeZone":"UTC"}}"#,
+        )
+        .expect_at_least(0)
+        .create();
+}
+
+#[test]
+fn contacts_surface_imports_only_address_books_and_cards() {
+    let mut server = Server::new();
+    server
+        .mock("GET", Matcher::Regex(r"^/me\?\$select=id".to_owned()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"uid-surface-c","userPrincipalName":"alice@x.com"}"#)
+        .create();
+    stub_contacts_surface(&mut server);
+    stub_calendar_surface(&mut server);
+    stub_mail_surface(&mut server);
+    let no_mail = server
+        .mock("GET", Matcher::Regex(r"^/me/mailFolders\?".to_owned()))
+        .with_status(500)
+        .with_body("MUST NOT BE CALLED")
+        .expect(0)
+        .create();
+    let no_calendars = server
+        .mock("GET", Matcher::Regex(r"^/me/calendars\?".to_owned()))
+        .with_status(500)
+        .with_body("MUST NOT BE CALLED")
+        .expect(0)
+        .create();
+
+    let base = server.url();
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    vandelay::sync::import_exchange_graph::run(
+        make_common(archive.clone()),
+        make_config(base, None, surfaces("contacts")),
+    )
+    .unwrap();
+    no_mail.assert();
+    no_calendars.assert();
+
+    let conn = vandelay::db::init::open(&archive).unwrap();
+    assert_eq!(row_count(&conn, "address_books"), 1);
+    assert_eq!(row_count(&conn, "contact_cards"), 1);
+    assert_eq!(row_count(&conn, "mailboxes"), 0);
+    assert_eq!(row_count(&conn, "emails"), 0);
+    assert_eq!(row_count(&conn, "calendars"), 0);
+    assert_eq!(row_count(&conn, "calendar_events"), 0);
+}
+
+#[test]
+fn mail_surface_imports_only_mailboxes_and_emails() {
+    let mut server = Server::new();
+    server
+        .mock("GET", Matcher::Regex(r"^/me\?\$select=id".to_owned()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"uid-surface-m","userPrincipalName":"alice@x.com"}"#)
+        .create();
+    stub_mail_surface(&mut server);
+    stub_calendar_surface(&mut server);
+    stub_contacts_surface(&mut server);
+    let no_calendars = server
+        .mock("GET", Matcher::Regex(r"^/me/calendars\?".to_owned()))
+        .with_status(500)
+        .with_body("MUST NOT BE CALLED")
+        .expect(0)
+        .create();
+    let no_contact_folders = server
+        .mock("GET", Matcher::Regex(r"^/me/contactFolders\?".to_owned()))
+        .with_status(500)
+        .with_body("MUST NOT BE CALLED")
+        .expect(0)
+        .create();
+
+    let base = server.url();
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    vandelay::sync::import_exchange_graph::run(
+        make_common(archive.clone()),
+        make_config(base, None, surfaces("mail")),
+    )
+    .unwrap();
+    no_calendars.assert();
+    no_contact_folders.assert();
+
+    let conn = vandelay::db::init::open(&archive).unwrap();
+    assert_eq!(row_count(&conn, "mailboxes"), 1);
+    assert_eq!(row_count(&conn, "emails"), 1);
+    assert_eq!(row_count(&conn, "address_books"), 0);
+    assert_eq!(row_count(&conn, "contact_cards"), 0);
+    assert_eq!(row_count(&conn, "calendars"), 0);
+    assert_eq!(row_count(&conn, "calendar_events"), 0);
 }

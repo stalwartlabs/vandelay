@@ -33,7 +33,7 @@ use crate::jmap::wire::email::Email;
 use crate::jmap::wire::file_node::{FileNode, NodeType};
 use crate::jmap::wire::sieve_script::SieveScript;
 use crate::logging::{LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
-use crate::sync::{CommonConfig, Context, ImportConfig, Summary, TypeCounts};
+use crate::sync::{CommonConfig, Context, ImportConfig, RunOutcome, Summary, TypeCounts};
 use crate::types::ObjectType;
 
 const IMPORT_ORDER: [ObjectType; 10] = [
@@ -147,6 +147,20 @@ fn username_of(auth: &Auth) -> String {
 }
 
 pub fn run(common: CommonConfig, config: ImportConfig) -> Result<Summary, Error> {
+    run_reporting(common, config).into_result()
+}
+
+pub fn run_reporting(common: CommonConfig, config: ImportConfig) -> RunOutcome {
+    let mut summary = Summary::default();
+    let error = run_into(common, config, &mut summary).err();
+    RunOutcome { summary, error }
+}
+
+fn run_into(
+    common: CommonConfig,
+    config: ImportConfig,
+    summary: &mut Summary,
+) -> Result<(), Error> {
     let logger = common.logger;
     let ctx = Context::open(common, &config.connect)?;
     let connected = connect::prepare(&ctx, &config.connect)?;
@@ -196,7 +210,6 @@ pub fn run(common: CommonConfig, config: ImportConfig) -> Result<Summary, Error>
         session: connected.session.clone(),
     };
 
-    let mut summary = Summary::default();
     let mut dry_rows: Vec<(&'static str, u64, u64, u64)> = Vec::new();
     let threads = ctx.common.threads;
 
@@ -216,6 +229,7 @@ pub fn run(common: CommonConfig, config: ImportConfig) -> Result<Summary, Error>
             &mut dry_rows,
         ) {
             Ok(()) => {}
+            Err(e) if e.aborts_run() => return Err(e),
             Err(e) => {
                 logger.warn(&format!(
                     "type {} aborted: {e}; continuing (run will exit 5)",
@@ -229,7 +243,8 @@ pub fn run(common: CommonConfig, config: ImportConfig) -> Result<Summary, Error>
 
     if ctx.dry_run() {
         print_dry_run(&dry_rows);
-        return Ok(Summary::default());
+        *summary = Summary::default();
+        return Ok(());
     }
 
     if !summary.any_failed()
@@ -240,7 +255,7 @@ pub fn run(common: CommonConfig, config: ImportConfig) -> Result<Summary, Error>
 
     summary.retries_observed = ctx.client.retries_observed();
     summary.retry_after_sleeps = ctx.client.retry_after_sleeps();
-    Ok(summary)
+    Ok(())
 }
 
 fn work_list(config: &ImportConfig, connected: &Connected) -> Vec<ObjectType> {

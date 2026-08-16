@@ -13,4 +13,4 @@ pub mod mbox;
 pub mod tree;
 pub mod walk;
 
-pub use coordinator::{TakeoutImportConfig, run};
+pub use coordinator::{TakeoutImportConfig, run, run_reporting};

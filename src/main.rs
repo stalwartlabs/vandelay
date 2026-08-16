@@ -9,7 +9,7 @@ use clap::Parser;
 use vandelay::cli::{Action, Cli};
 use vandelay::error::Error;
 use vandelay::inspect;
-use vandelay::sync::{self, Summary};
+use vandelay::sync::{self, RunOutcome, Summary};
 
 fn main() {
     let code = run();
@@ -30,42 +30,54 @@ fn run() -> i32 {
         Err(err) => return fail(&err),
     };
 
-    let result = match action {
+    let (outcome, logger) = match action {
         Action::Import(common, config) => {
             let logger = common.logger;
-            sync::import_jmap::run(common, config).map(|s| (s, logger))
+            (sync::import_jmap::run_reporting(common, config), logger)
         }
         Action::ImportImap(common, config) => {
             let logger = common.logger;
-            sync::import_imap::run(common, config).map(|s| (s, logger))
+            (sync::import_imap::run_reporting(common, config), logger)
         }
         Action::ImportDav(common, config) => {
             let logger = common.logger;
-            sync::import_dav::run(common, config).map(|s| (s, logger))
+            (sync::import_dav::run_reporting(common, config), logger)
         }
         Action::ImportManageSieve(common, config) => {
             let logger = common.logger;
-            sync::import_managesieve::run(common, config).map(|s| (s, logger))
+            (
+                RunOutcome::from_result(sync::import_managesieve::run(common, config)),
+                logger,
+            )
         }
         Action::ImportMaildir(common, config) => {
             let logger = common.logger;
-            sync::import_maildir::run(common, config).map(|s| (s, logger))
+            (sync::import_maildir::run_reporting(common, config), logger)
         }
         Action::ImportTakeout(common, config) => {
             let logger = common.logger;
-            sync::import_takeout::run(common, config).map(|s| (s, logger))
+            (sync::import_takeout::run_reporting(common, config), logger)
         }
         Action::ImportExchangeEws(common, config) => {
             let logger = common.logger;
-            sync::import_exchange_ews::run(common, config).map(|s| (s, logger))
+            (
+                RunOutcome::from_result(sync::import_exchange_ews::run(common, config)),
+                logger,
+            )
         }
         Action::ImportExchangeGraph(common, config) => {
             let logger = common.logger;
-            sync::import_exchange_graph::run(common, config).map(|s| (s, logger))
+            (
+                RunOutcome::from_result(sync::import_exchange_graph::run(common, config)),
+                logger,
+            )
         }
         Action::Export(common, config) => {
             let logger = common.logger;
-            sync::export::run(common, config).map(|s| (s, logger))
+            (
+                RunOutcome::from_result(sync::export::run(common, config)),
+                logger,
+            )
         }
         Action::Inspect(config) => {
             return match inspect::run(config) {
@@ -75,17 +87,17 @@ fn run() -> i32 {
         }
     };
 
-    match result {
-        Ok((summary, logger)) => {
-            report(&summary);
-            if summary.any_failed() {
+    report(&outcome.summary);
+    match outcome.error {
+        Some(err) => fail(&err),
+        None => {
+            if outcome.summary.any_failed() {
                 logger.error("some objects failed; the archive is consistent and resumable");
                 5
             } else {
                 0
             }
         }
-        Err(err) => fail(&err),
     }
 }
 

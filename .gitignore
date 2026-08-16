@@ -7,4 +7,5 @@ target
 *.md
 !README.md
 !CHANGELOG.md
-specs/
+.*
+!.github

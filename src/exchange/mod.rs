@@ -4,4 +4,5 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+pub mod jscalendar;
 pub mod tz;

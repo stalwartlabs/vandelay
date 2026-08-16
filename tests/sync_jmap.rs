@@ -689,6 +689,167 @@ fn prune_non_tree_type_contact_card() {
     seeder::teardown(base_url()).expect("teardown");
 }
 
+const ISSUE30_CARD_UID: &str = "vandelay-issue30-card";
+const ISSUE30_EVENT_UID: &str = "vandelay-issue30-event";
+
+fn data_uri_bytes(resource: &Value, uri_key: &str, expect_media_type: &str) -> Vec<u8> {
+    use base64::Engine;
+    let uri = resource
+        .get(uri_key)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("no {uri_key} on {resource}"));
+    assert!(
+        resource.get("blobId").is_none(),
+        "target must not hold a blobId for {uri_key}: {resource}"
+    );
+    let prefix = format!("data:{expect_media_type};base64,");
+    let payload = uri
+        .strip_prefix(&prefix)
+        .unwrap_or_else(|| panic!("{uri_key} is not a {prefix}... data URI: {resource}"));
+    base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .expect("base64 payload")
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn export_inlines_contact_and_event_blobs_instead_of_blob_ids() {
+    let fx = seeder::provision(base_url()).expect("provision");
+    let tgt = fx.account("test6").expect("test6");
+    let archive = tmp_archive("issue30");
+
+    let photo: &[u8] = b"\x89PNG\r\n\x1a\nvandelay issue 30 contact photo bytes";
+    let agenda: &[u8] = b"vandelay issue 30 calendar enclosure bytes";
+    {
+        let conn = vandelay::db::init::open(&archive).expect("init archive");
+        conn.execute(
+            "INSERT INTO address_books (id,name,is_default) VALUES (1,'Issue30 Book',1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendars (id,name,is_default) VALUES (1,'Issue30 Calendar',1)",
+            [],
+        )
+        .unwrap();
+        let photo_blob = vandelay::db::blobs::intern_blob(&conn, photo).unwrap();
+        let agenda_blob = vandelay::db::blobs::intern_blob(&conn, agenda).unwrap();
+        let card = json!({
+            "@type": "Card",
+            "version": "1.0",
+            "name": { "full": "Issue Thirty" },
+            "media": { "photo": {
+                "@type": "Media", "kind": "photo",
+                "@blob": photo_blob, "mediaType": "image/png"
+            } }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO contact_cards (id,uid,address_book_ids,data) VALUES (1,?1,'[1]',?2)",
+            [ISSUE30_CARD_UID, card.as_str()],
+        )
+        .unwrap();
+        let event = json!({
+            "@type": "Event",
+            "uid": ISSUE30_EVENT_UID,
+            "title": "Issue 30 review",
+            "start": "2026-03-01T09:00:00",
+            "duration": "PT1H",
+            "timeZone": "Etc/UTC",
+            "links": { "1": {
+                "@type": "Link", "rel": "enclosure",
+                "@blob": agenda_blob, "contentType": "text/plain", "title": "agenda.txt"
+            } }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO calendar_events (id,calendar_ids,is_draft,use_default_alerts,data)
+             VALUES (1,'[1]',0,0,?1)",
+            [event.as_str()],
+        )
+        .unwrap();
+    }
+
+    let summary = sync::export::run(
+        common(&archive, false),
+        export_cfg("test6", &tgt.account_id, false),
+    )
+    .expect("export");
+    for name in ["ContactCard", "CalendarEvent"] {
+        let counts = summary
+            .per_type
+            .iter()
+            .find(|(t, _)| *t == name)
+            .map(|(_, c)| c.clone())
+            .unwrap_or_else(|| panic!("{name} counts missing: {summary:?}"));
+        assert_eq!(counts.created, 1, "{name} created exactly one: {counts:?}");
+        assert_eq!(counts.failed, 0, "{name} had no failures: {counts:?}");
+    }
+
+    let client = HttpClient::new(basic("test6"), RetryPolicy::new(5), true);
+    let session = Session::discover(&client, base_url()).expect("discover target session");
+    let api = session.api_url.clone();
+
+    let cards = client
+        .post_json(
+            &api,
+            &json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:contacts"],
+                "methodCalls": [["ContactCard/get",
+                    { "accountId": tgt.account_id, "ids": Value::Null }, "g"]]
+            }),
+        )
+        .expect("ContactCard/get");
+    let card = cards
+        .pointer("/methodResponses/0/1/list")
+        .and_then(Value::as_array)
+        .expect("ContactCard list")
+        .iter()
+        .find(|c| c.get("uid").and_then(Value::as_str) == Some(ISSUE30_CARD_UID))
+        .unwrap_or_else(|| panic!("exported card not found on the target: {cards}"))
+        .clone();
+    let photo_resource = card
+        .pointer("/media/photo")
+        .unwrap_or_else(|| panic!("card has no media.photo: {card}"));
+    assert_eq!(
+        data_uri_bytes(photo_resource, "uri", "image/png"),
+        photo,
+        "contact photo bytes survived the export: {card}"
+    );
+
+    let events = client
+        .post_json(
+            &api,
+            &json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"],
+                "methodCalls": [["CalendarEvent/get",
+                    { "accountId": tgt.account_id, "ids": Value::Null }, "g"]]
+            }),
+        )
+        .expect("CalendarEvent/get");
+    let event = events
+        .pointer("/methodResponses/0/1/list")
+        .and_then(Value::as_array)
+        .expect("CalendarEvent list")
+        .iter()
+        .find(|e| e.get("uid").and_then(Value::as_str) == Some(ISSUE30_EVENT_UID))
+        .unwrap_or_else(|| panic!("exported event not found on the target: {events}"))
+        .clone();
+    let link = event
+        .get("links")
+        .and_then(Value::as_object)
+        .and_then(|m| m.values().next())
+        .unwrap_or_else(|| panic!("event has no links: {event}"));
+    assert_eq!(
+        data_uri_bytes(link, "href", "text/plain"),
+        agenda,
+        "calendar enclosure bytes survived the export: {event}"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+    seeder::teardown(base_url()).expect("teardown");
+}
+
 #[test]
 #[ignore = "requires Docker"]
 fn export_round_trip_and_convergence() {

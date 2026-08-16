@@ -151,7 +151,10 @@ fn sweep_abandoned_containers() {
         return;
     }
     eprintln!("removing {} abandoned test container(s)", ids.len());
-    let _ = Command::new("docker").args(["rm", "-f"]).args(&ids).output();
+    let _ = Command::new("docker")
+        .args(["rm", "-f"])
+        .args(&ids)
+        .output();
 }
 
 fn pick_free_port() -> ContainerResult<u16> {

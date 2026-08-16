@@ -9,4 +9,4 @@ pub mod keywords;
 pub mod messages;
 pub mod tree;
 
-pub use coordinator::{MaildirImportConfig, run};
+pub use coordinator::{MaildirImportConfig, run, run_reporting};

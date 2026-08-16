@@ -16,11 +16,10 @@ use crate::exchange_graph::error::GraphError;
 use crate::exchange_graph::oauth::{
     AcquiredToken, OAuthFlow, acquire, default_authority, refresh_access_token,
 };
-use crate::exchange_graph::types::{EventBodyFormat, MailboxKind, synthetic_account_id};
+use crate::exchange_graph::types::{EventBodyFormat, MailboxKind, Surfaces, synthetic_account_id};
 use crate::jmap::http::RetryPolicy;
 use crate::logging::LEVEL_DEFAULT;
 use crate::sync::{CommonConfig, Summary, TypeCounts};
-use crate::types::ObjectType;
 
 #[derive(Debug, Clone)]
 pub enum GraphAuth {
@@ -39,7 +38,7 @@ pub struct GraphImportConfig {
     pub api_base: String,
     pub user_target: Option<String>,
     pub mailbox_kind: MailboxKind,
-    pub objects: Option<Vec<ObjectType>>,
+    pub surfaces: Surfaces,
     pub event_body_format: EventBodyFormat,
     pub graph_connections: usize,
     pub top: usize,
@@ -141,32 +140,10 @@ pub fn run(common: CommonConfig, config: GraphImportConfig) -> Result<Summary, E
         event_body_format: config.event_body_format,
     };
 
-    let want_mail = config
-        .objects
-        .as_ref()
-        .map(|set| {
-            set.iter()
-                .any(|o| matches!(o, ObjectType::Mailbox | ObjectType::Email))
-        })
-        .unwrap_or(true);
-    let want_calendar = config
-        .objects
-        .as_ref()
-        .map(|set| {
-            set.iter()
-                .any(|o| matches!(o, ObjectType::Calendar | ObjectType::CalendarEvent))
-        })
-        .unwrap_or(true)
-        && !matches!(config.mailbox_kind, MailboxKind::Archive);
-    let want_contacts = config
-        .objects
-        .as_ref()
-        .map(|set| {
-            set.iter()
-                .any(|o| matches!(o, ObjectType::AddressBook | ObjectType::ContactCard))
-        })
-        .unwrap_or(true)
-        && !matches!(config.mailbox_kind, MailboxKind::Archive);
+    let primary = !matches!(config.mailbox_kind, MailboxKind::Archive);
+    let want_mail = config.surfaces.mail;
+    let want_calendar = config.surfaces.calendar && primary;
+    let want_contacts = config.surfaces.contacts && primary;
 
     if want_mail {
         let folders = super::folders::reconcile_mail(
@@ -509,7 +486,7 @@ mod tests {
             api_base: "https://graph.microsoft.com/v1.0".to_owned(),
             user_target: None,
             mailbox_kind: MailboxKind::Primary,
-            objects: None,
+            surfaces: Surfaces::ALL,
             event_body_format: EventBodyFormat::Text,
             graph_connections: 4,
             top: 100,

@@ -1201,3 +1201,97 @@ fn get_state_reads_state_from_empty_get() {
     let st = get_state(&client(0), &url, "w", "Email").expect("get_state");
     assert_eq!(st.as_deref(), Some("snap-1"));
 }
+
+fn archive_path() -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "vandelay-mockjmap-{}-{n}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+#[test]
+fn session_urls_on_a_foreign_origin_are_reported_as_a_mismatch() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let elsewhere = "https://mail.example".to_owned();
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(session_json(&elsewhere))
+        .create();
+
+    let session = Session::discover(&client(0), &base).expect("session discovered");
+    let mismatches = session.origin_mismatches(&base);
+    assert_eq!(mismatches.len(), 1, "one warning per distinct origin");
+    assert_eq!(
+        mismatches[0].fields,
+        vec!["apiUrl", "uploadUrl", "downloadUrl"]
+    );
+    let warning = mismatches[0].to_string();
+    assert!(warning.contains("session advertises apiUrl"), "{warning}");
+    assert!(warning.contains("connected to "), "{warning}");
+    assert!(warning.contains("advertised HTTP URL setting"), "{warning}");
+}
+
+#[test]
+fn import_aborts_with_exit_two_when_the_advertised_api_url_is_unreachable() {
+    let mut api_host = mockito::Server::new();
+    let mut session_host = mockito::Server::new();
+    let session_base = session_host.url();
+    let api_base = api_host.url();
+
+    let _root = session_host.mock("GET", "/").with_status(404).create();
+    let _wk = session_host
+        .mock("GET", "/.well-known/jmap")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(session_json(&api_base))
+        .create();
+    let _nginx = api_host
+        .mock("POST", "/jmap/api")
+        .with_status(404)
+        .with_header("content-type", "text/html")
+        .with_body(
+            "<html><head><title>404 Not Found</title></head><body>404 Not Found</body></html>",
+        )
+        .create();
+
+    let archive = archive_path();
+    let err = vandelay::sync::import_jmap::run(
+        vandelay::sync::CommonConfig {
+            archive: archive.clone(),
+            threads: 1,
+            dry_run: false,
+            max_retries: 0,
+            allow_invalid_certs: false,
+            logger: vandelay::logging::Logger::from_flags(true, 0),
+        },
+        vandelay::sync::ImportConfig {
+            connect: vandelay::sync::ConnectConfig {
+                url: session_base.clone(),
+                auth: Auth::Basic {
+                    user: "u".into(),
+                    password: "p".into(),
+                },
+                account: AccountSelector::Id("w".into()),
+            },
+            objects: None,
+            allow_source_change: false,
+        },
+    )
+    .expect_err("an unreachable apiUrl must abort the run");
+
+    assert!(
+        matches!(err, vandelay::error::Error::Connection(_)),
+        "a 404 from the advertised apiUrl is a whole-run connection failure, got {err:?}"
+    );
+    assert_eq!(err.exit_code(), 2, "must not report a partial failure");
+    let _ = std::fs::remove_file(&archive);
+}

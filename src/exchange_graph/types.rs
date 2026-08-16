@@ -59,6 +59,59 @@ impl EventBodyFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Surfaces {
+    pub mail: bool,
+    pub calendar: bool,
+    pub contacts: bool,
+}
+
+impl Default for Surfaces {
+    fn default() -> Self {
+        Surfaces::ALL
+    }
+}
+
+impl Surfaces {
+    pub const ALL: Surfaces = Surfaces {
+        mail: true,
+        calendar: true,
+        contacts: true,
+    };
+
+    pub const NONE: Surfaces = Surfaces {
+        mail: false,
+        calendar: false,
+        contacts: false,
+    };
+
+    pub fn parse_list(list: &str) -> Result<Surfaces, Error> {
+        let mut selected = Surfaces::NONE;
+        for token in list.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            match token.to_ascii_lowercase().as_str() {
+                "mail" => selected.mail = true,
+                "calendar" => selected.calendar = true,
+                "contacts" => selected.contacts = true,
+                _ => {
+                    return Err(Error::Usage(format!(
+                        "unknown surface: {token} (valid: mail, calendar, contacts)"
+                    )));
+                }
+            }
+        }
+        if selected == Surfaces::NONE {
+            return Err(Error::Usage(
+                "--objects given but resolved to an empty surface list".to_owned(),
+            ));
+        }
+        Ok(selected)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedPrincipal {
     pub id: String,
@@ -99,6 +152,86 @@ mod tests {
         assert_eq!(
             synthetic_account_id("u-uuid", MailboxKind::Archive),
             "u-uuid#archive"
+        );
+    }
+
+    #[test]
+    fn surfaces_default_is_all_three() {
+        let all = Surfaces::default();
+        assert!(all.mail && all.calendar && all.contacts);
+    }
+
+    #[test]
+    fn surfaces_parse_each_name() {
+        assert_eq!(
+            Surfaces::parse_list("mail").unwrap(),
+            Surfaces {
+                mail: true,
+                calendar: false,
+                contacts: false
+            }
+        );
+        assert_eq!(
+            Surfaces::parse_list("calendar").unwrap(),
+            Surfaces {
+                mail: false,
+                calendar: true,
+                contacts: false
+            }
+        );
+        assert_eq!(
+            Surfaces::parse_list("contacts").unwrap(),
+            Surfaces {
+                mail: false,
+                calendar: false,
+                contacts: true
+            }
+        );
+    }
+
+    #[test]
+    fn surfaces_parse_is_case_insensitive() {
+        assert_eq!(
+            Surfaces::parse_list("Mail,CALENDAR,Contacts").unwrap(),
+            Surfaces::ALL
+        );
+    }
+
+    #[test]
+    fn surfaces_parse_dedups_and_trims() {
+        assert_eq!(
+            Surfaces::parse_list("  mail , contacts ,mail,, ").unwrap(),
+            Surfaces {
+                mail: true,
+                calendar: false,
+                contacts: true
+            }
+        );
+    }
+
+    #[test]
+    fn surfaces_parse_rejects_unknown_name() {
+        let err = Surfaces::parse_list("mail,contact").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown surface: contact"), "msg was: {msg}");
+        assert!(
+            msg.contains("valid: mail, calendar, contacts"),
+            "msg was: {msg}"
+        );
+    }
+
+    #[test]
+    fn surfaces_parse_rejects_jmap_type_names() {
+        assert!(Surfaces::parse_list("mailbox").is_err());
+        assert!(Surfaces::parse_list("contactcard").is_err());
+    }
+
+    #[test]
+    fn surfaces_parse_rejects_empty_list() {
+        let err = Surfaces::parse_list("  ,  ").unwrap_err();
+        assert!(
+            err.to_string().contains("empty surface list"),
+            "msg was: {err}"
         );
     }
 

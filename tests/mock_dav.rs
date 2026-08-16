@@ -1595,3 +1595,234 @@ fn mixed_source_archive_allows_distinct_kinds_against_same_url() {
     let no_conflict = sources::conflicting_source(&conn, "caldav", "https://x", "alice").unwrap();
     assert!(no_conflict.is_none());
 }
+
+fn dav_archive() -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "vandelay-mockdav-{}-{:?}-{n}.sqlite",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+fn caldav_import_config(url: &str) -> vandelay::sync::import_dav::DavImportConfig {
+    vandelay::sync::import_dav::DavImportConfig {
+        kind: vandelay::sync::import_dav::DavKindArg::Caldav,
+        url: url.to_owned(),
+        auth: vandelay::sync::import_dav::DavAuth::Basic {
+            user: "u".to_owned(),
+            password: "p".to_owned(),
+        },
+        allow_cleartext: true,
+        dav_connections: 1,
+        multiget_batch: 8,
+        allow_source_change: false,
+    }
+}
+
+fn dav_common(archive: &std::path::Path) -> vandelay::sync::CommonConfig {
+    vandelay::sync::CommonConfig {
+        archive: archive.to_path_buf(),
+        threads: 1,
+        dry_run: false,
+        max_retries: 0,
+        allow_invalid_certs: false,
+        logger: vandelay::logging::Logger::from_flags(true, 0),
+    }
+}
+
+fn row_count(archive: &std::path::Path, table: &str) -> i64 {
+    let conn = rusqlite::Connection::open(archive).expect("open archive");
+    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+        .expect("count")
+}
+
+#[test]
+fn forbidden_collection_is_a_per_unit_failure_and_the_others_still_import() {
+    let mut server = mockito::Server::new();
+    let url = server.url();
+
+    let home_set = format!(
+        r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>{url}/dav/cal/u/work/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+        <d:displayname>Work</d:displayname>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>{url}/dav/cal/u/shared/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+        <d:displayname>Shared</d:displayname>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#
+    );
+    let _discovery = multistatus_response(&mut server, "PROPFIND", "/dav/cal/u/", &home_set);
+
+    let work_items = format!(
+        r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>{url}/dav/cal/u/work/e1.ics</d:href>
+    <d:propstat>
+      <d:prop><d:resourcetype/><d:getetag>"v1"</d:getetag></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#
+    );
+    let _work_enumeration =
+        multistatus_response(&mut server, "PROPFIND", "/dav/cal/u/work/", &work_items);
+
+    let work_data = format!(
+        r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>{url}/dav/cal/u/work/e1.ics</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:getetag>"v1"</d:getetag>
+        <c:calendar-data>BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//EN
+BEGIN:VEVENT
+UID:e1@example.com
+DTSTAMP:20260101T000000Z
+DTSTART:20260101T090000Z
+DTEND:20260101T100000Z
+SUMMARY:Standup
+END:VEVENT
+END:VCALENDAR
+</c:calendar-data>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#
+    );
+    let _work_multiget =
+        multistatus_response(&mut server, "REPORT", "/dav/cal/u/work/", &work_data);
+
+    let forbidden = server
+        .mock("PROPFIND", "/dav/cal/u/shared/")
+        .with_status(403)
+        .with_header("content-type", "text/plain")
+        .with_body("you may not read this calendar")
+        .expect_at_least(1)
+        .create();
+
+    let archive = dav_archive();
+    let summary = vandelay::sync::import_dav::run(
+        dav_common(&archive),
+        caldav_import_config(&format!("{url}/dav/cal/u/")),
+    )
+    .expect("a forbidden collection must not abort the run");
+
+    forbidden.assert();
+
+    let events = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "calendarevent")
+        .map(|(_, c)| c.clone())
+        .expect("calendarevent counts");
+    assert_eq!(events.failed, 1, "the forbidden calendar counts as failed");
+    assert_eq!(events.fetched, 1, "the readable calendar still imported");
+    assert!(
+        summary.any_failed(),
+        "a per-unit failure ends the run at exit 5"
+    );
+
+    assert_eq!(row_count(&archive, "calendars"), 2);
+    assert_eq!(row_count(&archive, "calendar_events"), 1);
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn credentials_rejected_during_discovery_still_aborts_the_run() {
+    let mut server = mockito::Server::new();
+    let url = server.url();
+
+    let _rejected = server
+        .mock("PROPFIND", mockito::Matcher::Any)
+        .with_status(401)
+        .with_header("content-type", "text/plain")
+        .with_body("bad password")
+        .expect_at_least(1)
+        .create();
+
+    let archive = dav_archive();
+    let err = vandelay::sync::import_dav::run(
+        dav_common(&archive),
+        caldav_import_config(&format!("{url}/dav/cal/u/")),
+    )
+    .expect_err("credentials rejected for the principal aborts the run");
+
+    assert!(
+        matches!(err, vandelay::error::Error::Connection(_)),
+        "discovery-level auth rejection is a whole-run failure, got {err:?}"
+    );
+    assert_eq!(err.exit_code(), 2);
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn dav_import_reports_both_phases_when_every_collection_fails() {
+    let mut server = mockito::Server::new();
+    let url = server.url();
+
+    let home_set = format!(
+        r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>{url}/dav/cal/u/work/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+        <d:displayname>Work</d:displayname>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#
+    );
+    let _discovery = multistatus_response(&mut server, "PROPFIND", "/dav/cal/u/", &home_set);
+    let _forbidden = server
+        .mock("PROPFIND", "/dav/cal/u/work/")
+        .with_status(403)
+        .with_body("nope")
+        .expect_at_least(1)
+        .create();
+
+    let archive = dav_archive();
+    let outcome = vandelay::sync::import_dav::run_reporting(
+        dav_common(&archive),
+        caldav_import_config(&format!("{url}/dav/cal/u/")),
+    );
+    assert!(outcome.error.is_none());
+    assert_eq!(
+        outcome
+            .summary
+            .per_type
+            .iter()
+            .map(|(t, _)| *t)
+            .collect::<Vec<_>>(),
+        vec!["calendar", "calendarevent"],
+        "both phases are reported even when every collection failed"
+    );
+    let _ = std::fs::remove_file(&archive);
+}

@@ -43,6 +43,20 @@ impl From<rusqlite::Error> for Error {
 }
 
 impl Error {
+    pub fn aborts_run(&self) -> bool {
+        match self {
+            Error::Partial(_) => false,
+            Error::Usage(_)
+            | Error::Connection(_)
+            | Error::Account(_)
+            | Error::SourceChange(_)
+            | Error::PruneAborted
+            | Error::Unimplemented(_)
+            | Error::Db(_)
+            | Error::Io(_) => true,
+        }
+    }
+
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::Usage(_) => 1,
@@ -73,5 +87,38 @@ mod tests {
         assert_eq!(Error::PruneAborted.exit_code(), 6);
         let io = Error::Io(std::io::Error::other("disk"));
         assert_eq!(io.exit_code(), 7);
+    }
+
+    #[test]
+    fn only_partial_is_a_per_unit_failure() {
+        assert!(!Error::Partial("one object".into()).aborts_run());
+    }
+
+    #[test]
+    fn whole_run_conditions_abort() {
+        assert!(Error::Connection("http status 404".into()).aborts_run());
+        assert!(Error::Account("ambiguous".into()).aborts_run());
+        assert!(Error::SourceChange("other account".into()).aborts_run());
+        assert!(Error::Usage("bad flag".into()).aborts_run());
+        assert!(Error::Unimplemented("x").aborts_run());
+        assert!(Error::PruneAborted.aborts_run());
+        assert!(Error::Db(OpenError::Sqlite(rusqlite::Error::QueryReturnedNoRows)).aborts_run());
+        assert!(Error::Io(std::io::Error::other("disk")).aborts_run());
+    }
+
+    #[test]
+    fn aborting_errors_do_not_map_to_the_partial_exit_code() {
+        for e in [
+            Error::Connection("x".into()),
+            Error::Account("x".into()),
+            Error::SourceChange("x".into()),
+            Error::Db(OpenError::Sqlite(rusqlite::Error::QueryReturnedNoRows)),
+            Error::Io(std::io::Error::other("disk")),
+        ] {
+            assert!(e.aborts_run(), "{e} must abort the run");
+            assert_ne!(e.exit_code(), 5, "{e} must not report a partial failure");
+        }
+        assert_eq!(Error::Connection("x".into()).exit_code(), 2);
+        assert_eq!(Error::Partial("x".into()).exit_code(), 5);
     }
 }

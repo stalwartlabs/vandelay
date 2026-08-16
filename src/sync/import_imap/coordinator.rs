@@ -29,7 +29,7 @@ use crate::imap::transport::Connector;
 use crate::logging::{LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
 use crate::sync::emailmeta::email_index_from_blob;
 use crate::sync::keys::index_to_json;
-use crate::sync::{CommonConfig, Summary, TypeCounts};
+use crate::sync::{CommonConfig, RunOutcome, Summary, TypeCounts};
 
 use super::fetch;
 use super::folders::{
@@ -199,6 +199,20 @@ pub enum ImapAuth {
 }
 
 pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Error> {
+    run_reporting(common, config).into_result()
+}
+
+pub fn run_reporting(common: CommonConfig, config: ImapImportConfig) -> RunOutcome {
+    let mut summary = Summary::default();
+    let error = run_into(common, config, &mut summary).err();
+    RunOutcome { summary, error }
+}
+
+fn run_into(
+    common: CommonConfig,
+    config: ImapImportConfig,
+    summary: &mut Summary,
+) -> Result<(), Error> {
     let logger = common.logger;
     let mut conn = db::init::open(&common.archive)?;
 
@@ -341,14 +355,15 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
 
     if common.dry_run {
         let existing_source = db::sources::find_source(&conn, &source_key)?;
-        return dry_run_summary(
+        *summary = dry_run_summary(
             &conn,
             existing_source,
             &mut client,
             &control_ctx,
             &resolved,
             logger,
-        );
+        )?;
+        return Ok(());
     }
 
     let mut mailbox_counts = TypeCounts::default();
@@ -410,6 +425,16 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
             &mut email_counts,
         ) {
             Ok(()) => {}
+            Err(e) if e.aborts_run() => {
+                pool.shutdown();
+                let _ = client.logout();
+                *summary = Summary {
+                    per_type: vec![("mailbox", mailbox_counts), ("email", email_counts)],
+                    retries_observed: backoff.total_retries(),
+                    retry_after_sleeps: backoff.transient_retries() as u64,
+                };
+                return Err(e);
+            }
             Err(e) => {
                 log_at(
                     logger,
@@ -424,11 +449,12 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
     pool.shutdown();
     let _ = client.logout();
 
-    Ok(Summary {
+    *summary = Summary {
         per_type: vec![("mailbox", mailbox_counts), ("email", email_counts)],
         retries_observed: backoff.total_retries(),
         retry_after_sleeps: backoff.transient_retries() as u64,
-    })
+    };
+    Ok(())
 }
 
 #[derive(Debug, Clone)]

@@ -27,9 +27,19 @@ pub fn classify_http_status(status: u16) -> Disposition {
     }
 }
 
-pub fn jmap_method_disposition(error_type: &str) -> Disposition {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethodCallKind {
+    Read,
+    SingleObjectWrite,
+}
+
+pub fn jmap_method_disposition(error_type: &str, kind: MethodCallKind) -> Disposition {
     match error_type {
-        "serverUnavailable" | "serverPartialFail" => Disposition::Retryable,
+        "serverUnavailable" => Disposition::Retryable,
+        "serverPartialFail" => match kind {
+            MethodCallKind::Read => Disposition::Retryable,
+            MethodCallKind::SingleObjectWrite => Disposition::Fatal,
+        },
         _ => Disposition::Fatal,
     }
 }
@@ -231,12 +241,33 @@ mod tests {
 
     #[test]
     fn method_classification() {
+        for kind in [MethodCallKind::Read, MethodCallKind::SingleObjectWrite] {
+            assert_eq!(
+                jmap_method_disposition("serverUnavailable", kind),
+                Disposition::Retryable,
+                "{kind:?}"
+            );
+            assert_eq!(
+                jmap_method_disposition("invalidArguments", kind),
+                Disposition::Fatal,
+                "{kind:?}"
+            );
+            assert_eq!(
+                jmap_method_disposition("forbidden", kind),
+                Disposition::Fatal,
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_fail_is_never_retried_for_a_write() {
         assert_eq!(
-            jmap_method_disposition("serverUnavailable"),
+            jmap_method_disposition("serverPartialFail", MethodCallKind::Read),
             Disposition::Retryable
         );
         assert_eq!(
-            jmap_method_disposition("invalidArguments"),
+            jmap_method_disposition("serverPartialFail", MethodCallKind::SingleObjectWrite),
             Disposition::Fatal
         );
     }
