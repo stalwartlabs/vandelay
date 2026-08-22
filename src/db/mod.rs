@@ -6,6 +6,7 @@
 
 pub mod blobs;
 pub mod dav_ids;
+pub mod defaults;
 pub mod exchange_ews_ids;
 pub mod exchange_graph_ids;
 pub mod ids;

@@ -20,7 +20,7 @@ use crate::error::Error;
 use crate::imap::client::{ConnectMode, ImapClient};
 use crate::imap::command;
 use crate::imap::error::ImapError;
-use crate::imap::name::encode_mailbox_name_with;
+use crate::imap::name::{alternate_mailbox_name, encode_mailbox_name_with};
 use crate::imap::response::{NamespaceEntry, Untagged};
 use crate::imap::retry::{
     BackoffState, Disposition, RetryPolicy, classify, is_negotiation_failure,
@@ -108,6 +108,33 @@ pub(super) fn control_run_collect(
                 }
             },
         }
+    }
+}
+
+pub(super) fn select_folder(
+    client: &mut ImapClient,
+    ctx: &ControlCtx,
+    folder: &str,
+) -> Result<crate::imap::CollectedResponse, Error> {
+    let utf8_accept = client.utf8_accept();
+    let wire_name = encode_mailbox_name_with(folder, utf8_accept);
+    let first = control_run_collect(client, ctx, &command::select(&wire_name));
+    let Err(Error::Partial(_)) = &first else {
+        return first;
+    };
+    let Some(alternate) = alternate_mailbox_name(folder, utf8_accept) else {
+        return first;
+    };
+    match control_run_collect(client, ctx, &command::select(&alternate)) {
+        Ok(r) => {
+            log_at(
+                ctx.logger,
+                LEVEL_DEFAULT,
+                &format!("folder {folder:?}: selected with the alternate mailbox-name encoding"),
+            );
+            Ok(r)
+        }
+        Err(_) => first,
     }
 }
 
@@ -713,8 +740,7 @@ fn reconcile_folder(
         }
     }
 
-    let wire_name = encode_mailbox_name_with(&folder.name, client.utf8_accept());
-    let resp = control_run_collect(client, control_ctx, &command::select(&wire_name))?;
+    let resp = select_folder(client, control_ctx, &folder.name)?;
     let mut uidvalidity: u32 = 0;
     let mut uidnext: u32 = 0;
     for u in &resp.untagged {
@@ -1123,8 +1149,7 @@ fn dry_run_summary(
     }
 
     for folder in folders {
-        let wire = encode_mailbox_name_with(&folder.name, client.utf8_accept());
-        let select_resp = match control_run_collect(client, control_ctx, &command::select(&wire)) {
+        let select_resp = match select_folder(client, control_ctx, &folder.name) {
             Ok(r) => r,
             Err(e) => {
                 log_at(

@@ -752,3 +752,57 @@ fn malformed_message_yields_zero_message_match_but_imports() {
     assert_eq!(inbox.len(), 2);
     let _ = fs::remove_file(&archive);
 }
+
+#[test]
+fn received_at_comes_from_the_filename_not_a_clobbered_mtime() {
+    let td = TempDir::new().unwrap();
+    let root = td.path();
+    ensure_maildir(root);
+    let with_stamp = write_message(
+        root,
+        "cur",
+        "1763065233.M1P1.host,S=120:2,S",
+        &rfc5322("stamped", "stamped", "body"),
+    );
+    let without_stamp = write_message(
+        root,
+        "cur",
+        "M2P2.host:2,S",
+        &rfc5322("unstamped", "unstamped", "body"),
+    );
+    let restored =
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+    for p in [&with_stamp, &without_stamp] {
+        let f = fs::File::options().write(true).open(p).unwrap();
+        f.set_modified(restored).unwrap();
+    }
+
+    let archive = tmp_archive("received_at");
+    let summary = run(common(&archive), base_cfg(root)).expect("import");
+    assert!(!summary.any_failed());
+
+    let conn = Connection::open(&archive).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.received_at FROM emails e
+             JOIN blobs b ON b.id = e.blob_id
+             WHERE CAST(b.data AS TEXT) LIKE ?1",
+        )
+        .unwrap();
+    let stamped: String = stmt
+        .query_row(rusqlite::params!["%<stamped@example.com>%"], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        stamped, "2025-11-13T20:20:33Z",
+        "the maildir filename timestamp wins over a restored mtime"
+    );
+    let unstamped: String = stmt
+        .query_row(rusqlite::params!["%<unstamped@example.com>%"], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        unstamped, "2025-05-12T10:00:00Z",
+        "without a filename timestamp the message Date header is used"
+    );
+    drop(stmt);
+    let _ = fs::remove_file(&archive);
+}

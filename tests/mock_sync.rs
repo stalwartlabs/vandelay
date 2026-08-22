@@ -1271,6 +1271,197 @@ fn import_removes_vanished_email_and_drops_cross_ref() {
 }
 
 #[test]
+fn import_unusable_received_at_falls_back_instead_of_dropping_the_email() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _mbterm = anchor_terminator(&mut server, api, "Mailbox");
+    let _emterm = anchor_terminator(&mut server, api, "Email");
+
+    let _mbq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",
+                {"accountId":"w","ids":["MX"]},"q"]]})
+            .to_string(),
+        )
+        .create();
+    let _mbg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"sm1","list":[
+                {"id":"MX","name":"Inbox","parentId":null,"role":"inbox","sortOrder":0,"isSubscribed":true}
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .create();
+    let _eq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/query",
+                {"accountId":"w","ids":["E1","E2","E3"]},"q"]]})
+            .to_string(),
+        )
+        .create();
+    let _eg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/get",{"accountId":"w","state":"se1","list":[
+                {"id":"E1","blobId":"BLB1","receivedAt":"30828-09-14T02:48:05Z","mailboxIds":{"MX":true},"keywords":{}},
+                {"id":"E2","blobId":"BLB2","mailboxIds":{"MX":true},"keywords":{}},
+                {"id":"E3","blobId":"BLB3","receivedAt":"2020-01-03 04:05:06Z","mailboxIds":{"MX":true},"keywords":{}}
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .create();
+    let _dl1 = server
+        .mock("GET", Matcher::Regex("/jmap/dl/w/BLB1/.*".into()))
+        .with_body(
+            "From: a@x\r\nMessage-ID: <1@h>\r\nDate: Mon, 12 May 2025 10:00:00 +0200\r\n\r\none",
+        )
+        .create();
+    let _dl2 = server
+        .mock("GET", Matcher::Regex("/jmap/dl/w/BLB2/.*".into()))
+        .with_body("From: b@x\r\nMessage-ID: <2@h>\r\n\r\ntwo")
+        .create();
+    let _dl3 = server
+        .mock("GET", Matcher::Regex("/jmap/dl/w/BLB3/.*".into()))
+        .with_body("From: c@x\r\nMessage-ID: <3@h>\r\n\r\nthree")
+        .create();
+
+    let summary = sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+    )
+    .expect("import does not abort on an unusable receivedAt");
+
+    let email = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.clone())
+        .expect("email counts");
+    assert_eq!(email.fetched, 3, "no email is dropped over its receivedAt");
+    assert_eq!(email.failed, 0, "an unusable receivedAt is not a failure");
+    assert!(!summary.any_failed());
+
+    let conn = rusqlite::Connection::open(&archive).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT received_at FROM emails ORDER BY id")
+        .unwrap();
+    let dates: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    drop(stmt);
+    assert_eq!(
+        dates[0], "2025-05-12T10:00:00+02:00",
+        "an out-of-range receivedAt falls back to the Date header"
+    );
+    assert_eq!(
+        dates[1], "1970-01-01T00:00:00Z",
+        "no receivedAt and no Date header falls back to the epoch"
+    );
+    assert_eq!(
+        dates[2], "2020-01-03T04:05:06Z",
+        "a space-separated receivedAt is salvaged, not discarded"
+    );
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn import_file_node_without_node_type_is_inferred_not_skipped() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _fnterm = anchor_terminator(&mut server, api, "FileNode");
+
+    let _fq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("FileNode/query".into()))
+        .with_body(
+            json!({"methodResponses":[["FileNode/query",
+                {"accountId":"w","ids":["F1","F2"]},"q"]]})
+            .to_string(),
+        )
+        .create();
+    let _fg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("FileNode/get".into()))
+        .with_body(
+            json!({"methodResponses":[["FileNode/get",{"accountId":"w","state":"sf1","list":[
+                {"id":"F1","parentId":null,"name":"docs","created":"2026-01-01T00:00:00Z"},
+                {"id":"F2","parentId":"F1","name":"a.txt","blobId":"BLBF","type":"text/plain","created":"2026-01-02T00:00:00Z"}
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .create();
+    let _dl = server
+        .mock("GET", Matcher::Regex("/jmap/dl/w/BLBF/.*".into()))
+        .with_body("file bytes")
+        .create();
+
+    let summary = sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::FileNode]),
+    )
+    .expect("import does not abort when nodeType is absent");
+
+    let nodes = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "FileNode")
+        .map(|(_, c)| c.clone())
+        .expect("file node counts");
+    assert_eq!(
+        nodes.fetched, 2,
+        "a server that omits nodeType still imports"
+    );
+    assert_eq!(nodes.failed, 0);
+
+    let conn = rusqlite::Connection::open(&archive).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT name, node_type FROM file_nodes ORDER BY name")
+        .unwrap();
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    drop(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            ("a.txt".to_owned(), "file".to_owned()),
+            ("docs".to_owned(), "directory".to_owned()),
+        ],
+        "nodeType is inferred from the presence of a blobId"
+    );
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
 fn import_missing_email_blob_is_skipped_and_counted_once() {
     let mut server = mockito::Server::new();
     let base = server.url();
@@ -1617,6 +1808,197 @@ fn export_email_blake3_fallback_matches_when_no_message_id() {
     assert_eq!(email.skipped, 1, "BLAKE3 fallback matched target");
     assert_eq!(email.created, 0);
     assert_eq!(email.failed, 0);
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_leaves_an_existing_target_default_address_book_alone() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO address_books (id,name,description,is_default)
+             VALUES (1,'Contacts',NULL,1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _g = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("AddressBook/get".into()))
+        .with_body(
+            json!({"methodResponses":[["AddressBook/get",{"accountId":"w","list":[
+                {"id":"P","name":"Personal","isDefault":true,"myRights":{"mayDelete":false}}
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let no_default_set = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("onSuccessSetIsDefault".into()))
+        .with_body(
+            json!({"methodResponses":[["AddressBook/set",{"accountId":"w"},"d"]]}).to_string(),
+        )
+        .expect(0)
+        .create();
+    let create = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("AddressBook/set".into()),
+            Matcher::Regex("Contacts".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["AddressBook/set",{"accountId":"w",
+                "created":{"c1":{"id":"CID"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::AddressBook]),
+    )
+    .expect("export");
+    create.assert();
+    no_default_set.assert();
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_claims_the_default_address_book_when_the_target_has_none() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO address_books (id,name,description,is_default)
+             VALUES (1,'Contacts',NULL,1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _g = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("AddressBook/get".into()))
+        .with_body(
+            json!({"methodResponses":[["AddressBook/get",{"accountId":"w","list":[
+                {"id":"P","name":"Personal","isDefault":false,"myRights":{"mayDelete":true}}
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let default_set = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("onSuccessSetIsDefault".into()))
+        .with_body(
+            json!({"methodResponses":[["AddressBook/set",{"accountId":"w"},"d"]]}).to_string(),
+        )
+        .expect(1)
+        .create();
+    let create = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("AddressBook/set".into()),
+            Matcher::Regex("Contacts".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["AddressBook/set",{"accountId":"w",
+                "created":{"c1":{"id":"CID"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::AddressBook]),
+    )
+    .expect("export");
+    create.assert();
+    default_set.assert();
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn import_never_stores_two_default_address_books() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _abg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("AddressBook/get".into()))
+        .with_body(
+            json!({"methodResponses":[["AddressBook/get",{"accountId":"w","state":"sa1","list":[
+                {"id":"A1","name":"Contacts","isDefault":true,"isSubscribed":true,"sortOrder":0},
+                {"id":"A2","name":"GAL","isDefault":true,"isSubscribed":true,"sortOrder":0}
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .create();
+
+    let summary = sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::AddressBook]),
+    )
+    .expect("import");
+    let books = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "AddressBook")
+        .map(|(_, c)| c.clone())
+        .expect("address book counts");
+    assert_eq!(books.fetched, 2, "both address books are imported");
+
+    let conn = rusqlite::Connection::open(&archive).unwrap();
+    let defaults: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM address_books WHERE is_default = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        defaults, 1,
+        "an archive must never hold more than one default address book"
+    );
+    let name: String = conn
+        .query_row(
+            "SELECT name FROM address_books WHERE is_default = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(name, "Contacts", "the first claimant keeps the default");
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -3997,7 +4379,10 @@ fn export_email_server_unavailable_is_retried_not_dropped() {
     failing.assert();
     succeeding.assert();
     up.assert();
-    assert_eq!(email.created, 1, "the message must survive a transient error");
+    assert_eq!(
+        email.created, 1,
+        "the message must survive a transient error"
+    );
     assert_eq!(email.failed, 0, "a retried message is not a failure");
     assert!(!summary.any_failed());
 

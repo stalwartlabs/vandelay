@@ -6,6 +6,7 @@
 
 use serde_json::{Value, json};
 
+use crate::exchange::date::recurrence_until;
 use crate::exchange_graph::error::GraphError;
 
 pub fn convert_patterned_recurrence(pr: &Value) -> Result<Value, GraphError> {
@@ -80,12 +81,11 @@ pub fn convert_patterned_recurrence_rule(
     let range_type = range.get("type").and_then(Value::as_str).unwrap_or("noEnd");
     match range_type {
         "endDate" => {
-            if let Some(end) = range.get("endDate").and_then(Value::as_str) {
-                let local = if end.contains('T') {
-                    end.to_owned()
-                } else {
-                    format!("{end}T23:59:59")
-                };
+            if let Some(local) = range
+                .get("endDate")
+                .and_then(Value::as_str)
+                .and_then(recurrence_until)
+            {
                 rule.insert("until".to_owned(), Value::from(local));
             }
         }

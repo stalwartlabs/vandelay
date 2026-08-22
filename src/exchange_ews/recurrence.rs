@@ -6,6 +6,7 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::exchange::date::recurrence_until;
 use crate::exchange_ews::parse::{RawRecurrence, RecurrencePattern, RecurrenceRange};
 
 pub fn to_jscalendar_rule(raw: &RawRecurrence) -> Option<Value> {
@@ -92,13 +93,9 @@ pub fn to_jscalendar_rule(raw: &RawRecurrence) -> Option<Value> {
     match raw.range.as_ref() {
         Some(RecurrenceRange::NoEnd { .. }) | None => {}
         Some(RecurrenceRange::EndDate { end_date, .. }) => {
-            let trimmed = end_date.trim().trim_end_matches('Z');
-            let local = if trimmed.contains('T') {
-                trimmed.to_owned()
-            } else {
-                format!("{trimmed}T23:59:59")
-            };
-            rule.insert("until".to_owned(), Value::String(local));
+            if let Some(local) = recurrence_until(end_date) {
+                rule.insert("until".to_owned(), Value::String(local));
+            }
         }
         Some(RecurrenceRange::Numbered {
             number_of_occurrences,
@@ -285,6 +282,35 @@ mod tests {
         assert_eq!(rule["frequency"], "yearly");
         assert_eq!(rule["byMonth"][0], "1");
         assert_eq!(rule["byMonthDay"][0], 1);
+    }
+
+    #[test]
+    fn end_date_with_numeric_offset_yields_valid_local_until() {
+        let raw = RawRecurrence {
+            pattern: Some(RecurrencePattern::Weekly {
+                interval: 2,
+                days_of_week: vec!["Wednesday".to_owned()],
+            }),
+            range: Some(RecurrenceRange::EndDate {
+                start_date: "2021-08-04-06:00".to_owned(),
+                end_date: "2021-09-30-06:00".to_owned(),
+            }),
+        };
+        let rule = to_jscalendar_rule(&raw).expect("rule");
+        assert_eq!(rule["until"], "2021-09-30T23:59:59");
+    }
+
+    #[test]
+    fn unusable_end_date_omits_until_rather_than_emitting_garbage() {
+        let raw = RawRecurrence {
+            pattern: Some(RecurrencePattern::Daily { interval: 1 }),
+            range: Some(RecurrenceRange::EndDate {
+                start_date: String::new(),
+                end_date: "not-a-date".to_owned(),
+            }),
+        };
+        let rule = to_jscalendar_rule(&raw).expect("rule");
+        assert!(rule.get("until").is_none());
     }
 
     #[test]

@@ -442,7 +442,7 @@ fn build_create(
         .map_err(Error::from)?;
     let mut wire = fnrow.wire;
     if let (crate::jmap::wire::file_node::NodeType::File, Some(blob_local)) =
-        (&wire.node_type, fnrow.blob_local_id)
+        (wire.effective_node_type(), fnrow.blob_local_id)
     {
         let ct = wire
             .media_type

@@ -4,10 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use serde::{Deserialize, Serialize};
-
 use super::common::bool_or_true;
 use super::{JmapId, UtcDate};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -18,7 +17,8 @@ pub struct FileNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<JmapId>,
 
-    pub node_type: NodeType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_type: Option<NodeType>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_id: Option<JmapId>,
@@ -46,6 +46,17 @@ pub struct FileNode {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+}
+
+impl FileNode {
+    pub fn effective_node_type(&self) -> NodeType {
+        match self.node_type {
+            Some(t) => t,
+            None if self.blob_id.is_some() => NodeType::File,
+            None if self.target.is_some() => NodeType::Symlink,
+            None => NodeType::Directory,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

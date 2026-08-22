@@ -533,23 +533,26 @@ impl<'r, R: BufRead> Parser<'r, R> {
 
     fn parse_quoted(&mut self) -> Result<Value, ImapError> {
         self.expect(b'"')?;
-        let mut s = String::new();
+        let mut raw: Vec<u8> = Vec::new();
         while let Some(b) = self.peek() {
             match b {
                 b'"' => {
                     self.bump();
-                    return Ok(Value::Str(s));
+                    return Ok(match String::from_utf8(raw) {
+                        Ok(s) => Value::Str(s),
+                        Err(e) => Value::Bytes(e.into_bytes()),
+                    });
                 }
                 b'\\' => {
                     self.bump();
                     let next = self
                         .peek()
                         .ok_or_else(|| ImapError::Parse("trailing \\ in quoted".into()))?;
-                    s.push(next as char);
+                    raw.push(next);
                     self.bump();
                 }
                 _ => {
-                    s.push(b as char);
+                    raw.push(b);
                     self.bump();
                 }
             }
@@ -827,6 +830,41 @@ mod tests {
                 assert_eq!(caps.len(), 11);
             }
             _ => panic!("expected Capability"),
+        }
+    }
+
+    #[test]
+    fn quoted_mailbox_name_with_utf8_bytes_is_decoded_as_utf8() {
+        let r = parse("* LIST (\\HasNoChildren) \"/\" \"Envoy\u{e9}s\"\r\n".as_bytes());
+        match r {
+            Response::Untagged(Untagged::List { name, .. }) => assert_eq!(name, "Envoyés"),
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quoted_mailbox_name_with_modified_utf7_is_left_untouched() {
+        let r =
+            parse(b"* LIST (\\HasNoChildren) \"/\" \"[Gmail]/G&APY-nderilmi&AV8- Postalar\"\r\n");
+        match r {
+            Response::Untagged(Untagged::List { name, .. }) => {
+                assert_eq!(name, "[Gmail]/G&APY-nderilmi&AV8- Postalar");
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quoted_mailbox_name_with_invalid_utf8_falls_back_to_lossy() {
+        let mut line: Vec<u8> = b"* LIST (\\HasNoChildren) \"/\" \"bad".to_vec();
+        line.push(0xff);
+        line.extend_from_slice(b"name\"\r\n");
+        let r = parse(&line);
+        match r {
+            Response::Untagged(Untagged::List { name, .. }) => {
+                assert!(name.starts_with("bad") && name.ends_with("name"));
+            }
+            other => panic!("expected List, got {other:?}"),
         }
     }
 

@@ -33,8 +33,11 @@ pub fn decode_mailbox_name_with(input: &str, utf8_accept: bool) -> Result<String
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] != b'&' {
-            out.push(bytes[i] as char);
-            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'&' {
+                i += 1;
+            }
+            out.push_str(&input[start..i]);
             continue;
         }
         if i + 1 < bytes.len() && bytes[i + 1] == b'-' {
@@ -63,6 +66,16 @@ pub fn decode_mailbox_name_with(input: &str, utf8_accept: bool) -> Result<String
         i = end + 1;
     }
     Ok(out)
+}
+
+pub fn alternate_mailbox_name(input: &str, utf8_accept: bool) -> Option<String> {
+    let primary = encode_mailbox_name_with(input, utf8_accept);
+    let alternate = encode_mailbox_name_with(input, !utf8_accept);
+    if alternate == primary {
+        None
+    } else {
+        Some(alternate)
+    }
 }
 
 pub fn encode_mailbox_name(input: &str) -> String {
@@ -219,6 +232,38 @@ mod tests {
         assert_eq!(canonicalise_inbox("Inbox"), "INBOX");
         assert_eq!(canonicalise_inbox("INBOX"), "INBOX");
         assert_eq!(canonicalise_inbox("Inbox/Sub"), "Inbox/Sub");
+    }
+
+    #[test]
+    fn raw_utf8_name_survives_mutf7_decode_untouched() {
+        assert_eq!(decode_mailbox_name("Envoyés").unwrap(), "Envoyés");
+        assert_eq!(
+            decode_mailbox_name("L/Le Vent Se Lève").unwrap(),
+            "L/Le Vent Se Lève"
+        );
+        assert_eq!(decode_mailbox_name("R&-D é").unwrap(), "R&D é");
+    }
+
+    #[test]
+    fn raw_utf8_name_round_trips_through_encode() {
+        for s in ["Envoyés", "Gönderilmiş Postalar", "Çöp kutusu"] {
+            assert_eq!(decode_mailbox_name(&encode_mailbox_name(s)).unwrap(), s);
+            assert_eq!(decode_mailbox_name(s).unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn alternate_encoding_offered_only_for_non_ascii_names() {
+        assert_eq!(
+            alternate_mailbox_name("Envoyés", false).as_deref(),
+            Some("Envoyés")
+        );
+        assert_eq!(
+            alternate_mailbox_name("Envoyés", true).as_deref(),
+            Some("Envoy&AOk-s")
+        );
+        assert_eq!(alternate_mailbox_name("INBOX", false), None);
+        assert_eq!(alternate_mailbox_name("Sent Items", true), None);
     }
 
     #[test]

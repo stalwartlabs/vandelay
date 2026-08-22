@@ -6,6 +6,7 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::exchange::address::{as_smtp_address, extract_smtp_address};
 use crate::exchange::jscalendar::{
     drop_calendar_address_dependents, is_override_ignored, synthetic_attendee_address,
 };
@@ -245,8 +246,13 @@ fn resolve_calendar_address(
     name: Option<&str>,
 ) -> Option<(String, Option<String>)> {
     if let Some(addr) = address.filter(|a| !a.trim().is_empty()) {
-        if is_smtp_routing(routing_type) {
-            return Some((format!("mailto:{addr}"), Some(addr.to_owned())));
+        let smtp = if is_smtp_routing(routing_type) {
+            as_smtp_address(addr).or_else(|| extract_smtp_address(addr))
+        } else {
+            extract_smtp_address(addr)
+        };
+        if let Some(smtp) = smtp {
+            return Some((format!("mailto:{smtp}"), Some(smtp)));
         }
         return Some((synthetic_attendee_address(addr), None));
     }
@@ -866,6 +872,83 @@ mod tests {
         let v = to_jscalendar(&raw).data;
         assert_eq!(v["duration"], "P3D");
         assert_eq!(v["showWithoutTime"], true);
+    }
+
+    #[test]
+    fn ex_routing_with_a_real_address_keeps_the_address() {
+        let raw = CalendarItemRaw {
+            id: crate::exchange_ews::types::ItemId::new("M", ""),
+            uid: Some("uid-ex".to_owned()),
+            start: Some("2025-06-15T14:00:00Z".to_owned()),
+            end: Some("2025-06-15T15:00:00Z".to_owned()),
+            organizer_smtp: Some("alice@example.com".to_owned()),
+            organizer_routing_type: Some("EX".to_owned()),
+            required_attendees: vec![crate::exchange_ews::parse::RawAttendee {
+                email: Some("SMTP:bob@example.com".to_owned()),
+                routing_type: Some("EX".to_owned()),
+                name: None,
+                response_type: Some("Accept".to_owned()),
+            }],
+            ..CalendarItemRaw::default()
+        };
+        let v = to_jscalendar(&raw).data;
+        assert_eq!(
+            v["organizerCalendarAddress"], "mailto:alice@example.com",
+            "a usable address must not be discarded because RoutingType says EX"
+        );
+        let participants = v["participants"].as_object().unwrap();
+        assert!(
+            participants
+                .values()
+                .any(|p| p["calendarAddress"] == "mailto:bob@example.com"),
+            "the SMTP: prefix must be stripped, got {participants:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_distinguished_name_still_becomes_a_synthetic_address() {
+        let dn = "/o=ExchangeLabs/ou=Exchange Administrative Group \
+             (FYDIBOHF23SPDLT)/cn=Recipients/cn=bdc77b18152647a29d28ce1188376dc9-kristina";
+        let raw = CalendarItemRaw {
+            id: crate::exchange_ews::types::ItemId::new("M", ""),
+            uid: Some("uid-dn".to_owned()),
+            start: Some("2025-06-15T14:00:00Z".to_owned()),
+            end: Some("2025-06-15T15:00:00Z".to_owned()),
+            organizer_smtp: Some(dn.to_owned()),
+            organizer_routing_type: Some("EX".to_owned()),
+            ..CalendarItemRaw::default()
+        };
+        let v = to_jscalendar(&raw).data;
+        let addr = v["organizerCalendarAddress"].as_str().unwrap();
+        assert!(
+            addr.starts_with("urn:x-vandelay:attendee:"),
+            "an unresolvable directory reference stays synthetic, got {addr}"
+        );
+        let participants = v["participants"].as_object().unwrap();
+        assert!(
+            participants.values().all(|p| p.get("email").is_none()),
+            "no email property is invented for a directory reference"
+        );
+    }
+
+    #[test]
+    fn smtp_routing_with_an_unusable_address_does_not_produce_a_broken_mailto() {
+        let raw = CalendarItemRaw {
+            id: crate::exchange_ews::types::ItemId::new("M", ""),
+            uid: Some("uid-bad".to_owned()),
+            start: Some("2025-06-15T14:00:00Z".to_owned()),
+            end: Some("2025-06-15T15:00:00Z".to_owned()),
+            organizer_smtp: Some("Kristina Morgental".to_owned()),
+            organizer_routing_type: Some("SMTP".to_owned()),
+            ..CalendarItemRaw::default()
+        };
+        let v = to_jscalendar(&raw).data;
+        assert!(
+            v["organizerCalendarAddress"]
+                .as_str()
+                .unwrap()
+                .starts_with("urn:x-vandelay:attendee:")
+        );
     }
 
     #[test]

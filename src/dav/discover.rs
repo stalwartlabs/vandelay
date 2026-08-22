@@ -127,7 +127,7 @@ fn try_treat_url_as_home_or_collection(
     let collections = match propfind_collections(client, kind, url, &body) {
         Ok(c) => c,
         Err(DiscoveryError::Transport(JmapError::HttpStatus { status, .. }))
-            if (400..500).contains(&status) =>
+            if (400..600).contains(&status) =>
         {
             return Ok(None);
         }

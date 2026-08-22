@@ -282,6 +282,21 @@ impl Cyrus {
         })
     }
 
+    pub fn create_non_ascii_mailbox(
+        &self,
+        account: &Account,
+        wire_name: &str,
+        message: &[u8],
+    ) -> ContainerResult<()> {
+        let mut client = ImapSeed::connect(&self.imap.host, self.imap.port)?;
+        client.login(&account.username, &account.password)?;
+        client.create(wire_name)?;
+        client.subscribe(wire_name)?;
+        client.append_with_flags(wire_name, &[], message)?;
+        client.logout()?;
+        Ok(())
+    }
+
     pub fn delete_first_inbox_message(&self, account: &Account) -> ContainerResult<()> {
         let mut client = ImapSeed::connect(&self.imap.host, self.imap.port)?;
         client.login(&account.username, &account.password)?;

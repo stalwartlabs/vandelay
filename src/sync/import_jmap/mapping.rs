@@ -8,6 +8,7 @@ use indexmap::IndexMap;
 use rusqlite::{Connection, Row, params};
 use serde_json::{Map, Value};
 
+use crate::db::defaults::unique_default;
 use crate::jmap::blob::{BlobWalkError, InlineShape, import_blob_ids, inline_blob_data_uris};
 use crate::jmap::error::JmapError;
 use crate::jmap::wire::JmapId;
@@ -168,7 +169,7 @@ pub fn insert_email(
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             blob_local_id,
-            format_utc(&wire.received_at)?,
+            format_utc(&wire.received_at.unwrap_or(time::OffsetDateTime::UNIX_EPOCH))?,
             id_array_json(&mailbox_locals),
             Value::Array(keywords.iter().map(|k| Value::from(k.as_str())).collect()).to_string(),
             message_match
@@ -248,6 +249,7 @@ pub fn insert_sieve_script(
 pub const SIEVE_SELECT: &str = "SELECT id, name, is_active, blob_id FROM sieve_scripts";
 
 pub fn insert_address_book(conn: &Connection, wire: &AddressBook) -> Result<i64, JmapError> {
+    let is_default = unique_default(conn, ObjectType::AddressBook, wire.is_default, None)?;
     conn.execute(
         "INSERT INTO address_books (name, description, sort_order, is_default, is_subscribed)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -255,7 +257,7 @@ pub fn insert_address_book(conn: &Connection, wire: &AddressBook) -> Result<i64,
             wire.name,
             wire.description,
             wire.sort_order,
-            wire.is_default as i64,
+            is_default as i64,
             wire.is_subscribed as i64
         ],
     )?;
@@ -266,6 +268,7 @@ pub const ADDRESS_BOOK_SELECT: &str =
     "SELECT id, name, description, sort_order, is_default, is_subscribed FROM address_books";
 
 pub fn insert_calendar(conn: &Connection, wire: &Calendar) -> Result<i64, JmapError> {
+    let is_default = unique_default(conn, ObjectType::Calendar, wire.is_default, None)?;
     conn.execute(
         "INSERT INTO calendars (name, description, color, sort_order, is_subscribed, is_visible,
             is_default, include_in_availability, default_alerts_with_time,
@@ -278,7 +281,7 @@ pub fn insert_calendar(conn: &Connection, wire: &Calendar) -> Result<i64, JmapEr
             wire.sort_order,
             wire.is_subscribed as i64,
             wire.is_visible as i64,
-            wire.is_default as i64,
+            is_default as i64,
             wire.include_in_availability,
             opt_json(&wire.default_alerts_with_time)?,
             opt_json(&wire.default_alerts_without_time)?,
@@ -296,10 +299,11 @@ pub fn insert_participant_identity(
     conn: &Connection,
     wire: &ParticipantIdentity,
 ) -> Result<i64, JmapError> {
+    let is_default = unique_default(conn, ObjectType::ParticipantIdentity, wire.is_default, None)?;
     conn.execute(
         "INSERT INTO participant_identities (name, calendar_address, is_default)
          VALUES (?1, ?2, ?3)",
-        params![wire.name, wire.calendar_address, wire.is_default as i64],
+        params![wire.name, wire.calendar_address, is_default as i64],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -314,7 +318,7 @@ pub fn insert_file_node(
     resolver: &impl LocalResolver,
 ) -> Result<i64, JmapError> {
     let parent = opt_parent(resolver, ObjectType::FileNode, &wire.parent_id);
-    let node_type = serde_json::to_value(wire.node_type)?
+    let node_type = serde_json::to_value(wire.effective_node_type())?
         .as_str()
         .unwrap_or("file")
         .to_owned();
@@ -495,6 +499,12 @@ pub fn update_address_book(
     local_id: i64,
     wire: &AddressBook,
 ) -> Result<bool, JmapError> {
+    let is_default = unique_default(
+        conn,
+        ObjectType::AddressBook,
+        wire.is_default,
+        Some(local_id),
+    )?;
     let n = conn.execute(
         "UPDATE address_books SET name = ?1, description = ?2, sort_order = ?3, is_default = ?4,
             is_subscribed = ?5
@@ -504,7 +514,7 @@ pub fn update_address_book(
             wire.name,
             wire.description,
             wire.sort_order,
-            wire.is_default as i64,
+            is_default as i64,
             wire.is_subscribed as i64,
             local_id
         ],
@@ -517,6 +527,7 @@ pub fn update_calendar(
     local_id: i64,
     wire: &Calendar,
 ) -> Result<bool, JmapError> {
+    let is_default = unique_default(conn, ObjectType::Calendar, wire.is_default, Some(local_id))?;
     let n = conn.execute(
         "UPDATE calendars SET name = ?1, description = ?2, color = ?3, sort_order = ?4,
             is_subscribed = ?5, is_visible = ?6, is_default = ?7, include_in_availability = ?8,
@@ -533,7 +544,7 @@ pub fn update_calendar(
             wire.sort_order,
             wire.is_subscribed as i64,
             wire.is_visible as i64,
-            wire.is_default as i64,
+            is_default as i64,
             wire.include_in_availability,
             opt_json(&wire.default_alerts_with_time)?,
             opt_json(&wire.default_alerts_without_time)?,
@@ -549,13 +560,19 @@ pub fn update_participant_identity(
     local_id: i64,
     wire: &ParticipantIdentity,
 ) -> Result<bool, JmapError> {
+    let is_default = unique_default(
+        conn,
+        ObjectType::ParticipantIdentity,
+        wire.is_default,
+        Some(local_id),
+    )?;
     let n = conn.execute(
         "UPDATE participant_identities SET name = ?1, calendar_address = ?2, is_default = ?3
          WHERE id = ?4 AND (name IS NOT ?1 OR calendar_address IS NOT ?2 OR is_default IS NOT ?3)",
         params![
             wire.name,
             wire.calendar_address,
-            wire.is_default as i64,
+            is_default as i64,
             local_id
         ],
     )?;
@@ -570,7 +587,7 @@ pub fn update_file_node(
     resolver: &impl LocalResolver,
 ) -> Result<bool, JmapError> {
     let parent = opt_parent(resolver, ObjectType::FileNode, &wire.parent_id);
-    let node_type = serde_json::to_value(wire.node_type)?
+    let node_type = serde_json::to_value(wire.effective_node_type())?
         .as_str()
         .unwrap_or("file")
         .to_owned();
@@ -828,7 +845,9 @@ pub fn row_to_file_node(
         ),
         None => None,
     };
-    let node_type = serde_json::from_value(Value::from(row.get::<_, String>(2)?))?;
+    let node_type = Some(serde_json::from_value(Value::from(
+        row.get::<_, String>(2)?,
+    ))?);
     let target: Option<Vec<String>> = from_opt_json(row.get::<_, Option<String>>(4)?)?;
     let blob_local_id: Option<i64> = row.get(3)?;
     Ok(FileNodeRow {

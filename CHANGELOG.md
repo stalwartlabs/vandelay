@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.9] - 2026-08-22
+
+### Added
+
+### Changed
+
+### Fixed
+- IMAP mailbox names were decoded as Latin-1 instead of UTF-8, so non-ASCII folders failed to SELECT (#32 #37).
+- CalDAV discovery aborted when the given URL answered PROPFIND with 501 instead of trying the next discovery step (#35).
+- An unparsable `receivedAt` dropped the whole email, and a `FileNode` without `nodeType` was skipped (#36).
+- Maildir import took `received_at` from the file mtime, which does not survive a copy or restore (#38).
+- An EWS recurrence `EndDate` carrying a UTC offset produced a malformed `until` and an unbounded series (#33).
+- Export took the default calendar or address book away from a target account that already had one, and an archive could hold more than one default per type.
+- Exchange participant addresses were replaced by a synthetic URN whenever `RoutingType` was not SMTP, and a Graph X500 reference was emitted as a malformed `mailto:` (#33).
+
 ## [1.0.8] - 2026-08-15
 
 ### Added

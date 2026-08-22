@@ -375,6 +375,78 @@ fn calendar_item_master_inlines_modified_and_deleted_occurrences() {
 }
 
 #[test]
+fn organizer_and_attendee_addresses_survive_an_ex_routing_type() {
+    let body = "<vandelay-inner xmlns:t=\"http://schemas.microsoft.com/exchange/services/2006/types\">\
+         <t:CalendarItem>\
+         <t:ItemId Id=\"M3\" ChangeKey=\"K1\"/>\
+         <t:Subject>Review</t:Subject>\
+         <t:UID>uid-3</t:UID>\
+         <t:Start>2025-06-15T14:00:00Z</t:Start>\
+         <t:End>2025-06-15T15:00:00Z</t:End>\
+         <t:Organizer><t:Mailbox><t:Name>Alice</t:Name>\
+           <t:EmailAddress>alice@example.com</t:EmailAddress>\
+           <t:RoutingType>EX</t:RoutingType><t:MailboxType>Mailbox</t:MailboxType></t:Mailbox></t:Organizer>\
+         <t:RequiredAttendees><t:Attendee><t:Mailbox><t:Name>Kristina Morgental</t:Name>\
+           <t:EmailAddress>/o=ExchangeLabs/ou=Exchange Administrative Group (FYDIBOHF23SPDLT)/cn=Recipients/cn=bdc77b18152647a29d28ce1188376dc9-kristina</t:EmailAddress>\
+           <t:RoutingType>EX</t:RoutingType></t:Mailbox><t:ResponseType>Unknown</t:ResponseType></t:Attendee></t:RequiredAttendees>\
+         </t:CalendarItem></vandelay-inner>";
+    let item = vandelay::exchange_ews::parse::parse_calendar_item(body).unwrap();
+    let event = vandelay::exchange_ews::calendar_map::to_jscalendar(&item);
+
+    assert_eq!(
+        event.data["organizerCalendarAddress"], "mailto:alice@example.com",
+        "a usable address must be kept even when RoutingType says EX"
+    );
+    let participants = event.data["participants"].as_object().unwrap();
+    let organizer = participants
+        .values()
+        .find(|p| p["calendarAddress"] == "mailto:alice@example.com")
+        .expect("organizer participant");
+    assert_eq!(organizer["email"], "alice@example.com");
+
+    let attendee = participants
+        .values()
+        .find(|p| p["name"] == "Kristina Morgental")
+        .expect("attendee participant");
+    assert!(
+        attendee["calendarAddress"]
+            .as_str()
+            .unwrap()
+            .starts_with("urn:x-vandelay:attendee:"),
+        "a legacy directory reference cannot be resolved and stays synthetic"
+    );
+    assert!(
+        attendee.get("email").is_none(),
+        "no email is invented for a directory reference"
+    );
+}
+
+#[test]
+fn recurrence_end_date_with_a_timezone_offset_yields_a_bounded_series() {
+    let body = "<vandelay-inner xmlns:t=\"http://schemas.microsoft.com/exchange/services/2006/types\">\
+         <t:CalendarItem>\
+         <t:ItemId Id=\"M2\" ChangeKey=\"K1\"/>\
+         <t:Subject>Biweekly</t:Subject>\
+         <t:UID>uid-2</t:UID>\
+         <t:Start>2021-08-04T21:15:00Z</t:Start>\
+         <t:End>2021-08-04T22:15:00Z</t:End>\
+         <t:CalendarItemType>RecurringMaster</t:CalendarItemType>\
+         <t:Recurrence>\
+           <t:WeeklyRecurrence><t:Interval>2</t:Interval><t:DaysOfWeek>Wednesday</t:DaysOfWeek></t:WeeklyRecurrence>\
+           <t:EndDateRecurrence><t:StartDate>2021-08-04-06:00</t:StartDate><t:EndDate>2021-09-30-06:00</t:EndDate></t:EndDateRecurrence>\
+         </t:Recurrence>\
+         </t:CalendarItem></vandelay-inner>";
+    let item = vandelay::exchange_ews::parse::parse_calendar_item(body).unwrap();
+    let event = vandelay::exchange_ews::calendar_map::to_jscalendar(&item);
+    let rule = &event.data["recurrenceRule"];
+    assert_eq!(rule["frequency"], "weekly");
+    assert_eq!(
+        rule["until"], "2021-09-30T23:59:59",
+        "an EndDate carrying a UTC offset must still produce a valid LocalDateTime"
+    );
+}
+
+#[test]
 fn sync_folder_items_creates_updates_deletes_round_trip() {
     let body = envelope(&format!(
         "<m:SyncFolderItemsResponse{NS}><m:ResponseMessages><m:SyncFolderItemsResponseMessage ResponseClass=\"Success\">\

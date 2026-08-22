@@ -6,6 +6,7 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::exchange::address::{as_smtp_address, extract_smtp_address};
 use crate::exchange::jscalendar::{drop_calendar_address_dependents, synthetic_attendee_address};
 use crate::exchange::tz::resolve_to_iana;
 use crate::exchange_graph::error::GraphError;
@@ -356,8 +357,10 @@ fn non_empty(email: &Value, key: &str) -> Option<String> {
 
 fn resolve_calendar_address(email: &Value) -> Option<(String, Option<String>)> {
     if let Some(addr) = non_empty(email, "address") {
-        let cal_addr = format!("mailto:{addr}");
-        return Some((cal_addr, Some(addr)));
+        if let Some(smtp) = as_smtp_address(&addr).or_else(|| extract_smtp_address(&addr)) {
+            return Some((format!("mailto:{smtp}"), Some(smtp)));
+        }
+        return Some((synthetic_attendee_address(&addr), None));
     }
     non_empty(email, "name").map(|name| (synthetic_attendee_address(&name), None))
 }
@@ -661,6 +664,64 @@ mod tests {
         assert!(participants.contains_key("att-1"));
         assert_eq!(participants["att-1"]["email"], "bob@x.com");
         assert_eq!(participants["att-1"]["roles"]["required"], true);
+    }
+
+    #[test]
+    fn a_hybrid_x500_address_is_not_emitted_as_a_mailto() {
+        let mut v = sample();
+        v["attendees"] = json!([
+            {
+                "emailAddress": {
+                    "name": "Kristina Morgental",
+                    "address": "/o=ExchangeLabs/ou=Exchange Administrative Group \
+                        (FYDIBOHF23SPDLT)/cn=Recipients/cn=bdc77b18152647a29d28ce1188376dc9-kristina"
+                },
+                "type": "required",
+                "status": {"response": "none"}
+            }
+        ]);
+        let conv = convert_event(&v, None).unwrap();
+        let p = &conv.data["participants"]["att-1"];
+        let addr = p["calendarAddress"].as_str().unwrap();
+        assert!(
+            addr.starts_with("urn:x-vandelay:attendee:"),
+            "a hybrid X500 reference must not become a malformed mailto, got {addr}"
+        );
+        assert!(
+            p.get("email").is_none(),
+            "an X500 reference is not an email address"
+        );
+        assert_eq!(p["name"], "Kristina Morgental", "the display name is kept");
+    }
+
+    #[test]
+    fn a_prefixed_or_bracketed_address_is_normalised() {
+        let mut v = sample();
+        v["attendees"] = json!([
+            {
+                "emailAddress": {"name": "Bob", "address": "SMTP:bob@example.com"},
+                "type": "required",
+                "status": {"response": "none"}
+            },
+            {
+                "emailAddress": {"name": "Eve", "address": "Eve <eve@example.com>"},
+                "type": "required",
+                "status": {"response": "none"}
+            }
+        ]);
+        let conv = convert_event(&v, None).unwrap();
+        assert_eq!(
+            conv.data["participants"]["att-1"]["calendarAddress"],
+            "mailto:bob@example.com"
+        );
+        assert_eq!(
+            conv.data["participants"]["att-1"]["email"],
+            "bob@example.com"
+        );
+        assert_eq!(
+            conv.data["participants"]["att-2"]["calendarAddress"],
+            "mailto:eve@example.com"
+        );
     }
 
     #[test]

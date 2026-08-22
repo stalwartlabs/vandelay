@@ -514,3 +514,50 @@ fn assert_received_at_rfc3339_ish(conn: &Connection) {
 }
 
 fn _unused(_: &AccountSeed) {}
+
+#[test]
+#[ignore = "requires Docker"]
+fn dovecot_non_ascii_mailbox_names_round_trip() {
+    let d = Dovecot::start().expect("dovecot start");
+    let account = d.accounts.first().expect("account").clone();
+
+    let mutf7_name = "Envoy&AOk-s";
+    let utf8_name = "Envoyés";
+    let message = b"From: accents@vandelay.test\r\n\
+         To: user1@vandelay.test\r\n\
+         Subject: Accents\r\n\
+         Message-ID: <accents-1@vandelay.test>\r\n\
+         Date: Wed, 01 Jan 2025 12:00:00 +0000\r\n\
+         \r\n\
+         Accented folder probe.\r\n";
+    d.create_non_ascii_mailbox(&account, mutf7_name, message)
+        .expect("create accented mailbox");
+
+    let archive = tmp_archive("dovecot-non-ascii");
+    let summary =
+        import_imap::run(common(&archive), imap_config(&account, &d.imap)).expect("imap import");
+    assert!(
+        !summary.any_failed(),
+        "an accented folder name must not fail the import: {summary:?}"
+    );
+
+    let conn = open_archive(&archive);
+    let names: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM mailboxes ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let mailbox_id = mailbox_id_by_name(&conn, utf8_name).unwrap_or_else(|| {
+        panic!("no mailbox named {utf8_name}; names must not be mojibake, got {names:?}")
+    });
+    let emails = emails_in_mailbox(&conn, mailbox_id);
+    assert_eq!(
+        emails, 1,
+        "the message inside the accented folder must be imported"
+    );
+    cleanup(&archive);
+}

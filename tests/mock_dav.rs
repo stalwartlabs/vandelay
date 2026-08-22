@@ -598,6 +598,69 @@ fn discovery_via_well_known_redirect_307() {
 }
 
 #[test]
+fn discovery_survives_501_on_the_user_supplied_url() {
+    let mut server = mockito::Server::new();
+    let url = server.url();
+
+    let _root = server
+        .mock("PROPFIND", "/")
+        .with_status(501)
+        .with_body("")
+        .expect_at_least(1)
+        .create();
+
+    let principal_with_homeset = format!(
+        r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>{url}/dav/principals/u/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:current-user-principal><d:href>{url}/dav/principals/u/</d:href></d:current-user-principal>
+        <c:calendar-home-set><d:href>{url}/dav/cal/u/</d:href></c:calendar-home-set>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#
+    );
+    let collections_body = format!(
+        r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>{url}/dav/cal/u/default/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+        <d:displayname>Default</d:displayname>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#
+    );
+    let _well_known = multistatus_response(
+        &mut server,
+        "PROPFIND",
+        "/.well-known/caldav",
+        &principal_with_homeset,
+    );
+    let _principal = multistatus_response(
+        &mut server,
+        "PROPFIND",
+        "/dav/principals/u/",
+        &principal_with_homeset,
+    );
+    let _collections =
+        multistatus_response(&mut server, "PROPFIND", "/dav/cal/u/", &collections_body);
+
+    let c = client(0);
+    let disc = discover(&c, DavKind::Caldav, &url).expect("discovery must not abort on 501");
+    assert_eq!(disc.collections.len(), 1);
+    assert!(disc.home_set_url.ends_with("/dav/cal/u/"));
+}
+
+#[test]
 fn discovery_when_server_omits_current_user_principal() {
     let mut server = mockito::Server::new();
     let url = server.url();
