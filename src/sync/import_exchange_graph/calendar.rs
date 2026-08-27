@@ -57,7 +57,9 @@ pub fn reconcile_all(
                 _ => {
                     if let Some(id) = stub.get("id").and_then(Value::as_str) {
                         server_total.insert(id.to_owned());
-                        if !local.contains_key(id) && planned.insert(id.to_owned()) {
+                        if local.contains_key(id) {
+                            counts.fetched += 1;
+                        } else if planned.insert(id.to_owned()) {
                             want_ids.push(id.to_owned());
                         }
                     }
@@ -79,19 +81,23 @@ pub fn reconcile_all(
         let fetched = fetch_events(ctx, &want_ids);
         let mut masters: Vec<(String, ConvertedEvent)> = Vec::new();
         let mut exceptions: Vec<(String, ConvertedEvent)> = Vec::new();
+        let mut any_series = false;
         for (graph_id, result) in fetched {
             match result {
-                Ok(raw) => match convert_event(&raw, None) {
-                    Ok(c) => match c.event_type {
-                        EventType::Exception => exceptions.push((graph_id, c)),
-                        _ => masters.push((graph_id, c)),
-                    },
-                    Err(e) => {
-                        counts.failed += 1;
-                        ctx.logger
-                            .warn(&format!("graph event {graph_id} convert failed: {e}"));
+                Ok(raw) => {
+                    any_series |= is_series_master(&raw);
+                    match convert_event(&raw, None) {
+                        Ok(c) => match c.event_type {
+                            EventType::Exception => exceptions.push((graph_id, c)),
+                            _ => masters.push((graph_id, c)),
+                        },
+                        Err(e) => {
+                            counts.failed += 1;
+                            ctx.logger
+                                .warn(&format!("graph event {graph_id} convert failed: {e}"));
+                        }
                     }
-                },
+                }
                 Err(GraphError::Vanished) => counts.skipped += 1,
                 Err(e) => {
                     counts.failed += 1;
@@ -99,6 +105,10 @@ pub fn reconcile_all(
                         .warn(&format!("graph event {graph_id} fetch failed: {e}"));
                 }
             }
+        }
+
+        if any_series {
+            exceptions.extend(fetch_calendar_exceptions(ctx, &cal.graph_id, counts));
         }
 
         let mut master_by_graph_id: HashMap<String, ConvertedEvent> = masters.into_iter().collect();
@@ -162,6 +172,73 @@ fn fetch_events(
     for _ in 0..ids.len() {
         if let Ok(r) = pool.results().recv() {
             out.push(r);
+        }
+    }
+    out
+}
+
+fn is_series_master(raw: &Value) -> bool {
+    raw.get("recurrence").is_some_and(|r| !r.is_null())
+}
+
+fn exception_windows(years: i32) -> Vec<(String, String)> {
+    let today = chrono::Utc::now().date_naive();
+    let span = chrono::Duration::days(
+        i64::from(years.max(1))
+            .saturating_mul(365)
+            .min(api::EXCEPTION_WINDOW_MAX_DAYS),
+    );
+    let fmt = |d: chrono::NaiveDate| d.format("%Y-%m-%dT00:00:00").to_string();
+    vec![
+        (fmt(today - span), fmt(today)),
+        (fmt(today), fmt(today + span)),
+    ]
+}
+
+fn fetch_calendar_exceptions(
+    ctx: &GraphCoordinator<'_>,
+    calendar_id: &str,
+    counts: &mut TypeCounts,
+) -> Vec<(String, ConvertedEvent)> {
+    let windows = exception_windows(ctx.exception_window_years);
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (from, to) in windows {
+        let url = ctx
+            .endpoints
+            .calendar_exceptions(calendar_id, &from, &to, ctx.top);
+        match api::collect_all_values(ctx.client, &url, &[PREFER_TIMEZONE_UTC]) {
+            Ok(values) => {
+                if ctx.logger.enabled(LEVEL_PROGRESS) {
+                    eprintln!(
+                        "graph calendar {calendar_id} exceptions in {from}..{to}: {}",
+                        values.len()
+                    );
+                }
+                for raw in values {
+                    let Some(ex_id) = raw.get("id").and_then(Value::as_str).map(str::to_owned)
+                    else {
+                        continue;
+                    };
+                    if !seen.insert(ex_id.clone()) {
+                        continue;
+                    }
+                    match convert_event(&raw, None) {
+                        Ok(c) => out.push((ex_id, c)),
+                        Err(e) => {
+                            counts.failed += 1;
+                            ctx.logger
+                                .warn(&format!("graph exception {ex_id} convert failed: {e}"));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                counts.failed += 1;
+                ctx.logger.warn(&format!(
+                    "graph calendar {calendar_id} exception lookup {from}..{to} failed: {e}"
+                ));
+            }
         }
     }
     out
@@ -406,6 +483,48 @@ fn delete_vanished(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exception_windows_never_exceed_the_graph_limit() {
+        for requested in [1, 5, 50] {
+            let windows = exception_windows(requested);
+            assert_eq!(windows.len(), 2, "one window behind today, one ahead");
+            for (from, to) in windows {
+                let start = chrono::NaiveDate::parse_from_str(&from[..10], "%Y-%m-%d").unwrap();
+                let end = chrono::NaiveDate::parse_from_str(&to[..10], "%Y-%m-%d").unwrap();
+                let days = (end - start).num_days();
+                assert!(days > 0, "window runs forwards: {from}..{to}");
+                assert!(
+                    days <= api::EXCEPTION_WINDOW_MAX_DAYS,
+                    "requested {requested}y produced {days} days, over Graph's cap"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_occurrence_keys_drop_the_oid_prefix() {
+        let raw = serde_json::json!({
+            "id": "M",
+            "start": {"dateTime": "2026-09-21T11:00:00.0000000", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-09-21T11:30:00.0000000", "timeZone": "UTC"},
+            "recurrence": {
+                "pattern": {"type": "daily", "interval": 1},
+                "range": {"type": "numbered", "startDate": "2026-09-21",
+                          "numberOfOccurrences": 6}
+            },
+            "cancelledOccurrences": ["OID.AAMkAGI2TGuLAAA=.2026-09-24"]
+        });
+        let converted = convert_event(&raw, None).unwrap();
+        let overrides = converted.data["recurrenceOverrides"].as_object().unwrap();
+        assert!(
+            overrides.contains_key("2026-09-24T11:00:00"),
+            "beta cancelledOccurrences are OID.<id>.<date>; the key must be a LocalDateTime, \
+             got {:?}",
+            overrides.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(overrides["2026-09-24T11:00:00"]["excluded"], true);
+    }
 
     #[test]
     fn override_key_utc_converts_to_master_local_time() {

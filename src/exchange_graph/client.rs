@@ -28,6 +28,7 @@ const LONG_RETRY_THRESHOLD: Duration = Duration::from_secs(10);
 pub enum Accept {
     Json,
     Text,
+    Binary,
 }
 
 impl Accept {
@@ -35,6 +36,7 @@ impl Accept {
         match self {
             Accept::Json => "application/json",
             Accept::Text => "text/plain",
+            Accept::Binary => "application/octet-stream",
         }
     }
 }
@@ -411,10 +413,17 @@ struct RetryLog<'a> {
 }
 
 fn warn_on_redirect(logger: &Logger, method: &str, requested: &str, final_uri: &Uri) {
+    if requested.ends_with("/content") {
+        return;
+    }
     let landed = final_uri.to_string();
     if cross_host(requested, &landed) {
+        let host = url::Url::parse(&landed)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .unwrap_or_else(|| "another host".to_owned());
         logger.warn(&format!(
-            "{method} {requested} was redirected across hosts to {landed}; verify the Graph endpoint host is reachable directly without redirection"
+            "{method} {requested} was redirected across hosts to {host}; verify the Graph endpoint host is reachable directly without redirection"
         ));
     }
 }

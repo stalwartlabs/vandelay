@@ -118,7 +118,8 @@ CREATE TABLE IF NOT EXISTS sync_id_exchange_graph (
     type_name   TEXT    NOT NULL CHECK (type_name IN (
                                             'mailbox','email',
                                             'calendar','calendarevent',
-                                            'addressbook','contactcard')),
+                                            'addressbook','contactcard',
+                                            'filenode')),
     graph_id    TEXT    NOT NULL,
     local_id    INTEGER NOT NULL,
     PRIMARY KEY (source_id, type_name, graph_id),

@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.10] - 2026-08-27
+
+### Added
+- MS Exchange Graph: Import the default Contacts folder, recover series exceptions (fixes #39)
+- OneDrive files import
+
+### Changed
+
+### Fixed
+
 ## [1.0.9] - 2026-08-22
 
 ### Added

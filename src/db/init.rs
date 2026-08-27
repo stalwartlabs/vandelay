@@ -19,6 +19,7 @@ pub fn apply_schema(conn: &Connection) -> Result<(), OpenError> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(SCHEMA_SQL)?;
     ensure_calendar_events_data_type(&tx)?;
+    ensure_graph_ids_accept_file_nodes(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -33,6 +34,41 @@ fn ensure_calendar_events_data_type(conn: &Connection) -> Result<(), OpenError> 
             [],
         )?;
     }
+    Ok(())
+}
+
+fn ensure_graph_ids_accept_file_nodes(conn: &Connection) -> Result<(), OpenError> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' \
+             AND name = 'sync_id_exchange_graph'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    let Some(sql) = sql else { return Ok(()) };
+    if sql.contains("'filenode'") {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "ALTER TABLE sync_id_exchange_graph RENAME TO sync_id_exchange_graph_old;
+         CREATE TABLE sync_id_exchange_graph (
+             source_id   INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+             type_name   TEXT    NOT NULL CHECK (type_name IN (
+                                                     'mailbox','email',
+                                                     'calendar','calendarevent',
+                                                     'addressbook','contactcard',
+                                                     'filenode')),
+             graph_id    TEXT    NOT NULL,
+             local_id    INTEGER NOT NULL,
+             PRIMARY KEY (source_id, type_name, graph_id),
+             UNIQUE (source_id, type_name, local_id)
+         );
+         INSERT INTO sync_id_exchange_graph SELECT * FROM sync_id_exchange_graph_old;
+         DROP TABLE sync_id_exchange_graph_old;
+         CREATE INDEX IF NOT EXISTS sync_id_exchange_graph_type_idx
+             ON sync_id_exchange_graph (source_id, type_name);",
+    )?;
     Ok(())
 }
 

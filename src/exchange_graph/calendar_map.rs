@@ -320,9 +320,15 @@ pub fn convert_event(
         .and_then(Value::as_array)
         && !cancels.is_empty()
     {
+        let start_time = card
+            .get("start")
+            .and_then(Value::as_str)
+            .and_then(|s| s.split_once('T').map(|(_, time)| time.to_owned()));
         let mut overrides = Map::new();
         for entry in cancels.iter().filter_map(Value::as_str) {
-            overrides.insert(entry.to_owned(), json!({"excluded": true}));
+            if let Some(key) = cancelled_occurrence_key(entry, start_time.as_deref()) {
+                overrides.insert(key, json!({"excluded": true}));
+            }
         }
         if !overrides.is_empty() {
             card.insert("recurrenceOverrides".to_owned(), Value::Object(overrides));
@@ -338,6 +344,17 @@ pub fn convert_event(
         event_type,
         original_start,
     })
+}
+
+fn cancelled_occurrence_key(entry: &str, start_time: Option<&str>) -> Option<String> {
+    let date = entry.rsplit('.').next().filter(|d| d.len() == 10)?;
+    if !date.as_bytes().iter().enumerate().all(|(i, b)| match i {
+        4 | 7 => *b == b'-',
+        _ => b.is_ascii_digit(),
+    }) {
+        return None;
+    }
+    Some(format!("{date}T{}", start_time.unwrap_or("00:00:00")))
 }
 
 fn extract_local_datetime(slot: Option<&Value>) -> Option<String> {

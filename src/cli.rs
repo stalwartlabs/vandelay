@@ -1132,7 +1132,7 @@ pub struct ExchangeGraphImportArgs {
     #[arg(
         long,
         value_name = "LIST",
-        help = "Comma-separated surface list: mail | calendar | contacts (default: all three)"
+        help = "Comma-separated surface list: mail | calendar | contacts | files (default: all)"
     )]
     objects: Option<String>,
 
@@ -1160,6 +1160,19 @@ pub struct ExchangeGraphImportArgs {
         help = "Per-page size ($top query parameter, range [1, 1000])"
     )]
     top: usize,
+
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 5,
+        help = "Years either side of today to scan for edited recurrence occurrences (max 5)",
+        long_help = "Years either side of today to scan for edited recurrence occurrences.\n  \
+            Graph reports a series exception only inside an expanded calendar view, and caps\n  \
+            any single view at five years, so vandelay scans [today - N, today] and\n  \
+            [today, today + N]. An occurrence edited outside that span imports with the\n  \
+            series default instead of its edit."
+    )]
+    exception_window_years: i32,
 
     #[arg(
         long,
@@ -1225,6 +1238,7 @@ fn resolve_exchange_graph_import(args: ExchangeGraphImportArgs) -> Result<Action
             event_body_format,
             graph_connections,
             top,
+            exception_window_years: args.exception_window_years,
             allow_source_change: args.allow_source_change,
         },
     ))
@@ -1389,7 +1403,8 @@ mod tests {
             Surfaces {
                 mail: false,
                 calendar: false,
-                contacts: true
+                contacts: true,
+                files: false
             }
         );
     }

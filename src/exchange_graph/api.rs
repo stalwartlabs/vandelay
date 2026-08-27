@@ -16,6 +16,18 @@ pub const PREFER_TIMEZONE_UTC: &str = "outlook.timezone=\"UTC\"";
 pub const PREFER_BODY_TEXT: &str = "outlook.body-content-type=\"text\"";
 pub const PREFER_BODY_HTML: &str = "outlook.body-content-type=\"html\"";
 
+pub const EXCEPTION_SELECT: &str = "id,type,seriesMasterId,originalStart,iCalUId,subject,body,\
+     start,end,isAllDay,isCancelled,isDraft,sensitivity,importance,showAs,categories,locations,\
+     organizer,attendees,createdDateTime,lastModifiedDateTime,isReminderOn,\
+     reminderMinutesBeforeStart,originalStartTimeZone";
+
+pub const EXCEPTION_WINDOW_MAX_DAYS: i64 = 1825;
+
+pub const DRIVE_ITEM_SELECT: &str =
+    "id,name,size,folder,file,package,remoteItem,createdDateTime,lastModifiedDateTime";
+
+pub const MESSAGE_STATE_SELECT: &str = "id,isRead,isDraft,isReadReceiptRequested,flag,categories";
+
 #[derive(Debug, Clone)]
 pub struct Endpoints {
     pub api_base: String,
@@ -68,7 +80,7 @@ impl Endpoints {
 
     pub fn folder_messages_ids(&self, folder_id: &str, top: usize) -> String {
         format!(
-            "{}/mailFolders/{}/messages?$top={top}&$select=id",
+            "{}/mailFolders/{}/messages?$top={top}&$select={MESSAGE_STATE_SELECT}",
             self.me_or_user(),
             url_escape(folder_id)
         )
@@ -106,8 +118,62 @@ impl Endpoints {
         format!("{}/events/{}", self.me_or_user(), url_escape(event_id))
     }
 
+    pub fn calendar_exceptions(
+        &self,
+        calendar_id: &str,
+        window_start: &str,
+        window_end: &str,
+        top: usize,
+    ) -> String {
+        format!(
+            "{}/calendars/{}/calendarView?startDateTime={window_start}&endDateTime={window_end}\
+             &$filter=type%20eq%20%27exception%27&$top={top}&$select={EXCEPTION_SELECT}",
+            self.me_or_user(),
+            url_escape(calendar_id)
+        )
+    }
+
+    pub fn drive_root(&self) -> String {
+        format!("{}/drive/root?$select=id,name", self.me_or_user())
+    }
+
+    pub fn drive_children(&self, item_id: &str, top: usize) -> String {
+        format!(
+            "{}/drive/items/{}/children?$top={top}&$select={DRIVE_ITEM_SELECT}",
+            self.me_or_user(),
+            url_escape(item_id)
+        )
+    }
+
+    pub fn drive_item_content(&self, item_id: &str) -> String {
+        format!(
+            "{}/drive/items/{}/content",
+            self.me_or_user(),
+            url_escape(item_id)
+        )
+    }
+
     pub fn contact_folders(&self, top: usize) -> String {
         format!("{}/contactFolders?$top={top}", self.me_or_user())
+    }
+
+    pub fn default_contact_folder(&self) -> String {
+        format!("{}/contactFolders/contacts", self.me_or_user())
+    }
+
+    pub fn contact_folder(&self, folder_id: &str) -> String {
+        format!(
+            "{}/contactFolders/{}",
+            self.me_or_user(),
+            url_escape(folder_id)
+        )
+    }
+
+    pub fn any_contact_parent(&self) -> String {
+        format!(
+            "{}/contacts?$top=1&$select=id,parentFolderId",
+            self.me_or_user()
+        )
     }
 
     pub fn contact_folder_children(&self, folder_id: &str, top: usize) -> String {

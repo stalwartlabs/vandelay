@@ -59,10 +59,14 @@ pub fn reconcile_all(
         for id in &ids {
             server_total.insert(id.clone());
         }
-        let new_ids: Vec<String> = ids
-            .into_iter()
-            .filter(|id| !local.contains_key(id) && planned.insert(id.clone()))
-            .collect();
+        let mut new_ids: Vec<String> = Vec::new();
+        for id in ids {
+            if local.contains_key(&id) {
+                counts.fetched += 1;
+            } else if planned.insert(id.clone()) {
+                new_ids.push(id);
+            }
+        }
         if new_ids.is_empty() {
             continue;
         }
