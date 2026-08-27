@@ -25,6 +25,52 @@ use crate::sync::import_jmap::pool::Pool;
 use super::coordinator::{CHUNK_SIZE, GraphCoordinator};
 use super::folders::CalendarFolder;
 
+pub type EventAttachment = (String, String, Vec<u8>);
+
+fn fetch_event_attachments(
+    client: &crate::exchange_graph::client::GraphClient,
+    endpoints: &crate::exchange_graph::api::Endpoints,
+    event_id: &str,
+) -> Vec<EventAttachment> {
+    use base64::Engine;
+    let url = endpoints.event_attachments(event_id);
+    let Ok(body) = client.get_json_with_prefer(&url, &[]) else {
+        return Vec::new();
+    };
+    let Some(items) = body.get("value").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        if item.get("@odata.type").and_then(Value::as_str)
+            != Some("#microsoft.graph.fileAttachment")
+        {
+            continue;
+        }
+        let Some(encoded) = item.get("contentBytes").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("attachment")
+            .to_owned();
+        let content_type = item
+            .get("contentType")
+            .and_then(Value::as_str)
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        out.push((name, content_type, bytes));
+    }
+    out
+}
+
 pub fn reconcile_all(
     conn: &mut Connection,
     ctx: &GraphCoordinator<'_>,
@@ -51,10 +97,16 @@ pub fn reconcile_all(
         };
         let mut want_ids: Vec<String> = Vec::new();
         let mut occurrence_count = 0usize;
+        let mut series_masters: Vec<String> = Vec::new();
         for stub in &stubs {
             match classify_event_type(stub) {
                 EventType::Occurrence => occurrence_count += 1,
                 _ => {
+                    if matches!(classify_event_type(stub), EventType::SeriesMaster)
+                        && let Some(id) = stub.get("id").and_then(Value::as_str)
+                    {
+                        series_masters.push(id.to_owned());
+                    }
                     if let Some(id) = stub.get("id").and_then(Value::as_str) {
                         server_total.insert(id.to_owned());
                         if local.contains_key(id) {
@@ -75,29 +127,22 @@ pub fn reconcile_all(
                 occurrence_count
             );
         }
-        if want_ids.is_empty() {
-            continue;
-        }
         let fetched = fetch_events(ctx, &want_ids);
         let mut masters: Vec<(String, ConvertedEvent)> = Vec::new();
-        let mut exceptions: Vec<(String, ConvertedEvent)> = Vec::new();
-        let mut any_series = false;
-        for (graph_id, result) in fetched {
+        let mut attachments_by_id: HashMap<String, Vec<EventAttachment>> = HashMap::new();
+        for (graph_id, result, attachments) in fetched {
             match result {
-                Ok(raw) => {
-                    any_series |= is_series_master(&raw);
-                    match convert_event(&raw, None) {
-                        Ok(c) => match c.event_type {
-                            EventType::Exception => exceptions.push((graph_id, c)),
-                            _ => masters.push((graph_id, c)),
-                        },
-                        Err(e) => {
-                            counts.failed += 1;
-                            ctx.logger
-                                .warn(&format!("graph event {graph_id} convert failed: {e}"));
-                        }
+                Ok(raw) => match convert_event(&raw, None) {
+                    Ok(c) => {
+                        attachments_by_id.insert(graph_id.clone(), attachments);
+                        masters.push((graph_id, c));
                     }
-                }
+                    Err(e) => {
+                        counts.failed += 1;
+                        ctx.logger
+                            .warn(&format!("graph event {graph_id} convert failed: {e}"));
+                    }
+                },
                 Err(GraphError::Vanished) => counts.skipped += 1,
                 Err(e) => {
                     counts.failed += 1;
@@ -107,33 +152,13 @@ pub fn reconcile_all(
             }
         }
 
-        if any_series {
-            exceptions.extend(fetch_calendar_exceptions(ctx, &cal.graph_id, counts));
-        }
-
-        let mut master_by_graph_id: HashMap<String, ConvertedEvent> = masters.into_iter().collect();
-        for (ex_graph_id, ex) in exceptions {
-            let Some(master_graph_id) = ex.series_master_id.clone() else {
-                ctx.logger.warn(&format!(
-                    "graph exception event {ex_graph_id} has no seriesMasterId; dropping"
-                ));
-                counts.skipped += 1;
-                continue;
-            };
-            if let Some(master) = master_by_graph_id.get_mut(&master_graph_id) {
-                merge_exception_into(master, &ex);
-            } else if local.contains_key(&master_graph_id) {
-                merge_exception_into_existing(conn, ctx, &master_graph_id, &ex, counts);
-            } else {
-                counts.skipped += 1;
-                ctx.logger.warn(&format!(
-                    "graph exception {ex_graph_id} references missing master {master_graph_id}; orphaned"
-                ));
-            }
-        }
-
+        let master_by_graph_id: HashMap<String, ConvertedEvent> = masters.into_iter().collect();
         let pairs: Vec<(String, ConvertedEvent)> = master_by_graph_id.into_iter().collect();
-        insert_events_chunked(conn, ctx, cal.local_id, &pairs, counts)?;
+        insert_events_chunked(conn, ctx, cal.local_id, &pairs, &attachments_by_id, counts)?;
+
+        if !series_masters.is_empty() {
+            apply_series_expansion(conn, ctx, &cal.graph_id, &series_masters, counts)?;
+        }
     }
 
     if any_failure {
@@ -150,8 +175,8 @@ pub fn reconcile_all(
 fn fetch_events(
     ctx: &GraphCoordinator<'_>,
     ids: &[String],
-) -> Vec<(String, Result<Value, GraphError>)> {
-    type R = (String, Result<Value, GraphError>);
+) -> Vec<(String, Result<Value, GraphError>, Vec<EventAttachment>)> {
+    type R = (String, Result<Value, GraphError>, Vec<EventAttachment>);
     let client = ctx.client.clone();
     let endpoints: crate::exchange_graph::api::Endpoints = (*ctx.endpoints).clone();
     let body_prefer = match ctx.event_body_format {
@@ -159,11 +184,18 @@ fn fetch_events(
         EventBodyFormat::Html => PREFER_BODY_HTML,
     };
     let prefer: Vec<String> = vec![PREFER_TIMEZONE_UTC.to_owned(), body_prefer.to_owned()];
+    let want_attachments = ctx.event_attachments;
     let pool: Pool<String, R> = Pool::new(ctx.workers, move |id: String| {
         let url = endpoints.event(&id);
         let prefer_refs: Vec<&str> = prefer.iter().map(String::as_str).collect();
         let result = client.get_json_with_prefer(&url, &prefer_refs);
-        (id, result)
+        let attachments = match (&result, want_attachments) {
+            (Ok(raw), true) if raw.get("hasAttachments").and_then(Value::as_bool) == Some(true) => {
+                fetch_event_attachments(&client, &endpoints, &id)
+            }
+            _ => Vec::new(),
+        };
+        (id, result, attachments)
     });
     for id in ids {
         pool.submit(id.clone());
@@ -175,10 +207,6 @@ fn fetch_events(
         }
     }
     out
-}
-
-fn is_series_master(raw: &Value) -> bool {
-    raw.get("recurrence").is_some_and(|r| !r.is_null())
 }
 
 fn exception_windows(years: i32) -> Vec<(String, String)> {
@@ -244,103 +272,204 @@ fn fetch_calendar_exceptions(
     out
 }
 
-fn merge_exception_into(master: &mut ConvertedEvent, ex: &ConvertedEvent) {
-    let Some(raw_key) = ex.original_start.as_deref() else {
-        return;
-    };
-    let master_tz = master
-        .data
-        .get("timeZone")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let key = normalise_override_key(raw_key, master_tz.as_deref());
-    let Value::Object(map) = &mut master.data else {
-        return;
-    };
-    let overrides = map
-        .entry("recurrenceOverrides".to_owned())
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    let Value::Object(overrides) = overrides else {
-        return;
-    };
-    overrides.insert(key, override_patch_from_event(&ex.data));
-}
-
-fn merge_exception_into_existing(
+fn apply_series_expansion(
     conn: &mut Connection,
     ctx: &GraphCoordinator<'_>,
-    master_graph_id: &str,
-    ex: &ConvertedEvent,
+    calendar_id: &str,
+    series_masters: &[String],
     counts: &mut TypeCounts,
-) {
-    let local_id = match exchange_graph_ids::local_for_graph_id(
-        conn,
-        ctx.source_id,
-        exchange_graph_ids::CALENDAR_EVENT,
-        master_graph_id,
-    ) {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            counts.skipped += 1;
-            return;
-        }
-        Err(e) => {
-            counts.failed += 1;
-            ctx.logger.warn(&format!(
-                "graph exception merge: lookup of master {master_graph_id} failed: {e}"
-            ));
-            return;
-        }
-    };
-    let Some(raw_key) = ex.original_start.as_deref() else {
-        counts.skipped += 1;
-        return;
-    };
-    if let Err(e) = merge_persisted_master(conn, local_id, raw_key, &ex.data) {
-        counts.failed += 1;
-        ctx.logger.warn(&format!(
-            "graph exception merge into stored master {master_graph_id} failed: {e}"
-        ));
-    } else {
-        counts.fetched += 1;
-    }
-}
+) -> Result<(), Error> {
+    let exceptions = fetch_calendar_exceptions(ctx, calendar_id, counts);
+    let occurrences = fetch_calendar_occurrences(ctx, calendar_id, counts);
+    let windows = exception_windows(ctx.exception_window_years);
+    let ids: HashMap<String, i64> =
+        exchange_graph_ids::ids_of_type(conn, ctx.source_id, exchange_graph_ids::CALENDAR_EVENT)?;
 
-fn merge_persisted_master(
-    conn: &Connection,
-    local_id: i64,
-    raw_key: &str,
-    ex_data: &Value,
-) -> Result<(), String> {
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-    let row: String = tx
-        .query_row(
+    let mut by_master: HashMap<&str, Vec<&ConvertedEvent>> = HashMap::new();
+    for (_, ex) in &exceptions {
+        if let Some(master) = ex.series_master_id.as_deref() {
+            by_master.entry(master).or_default().push(ex);
+        }
+    }
+
+    for master_id in series_masters {
+        let Some(local_id) = ids.get(master_id).copied() else {
+            continue;
+        };
+        let stored: String = match conn.query_row(
             "SELECT data FROM calendar_events WHERE id = ?1",
             params![local_id],
             |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    let mut data: Value = serde_json::from_str(&row).map_err(|e| e.to_string())?;
-    let master_tz = data
-        .get("timeZone")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let key = normalise_override_key(raw_key, master_tz.as_deref());
-    if let Value::Object(map) = &mut data {
-        let entry = map
-            .entry("recurrenceOverrides".to_owned())
-            .or_insert_with(|| Value::Object(serde_json::Map::new()));
-        if let Value::Object(overrides) = entry {
-            overrides.insert(key, override_patch_from_event(ex_data));
+        ) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Ok(mut card) = serde_json::from_str::<Value>(&stored) else {
+            continue;
+        };
+        let before = card.clone();
+
+        for ex in by_master.get(master_id.as_str()).into_iter().flatten() {
+            let Some(raw_key) = ex.original_start.as_deref() else {
+                continue;
+            };
+            let tz = card
+                .get("timeZone")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let key = normalise_override_key(raw_key, tz.as_deref());
+            if let Some(map) = card.as_object_mut() {
+                let entry = map
+                    .entry("recurrenceOverrides".to_owned())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if let Some(overrides) = entry.as_object_mut() {
+                    overrides.insert(key, override_patch_from_event(&ex.data));
+                }
+            }
+        }
+
+        let cancelled = cancelled_occurrence_keys(
+            &card,
+            master_id,
+            &occurrences,
+            by_master
+                .get(master_id.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            &windows,
+        );
+        if !cancelled.is_empty()
+            && let Some(map) = card.as_object_mut()
+        {
+            let entry = map
+                .entry("recurrenceOverrides".to_owned())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(overrides) = entry.as_object_mut() {
+                for key in cancelled {
+                    overrides
+                        .entry(key)
+                        .or_insert_with(|| json!({"excluded": true}));
+                }
+            }
+        }
+
+        if card != before {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE calendar_events SET data = ?1 WHERE id = ?2",
+                params![card.to_string(), local_id],
+            )?;
+            tx.commit()?;
+            counts.updated += 1;
         }
     }
-    tx.execute(
-        "UPDATE calendar_events SET data = ?1 WHERE id = ?2",
-        params![data.to_string(), local_id],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn cancelled_occurrence_keys(
+    card: &Value,
+    master_id: &str,
+    occurrences: &HashMap<String, Vec<String>>,
+    exceptions: &[&ConvertedEvent],
+    windows: &[(String, String)],
+) -> Vec<String> {
+    let Some(rule) = card.get("recurrenceRule") else {
+        return Vec::new();
+    };
+    let Some(start) = card.get("start").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let (start_date, start_time) = match start.split_once('T') {
+        Some((d, t)) => (d, t),
+        None => (start, "00:00:00"),
+    };
+    let Ok(series_start) = chrono::NaiveDate::parse_from_str(start_date, "%Y-%m-%d") else {
+        return Vec::new();
+    };
+    let Some(pattern) =
+        crate::exchange_graph::expand::graph_pattern_from_jscalendar(rule, series_start)
+    else {
+        return Vec::new();
+    };
+    let tz = card.get("timeZone").and_then(Value::as_str);
+
+    let mut actual: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for utc in occurrences.get(master_id).into_iter().flatten() {
+        actual.insert(local_date_of(utc, tz));
+    }
+    for ex in exceptions {
+        if let Some(raw) = ex.original_start.as_deref() {
+            let key = normalise_override_key(raw, tz);
+            actual.insert(key.split('T').next().unwrap_or(&key).to_owned());
+        }
+    }
+
+    let mut out = Vec::new();
+    for (from, to) in windows {
+        let (Ok(w0), Ok(w1)) = (
+            chrono::NaiveDate::parse_from_str(&from[..10], "%Y-%m-%d"),
+            chrono::NaiveDate::parse_from_str(&to[..10], "%Y-%m-%d"),
+        ) else {
+            continue;
+        };
+        let Some(expected) = crate::exchange_graph::expand::expected_dates(&pattern, w0, w1) else {
+            return Vec::new();
+        };
+        for date in expected {
+            let key = date.format("%Y-%m-%d").to_string();
+            if !actual.contains(&key) {
+                out.push(format!("{key}T{start_time}"));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn local_date_of(utc: &str, tz: Option<&str>) -> String {
+    let key = normalise_override_key(utc, tz);
+    key.split('T').next().unwrap_or(&key).to_owned()
+}
+
+fn fetch_calendar_occurrences(
+    ctx: &GraphCoordinator<'_>,
+    calendar_id: &str,
+    counts: &mut TypeCounts,
+) -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for (from, to) in exception_windows(ctx.exception_window_years) {
+        let url = ctx
+            .endpoints
+            .calendar_occurrences(calendar_id, &from, &to, ctx.top);
+        match api::collect_all_values(ctx.client, &url, &[PREFER_TIMEZONE_UTC]) {
+            Ok(values) => {
+                for raw in values {
+                    let Some(master) = raw.get("seriesMasterId").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(start) = raw
+                        .get("start")
+                        .and_then(|s| s.get("dateTime"))
+                        .and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    out.entry(master.to_owned())
+                        .or_default()
+                        .push(start.to_owned());
+                }
+            }
+            Err(e) => {
+                counts.failed += 1;
+                ctx.logger.warn(&format!(
+                    "graph calendar {calendar_id} occurrence sweep {from}..{to} failed: {e}; \
+                     deleted occurrences cannot be detected for this calendar"
+                ));
+            }
+        }
+    }
+    out
 }
 
 pub fn normalise_override_key(raw: &str, master_tz: Option<&str>) -> String {
@@ -398,12 +527,14 @@ fn insert_events_chunked(
     ctx: &GraphCoordinator<'_>,
     calendar_local_id: i64,
     pairs: &[(String, ConvertedEvent)],
+    attachments: &HashMap<String, Vec<EventAttachment>>,
     counts: &mut TypeCounts,
 ) -> Result<(), Error> {
     for chunk in pairs.chunks(CHUNK_SIZE) {
         let tx = conn.unchecked_transaction()?;
         for (graph_id, event) in chunk {
-            insert_event_in_tx(&tx, ctx, calendar_local_id, graph_id, event, counts)?;
+            let files = attachments.get(graph_id).map(Vec::as_slice).unwrap_or(&[]);
+            insert_event_in_tx(&tx, ctx, calendar_local_id, graph_id, event, files, counts)?;
         }
         tx.commit()?;
     }
@@ -416,10 +547,13 @@ fn insert_event_in_tx(
     calendar_local_id: i64,
     graph_id: &str,
     event: &ConvertedEvent,
+    attachments: &[EventAttachment],
     counts: &mut TypeCounts,
 ) -> Result<(), Error> {
     let calendar_ids = json!([calendar_local_id]).to_string();
-    let data = event.data.to_string();
+    let mut card = event.data.clone();
+    attach_links(tx, &mut card, attachments)?;
+    let data = card.to_string();
     tx.execute(
         "INSERT INTO calendar_events (calendar_ids, is_draft, use_default_alerts, data, data_type)
          VALUES (?1, ?2, ?3, ?4, 'Event')",
@@ -439,6 +573,39 @@ fn insert_event_in_tx(
         new_id,
     )?;
     counts.created += 1;
+    Ok(())
+}
+
+fn attach_links(
+    tx: &Transaction<'_>,
+    card: &mut Value,
+    attachments: &[EventAttachment],
+) -> Result<(), Error> {
+    if attachments.is_empty() {
+        return Ok(());
+    }
+    let mut links = serde_json::Map::new();
+    for (idx, (name, content_type, bytes)) in (1u32..).zip(attachments) {
+        let blob_id = crate::db::blobs::intern_blob(tx, bytes)?;
+        links.insert(
+            idx.to_string(),
+            json!({
+                "@type": "Link",
+                "@blob": blob_id,
+                "contentType": content_type,
+                "title": name,
+                "rel": "enclosure",
+            }),
+        );
+    }
+    if let Some(map) = card.as_object_mut() {
+        match map.get_mut("links").and_then(Value::as_object_mut) {
+            Some(existing) => existing.extend(links),
+            None => {
+                map.insert("links".to_owned(), Value::Object(links));
+            }
+        }
+    }
     Ok(())
 }
 

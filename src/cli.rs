@@ -1176,6 +1176,19 @@ pub struct ExchangeGraphImportArgs {
 
     #[arg(
         long,
+        help = "Skip contact photos (saves one request per contact on large address books)",
+        long_help = "Skip contact photos.\n              Graph will not say which contacts have a photo: $expand=photo comes back empty\n              even when one exists, so the only way to find out is to ask for the bytes.\n              vandelay therefore spends one extra request per contact. Pass this to skip\n              photos entirely on a large address book."
+    )]
+    skip_contact_photos: bool,
+
+    #[arg(
+        long,
+        help = "Skip event file attachments (they are stored as JSCalendar enclosure links)"
+    )]
+    skip_event_attachments: bool,
+
+    #[arg(
+        long,
         value_name = "URL",
         default_value = "https://graph.microsoft.com/v1.0",
         help = "Microsoft Graph API base URL (override for national clouds or tests)",
@@ -1239,6 +1252,8 @@ fn resolve_exchange_graph_import(args: ExchangeGraphImportArgs) -> Result<Action
             graph_connections,
             top,
             exception_window_years: args.exception_window_years,
+            contact_photos: !args.skip_contact_photos,
+            event_attachments: !args.skip_event_attachments,
             allow_source_change: args.allow_source_change,
         },
     ))

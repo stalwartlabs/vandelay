@@ -43,6 +43,8 @@ pub struct GraphImportConfig {
     pub graph_connections: usize,
     pub top: usize,
     pub exception_window_years: i32,
+    pub contact_photos: bool,
+    pub event_attachments: bool,
     pub allow_source_change: bool,
 }
 
@@ -57,6 +59,8 @@ pub struct GraphCoordinator<'a> {
     pub logger: crate::logging::Logger,
     pub event_body_format: EventBodyFormat,
     pub exception_window_years: i32,
+    pub contact_photos: bool,
+    pub event_attachments: bool,
 }
 
 pub fn run(common: CommonConfig, config: GraphImportConfig) -> Result<Summary, Error> {
@@ -142,6 +146,8 @@ pub fn run(common: CommonConfig, config: GraphImportConfig) -> Result<Summary, E
         logger,
         event_body_format: config.event_body_format,
         exception_window_years: config.exception_window_years,
+        contact_photos: config.contact_photos,
+        event_attachments: config.event_attachments,
     };
 
     let primary = !matches!(config.mailbox_kind, MailboxKind::Archive);
@@ -503,6 +509,8 @@ mod tests {
             graph_connections: 4,
             top: 100,
             exception_window_years: 5,
+            contact_photos: true,
+            event_attachments: true,
             allow_source_change: false,
         };
         let url = canonical_session_url(&config);

@@ -590,6 +590,8 @@ fn integration_dry_run_against_mock_server_lists_three_surfaces() {
         graph_connections: 2,
         top: 100,
         exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     };
     let summary = vandelay::sync::import_exchange_graph::run(common, config).unwrap();
@@ -700,6 +702,8 @@ fn integration_full_run_mail_only_imports_mime_via_value() {
         graph_connections: 2,
         top: 100,
         exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     };
     drop(tmp);
@@ -797,6 +801,8 @@ fn integration_duplicate_message_id_does_not_abort_run() {
         graph_connections: 2,
         top: 100,
         exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     };
     drop(tmp);
@@ -887,6 +893,8 @@ fn integration_full_run_is_convergent_on_second_invocation() {
         graph_connections: 2,
         top: 100,
         exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     };
     let make_common = |path: std::path::PathBuf| vandelay::sync::CommonConfig {
@@ -967,6 +975,8 @@ fn source_change_protection_refuses_a_different_account() {
         graph_connections: 2,
         top: 100,
         exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     };
     let err = vandelay::sync::import_exchange_graph::run(common, config).unwrap_err();
@@ -1034,6 +1044,8 @@ fn make_config(
         graph_connections: 2,
         top: 100,
         exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     }
 }
@@ -1746,6 +1758,8 @@ fn full_run_records_graph_id_in_sync_id_exchange_graph_with_padding() {
         graph_connections: 2,
         top: 100,
         exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     };
     drop(tmp);
@@ -1817,6 +1831,8 @@ fn archive_mailbox_kind_encodes_synthetic_suffix_in_account_id() {
         graph_connections: 2,
         top: 100,
         exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     };
     drop(tmp);
@@ -1883,6 +1899,8 @@ fn allow_source_change_permits_overwriting_a_different_account() {
         graph_connections: 2,
         top: 100,
         exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: true,
     };
     let result = vandelay::sync::import_exchange_graph::run(common, config);
@@ -1965,6 +1983,8 @@ fn dry_run_makes_no_per_item_get_and_no_sqlite_writes() {
         graph_connections: 2,
         top: 100,
         exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     };
     drop(tmp);
@@ -2134,6 +2154,8 @@ fn folder_enumeration_failure_skips_vanished_deletion() {
         graph_connections: 2,
         top: 100,
         exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: true,
     };
     let _ = vandelay::sync::import_exchange_graph::run(common, config).unwrap();
@@ -2734,4 +2756,256 @@ fn drive_items_import_as_file_nodes_and_skip_facetless_items() {
         )
         .unwrap();
     assert_eq!(body, b"hello", "file content is stored verbatim");
+}
+
+fn stub_empty_calendar_scaffold(server: &mut Server) {
+    stub_principal(server);
+    json_mock(
+        server,
+        "/me/mailFolders?$top=100&includeHiddenFolders=true",
+        r#"{"value":[]}"#,
+    );
+    json_mock(
+        server,
+        "/me/mailboxSettings?$select=timeZone",
+        r#"{"timeZone":"UTC"}"#,
+    );
+    json_mock(server, "/me/contactFolders?$top=100", r#"{"value":[]}"#);
+}
+
+#[test]
+fn a_deleted_occurrence_becomes_an_excluded_override() {
+    let mut server = Server::new();
+    stub_empty_calendar_scaffold(&mut server);
+    json_mock(
+        &mut server,
+        "/me/calendars?$top=100",
+        r#"{"value":[{"id":"CAL1","name":"Calendar","isDefaultCalendar":true}]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/calendars/CAL1/events?$top=100&$select=id,type,seriesMasterId",
+        r#"{"value":[{"id":"MASTER","type":"seriesMaster","iCalUId":"uid-master"}]}"#,
+    );
+    let today = chrono::Utc::now().date_naive();
+    let start = today + chrono::Duration::days(10);
+    json_mock(
+        &mut server,
+        "/me/events/MASTER",
+        &format!(
+            r#"{{
+                "id":"MASTER","iCalUId":"uid-master","type":"seriesMaster",
+                "subject":"Daily standup",
+                "start":{{"dateTime":"{start}T09:00:00.0000000","timeZone":"UTC"}},
+                "end":{{"dateTime":"{start}T09:30:00.0000000","timeZone":"UTC"}},
+                "recurrence":{{
+                    "pattern":{{"type":"daily","interval":1}},
+                    "range":{{"type":"numbered","startDate":"{start}",
+                              "numberOfOccurrences":4}}
+                }}
+            }}"#,
+            start = start.format("%Y-%m-%d")
+        ),
+    );
+    server
+        .mock(
+            "GET",
+            Matcher::Regex(r"calendarView.*type%20eq%20%27exception%27".to_owned()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[]}"#)
+        .expect_at_least(1)
+        .create();
+    // Graph returns three of the four occurrences: the third was deleted, and a
+    // deleted occurrence is simply absent rather than reported as cancelled.
+    let occurrences = format!(
+        r#"{{"value":[
+            {{"id":"O1","type":"occurrence","seriesMasterId":"MASTER",
+              "start":{{"dateTime":"{d0}T09:00:00.0000000","timeZone":"UTC"}}}},
+            {{"id":"O2","type":"occurrence","seriesMasterId":"MASTER",
+              "start":{{"dateTime":"{d1}T09:00:00.0000000","timeZone":"UTC"}}}},
+            {{"id":"O4","type":"occurrence","seriesMasterId":"MASTER",
+              "start":{{"dateTime":"{d3}T09:00:00.0000000","timeZone":"UTC"}}}}
+        ]}}"#,
+        d0 = start.format("%Y-%m-%d"),
+        d1 = (start + chrono::Duration::days(1)).format("%Y-%m-%d"),
+        d3 = (start + chrono::Duration::days(3)).format("%Y-%m-%d"),
+    );
+    server
+        .mock(
+            "GET",
+            Matcher::Regex(r"calendarView.*type%20eq%20%27occurrence%27".to_owned()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(occurrences)
+        .expect_at_least(1)
+        .create();
+
+    let base = server.url();
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    vandelay::sync::import_exchange_graph::run(
+        make_common(archive.clone()),
+        make_config(base, None, surfaces("calendar")),
+    )
+    .unwrap();
+
+    let conn = vandelay::db::init::open(&archive).unwrap();
+    let row: String = conn
+        .query_row("SELECT data FROM calendar_events", [], |row| row.get(0))
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&row).unwrap();
+    let overrides = v["recurrenceOverrides"]
+        .as_object()
+        .expect("the missing occurrence produces an override");
+    let missing = format!(
+        "{}T09:00:00",
+        (start + chrono::Duration::days(2)).format("%Y-%m-%d")
+    );
+    assert_eq!(
+        overrides.len(),
+        1,
+        "only the absent occurrence is excluded; got {:?}",
+        overrides.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        overrides[&missing]["excluded"], true,
+        "v1.0 cannot report a cancelled occurrence, so it is inferred from the gap \
+         between the expanded rule and the occurrences Graph returned"
+    );
+}
+
+#[test]
+fn event_file_attachments_become_enclosure_links() {
+    let mut server = Server::new();
+    stub_empty_calendar_scaffold(&mut server);
+    json_mock(
+        &mut server,
+        "/me/calendars?$top=100",
+        r#"{"value":[{"id":"CAL1","name":"Calendar","isDefaultCalendar":true}]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/calendars/CAL1/events?$top=100&$select=id,type,seriesMasterId",
+        r#"{"value":[{"id":"EV","type":"singleInstance","iCalUId":"uid-ev"}]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/events/EV",
+        r#"{"id":"EV","iCalUId":"uid-ev","type":"singleInstance","subject":"With a file",
+            "hasAttachments":true,
+            "start":{"dateTime":"2026-05-04T15:00:00.0000000","timeZone":"UTC"},
+            "end":{"dateTime":"2026-05-04T16:00:00.0000000","timeZone":"UTC"}}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/events/EV/attachments",
+        r##"{"value":[
+            {"@odata.type":"#microsoft.graph.fileAttachment","id":"A1","name":"agenda.txt",
+             "contentType":"text/plain","size":5,"contentBytes":"aGVsbG8="},
+            {"@odata.type":"#microsoft.graph.itemAttachment","id":"A2","name":"nested.msg"},
+            {"@odata.type":"#microsoft.graph.referenceAttachment","id":"A3","name":"link"}
+        ]}"##,
+    );
+
+    let base = server.url();
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    vandelay::sync::import_exchange_graph::run(
+        make_common(archive.clone()),
+        make_config(base, None, surfaces("calendar")),
+    )
+    .unwrap();
+
+    let conn = vandelay::db::init::open(&archive).unwrap();
+    let row: String = conn
+        .query_row("SELECT data FROM calendar_events", [], |row| row.get(0))
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&row).unwrap();
+    let links = v["links"].as_object().expect("links present");
+    assert_eq!(
+        links.len(),
+        1,
+        "only fileAttachment carries bytes; item and reference attachments are skipped"
+    );
+    let link = &links["1"];
+    assert_eq!(link["rel"], "enclosure");
+    assert_eq!(link["title"], "agenda.txt");
+    assert_eq!(link["contentType"], "text/plain");
+    let blob: Vec<u8> = conn
+        .query_row(
+            "SELECT b.data FROM blobs b WHERE b.id = ?1",
+            [link["@blob"].as_i64().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(blob, b"hello");
+}
+
+#[test]
+fn contact_photo_categories_and_im_addresses_are_imported() {
+    let mut server = Server::new();
+    stub_principal(&mut server);
+    json_mock(
+        &mut server,
+        "/me/contactFolders?$top=100",
+        r#"{"value":[]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contactFolders/contacts",
+        r#"{"id":"DEFAULT","displayName":"Contacts","wellKnownName":"contacts"}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contactFolders/DEFAULT/childFolders?$top=100",
+        r#"{"value":[]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contactFolders/DEFAULT/contacts?$top=100&$select=id",
+        r#"{"value":[{"id":"C1"}]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contacts/C1",
+        r#"{"id":"C1","displayName":"Alice","categories":["Red Category","VIP"],
+            "imAddresses":["sip:alice@x.com",""]}"#,
+    );
+    // Graph reports image/jpeg for every contact photo regardless of the real bytes,
+    // so the stored mediaType has to come from the content itself.
+    server
+        .mock("GET", "/me/contacts/C1/photo/$value")
+        .with_status(200)
+        .with_header("content-type", "image/jpeg")
+        .with_body(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".as_slice())
+        .expect_at_least(1)
+        .create();
+
+    let base = server.url();
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    let mut config = make_config(base, None, surfaces("contacts"));
+    config.contact_photos = true;
+    vandelay::sync::import_exchange_graph::run(make_common(archive.clone()), config).unwrap();
+
+    let conn = vandelay::db::init::open(&archive).unwrap();
+    let row: String = conn
+        .query_row("SELECT data FROM contact_cards", [], |row| row.get(0))
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&row).unwrap();
+    assert_eq!(v["keywords"]["red category"], true);
+    assert_eq!(v["keywords"]["vip"], true);
+    assert_eq!(
+        v["onlineServices"]["1"]["uri"], "sip:alice@x.com",
+        "RFC 9553 2.3.2: a URI-shaped IM address belongs in uri, not user"
+    );
+    assert!(
+        v["onlineServices"].as_object().unwrap().len() == 1,
+        "the empty IM entry is dropped"
+    );
+    assert_eq!(v["media"]["photo"]["kind"], "photo");
+    assert_eq!(
+        v["media"]["photo"]["mediaType"], "image/png",
+        "the type is sniffed from the bytes, not taken from Graph's jpeg header"
+    );
 }

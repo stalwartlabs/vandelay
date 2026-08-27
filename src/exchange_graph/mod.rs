@@ -9,6 +9,7 @@ pub mod calendar_map;
 pub mod client;
 pub mod contact_map;
 pub mod error;
+pub mod expand;
 pub mod oauth;
 pub mod recurrence;
 pub mod retry;

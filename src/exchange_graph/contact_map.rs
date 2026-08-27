@@ -286,6 +286,38 @@ pub fn convert_contact(graph_contact: &Value) -> Result<ConvertedContact, GraphE
         card.insert("links".to_owned(), Value::Object(links));
     }
 
+    if let Some(cats) = graph_contact.get("categories").and_then(Value::as_array) {
+        let mut keywords = Map::new();
+        for cat in cats.iter().filter_map(Value::as_str) {
+            if !cat.trim().is_empty() {
+                keywords.insert(cat.to_ascii_lowercase(), Value::Bool(true));
+            }
+        }
+        if !keywords.is_empty() {
+            card.insert("keywords".to_owned(), Value::Object(keywords));
+        }
+    }
+
+    if let Some(ims) = graph_contact.get("imAddresses").and_then(Value::as_array) {
+        let mut services = Map::new();
+        for (i, addr) in ims
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .enumerate()
+        {
+            let slot = if has_uri_scheme(addr) { "uri" } else { "user" };
+            services.insert(
+                (i + 1).to_string(),
+                json!({"@type": "OnlineService", slot: addr}),
+            );
+        }
+        if !services.is_empty() {
+            card.insert("onlineServices".to_owned(), Value::Object(services));
+        }
+    }
+
     if let Some(created) = graph_contact.get("createdDateTime").and_then(Value::as_str) {
         card.insert(
             "created".to_owned(),
@@ -306,6 +338,18 @@ pub fn convert_contact(graph_contact: &Value) -> Result<ConvertedContact, GraphE
         uid,
         data: Value::Object(card),
     })
+}
+
+fn has_uri_scheme(value: &str) -> bool {
+    let Some((scheme, rest)) = value.split_once(':') else {
+        return false;
+    };
+    !rest.is_empty()
+        && !scheme.is_empty()
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 pub fn synthetic_uid(graph_id: &str) -> String {

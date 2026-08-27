@@ -21,6 +21,44 @@ use crate::sync::import_jmap::pool::Pool;
 use super::coordinator::{CHUNK_SIZE, GraphCoordinator};
 use super::folders::ContactFolder;
 
+fn fetch_photo(
+    client: &crate::exchange_graph::client::GraphClient,
+    endpoints: &crate::exchange_graph::api::Endpoints,
+    id: &str,
+) -> Option<ContactPhoto> {
+    let url = endpoints.contact_photo(id);
+    let resp = client
+        .get_with_prefer(&url, crate::exchange_graph::client::Accept::Binary, &[])
+        .ok()?;
+    if resp.body.is_empty() {
+        return None;
+    }
+    let media_type = sniff_image_type(&resp.body)
+        .map(str::to_owned)
+        .or_else(|| resp.content_type.clone())
+        .unwrap_or_else(|| "application/octet-stream".to_owned());
+    Some((resp.body, media_type))
+}
+
+fn sniff_image_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("image/bmp");
+    }
+    None
+}
+
 pub fn reconcile_all(
     conn: &mut Connection,
     ctx: &GraphCoordinator<'_>,
@@ -71,11 +109,11 @@ pub fn reconcile_all(
             continue;
         }
         let fetched = fetch_contacts(ctx, &new_ids);
-        let mut converted: Vec<(String, ConvertedContact)> = Vec::new();
-        for (graph_id, result) in fetched {
+        let mut converted: Vec<(String, ConvertedContact, Option<ContactPhoto>)> = Vec::new();
+        for (graph_id, result, photo) in fetched {
             match result {
                 Ok(raw) => match convert_contact(&raw) {
-                    Ok(c) => converted.push((graph_id, c)),
+                    Ok(c) => converted.push((graph_id, c, photo)),
                     Err(e) => {
                         counts.failed += 1;
                         ctx.logger
@@ -104,16 +142,25 @@ pub fn reconcile_all(
     Ok(())
 }
 
+pub type ContactPhoto = (Vec<u8>, String);
+
 fn fetch_contacts(
     ctx: &GraphCoordinator<'_>,
     ids: &[String],
-) -> Vec<(String, Result<Value, GraphError>)> {
-    type R = (String, Result<Value, GraphError>);
+) -> Vec<(String, Result<Value, GraphError>, Option<ContactPhoto>)> {
+    type R = (String, Result<Value, GraphError>, Option<ContactPhoto>);
     let client = ctx.client.clone();
     let endpoints: crate::exchange_graph::api::Endpoints = (*ctx.endpoints).clone();
+    let want_photos = ctx.contact_photos;
     let pool: Pool<String, R> = Pool::new(ctx.workers, move |id: String| {
         let url = endpoints.contact(&id);
-        (id, client.get_json_with_prefer(&url, &[]))
+        let contact = client.get_json_with_prefer(&url, &[]);
+        let photo = if want_photos && contact.is_ok() {
+            fetch_photo(&client, &endpoints, &id)
+        } else {
+            None
+        };
+        (id, contact, photo)
     });
     for id in ids {
         pool.submit(id.clone());
@@ -131,13 +178,13 @@ fn insert_contacts_chunked(
     conn: &mut Connection,
     ctx: &GraphCoordinator<'_>,
     book_local_id: i64,
-    pairs: &[(String, ConvertedContact)],
+    pairs: &[(String, ConvertedContact, Option<ContactPhoto>)],
     counts: &mut TypeCounts,
 ) -> Result<(), Error> {
     for chunk in pairs.chunks(CHUNK_SIZE) {
         let tx = conn.unchecked_transaction()?;
-        for (graph_id, contact) in chunk {
-            insert_contact_in_tx(&tx, ctx, book_local_id, graph_id, contact, counts)?;
+        for (graph_id, contact, photo) in chunk {
+            insert_contact_in_tx(&tx, ctx, book_local_id, graph_id, contact, photo, counts)?;
         }
         tx.commit()?;
     }
@@ -150,10 +197,28 @@ fn insert_contact_in_tx(
     book_local_id: i64,
     graph_id: &str,
     converted: &ConvertedContact,
+    photo: &Option<ContactPhoto>,
     counts: &mut TypeCounts,
 ) -> Result<(), Error> {
     let book_ids = json!([book_local_id]).to_string();
-    let data = converted.data.to_string();
+    let mut card = converted.data.clone();
+    if let Some((bytes, media_type)) = photo {
+        let blob_id = crate::db::blobs::intern_blob(tx, bytes)?;
+        if let Some(map) = card.as_object_mut() {
+            map.insert(
+                "media".to_owned(),
+                json!({
+                    "photo": {
+                        "@type": "Media",
+                        "kind": "photo",
+                        "@blob": blob_id,
+                        "mediaType": media_type,
+                    }
+                }),
+            );
+        }
+    }
+    let data = card.to_string();
     tx.execute(
         "INSERT INTO contact_cards (uid, address_book_ids, data) VALUES (?1, ?2, ?3)",
         params![converted.uid, book_ids, data],
@@ -203,4 +268,22 @@ fn delete_vanished(
         tx.commit()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sniff_image_type;
+
+    #[test]
+    fn photo_type_comes_from_the_bytes_not_the_header() {
+        let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        assert_eq!(sniff_image_type(png), Some("image/png"));
+        assert_eq!(
+            sniff_image_type(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some("image/jpeg")
+        );
+        assert_eq!(sniff_image_type(b"GIF89a..."), Some("image/gif"));
+        assert_eq!(sniff_image_type(b"RIFF____WEBPVP8 "), Some("image/webp"));
+        assert_eq!(sniff_image_type(b"not an image"), None);
+    }
 }

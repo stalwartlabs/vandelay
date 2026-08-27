@@ -153,6 +153,22 @@ impl Endpoints {
         )
     }
 
+    pub fn calendar_occurrences(
+        &self,
+        calendar_id: &str,
+        window_start: &str,
+        window_end: &str,
+        top: usize,
+    ) -> String {
+        format!(
+            "{}/calendars/{}/calendarView?startDateTime={window_start}&endDateTime={window_end}\
+             &$filter=type%20eq%20%27occurrence%27&$top={top}\
+             &$select=id,type,seriesMasterId,start",
+            self.me_or_user(),
+            url_escape(calendar_id)
+        )
+    }
+
     pub fn contact_folders(&self, top: usize) -> String {
         format!("{}/contactFolders?$top={top}", self.me_or_user())
     }
@@ -194,6 +210,22 @@ impl Endpoints {
 
     pub fn contact(&self, contact_id: &str) -> String {
         format!("{}/contacts/{}", self.me_or_user(), url_escape(contact_id))
+    }
+
+    pub fn contact_photo(&self, contact_id: &str) -> String {
+        format!(
+            "{}/contacts/{}/photo/$value",
+            self.me_or_user(),
+            url_escape(contact_id)
+        )
+    }
+
+    pub fn event_attachments(&self, event_id: &str) -> String {
+        format!(
+            "{}/events/{}/attachments",
+            self.me_or_user(),
+            url_escape(event_id)
+        )
     }
 
     pub fn mailbox_settings_timezone(&self) -> String {

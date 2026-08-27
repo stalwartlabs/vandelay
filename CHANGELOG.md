@@ -6,11 +6,20 @@ All notable changes to this project will be documented in this file. This projec
 
 ### Added
 - MS Exchange Graph: Import the default Contacts folder, recover series exceptions (fixes #39)
-- OneDrive files import
+- OneDrive files import.
+- Graph contact photos, categories and IM addresses.
+- Graph event file attachments.
 
 ### Changed
+- Graph counts already-present objects as fetched.
 
 ### Fixed
+- Graph deleted recurrence occurrences were not excluded.
+- `bySetPosition` was emitted on every Graph recurrence rule.
+- Graph read, flagged and category state was dropped.
+- A contact folder reachable by two paths aborted the run.
+- IM addresses were dropped on export for lacking a `uri`.
+- A redirect warning logged a OneDrive download credential.
 
 ## [1.0.9] - 2026-08-22
 
