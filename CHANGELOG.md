@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file. This projec
 ## [1.0.14] - Unreleased
 
 ### Added
+- A `Dockerfile` that builds a static image running as `nobody`, with the archive directory mounted at `/data` (#20)
 
 ### Changed
 - README: the export section explains how an administrator exports into another user's account with `--account-name` (#34)

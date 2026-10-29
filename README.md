@@ -91,6 +91,15 @@ cargo install --path .
 
 A signed `.msi` is also published with each release.
 
+To run it in a container, build the image from the repository's `Dockerfile` and mount a directory for the archive at `/data`. The image runs as `nobody`, so pass your own user id to keep the archive writable:
+
+```sh
+docker build -t vandelay .
+docker run --rm -it --user "$(id -u):$(id -g)" -v "$PWD:/data" \
+  -e VANDELAY_PASSWORD vandelay import imap \
+  --url imaps://imap.example.com --auth-basic alice@example.com alice.sqlite
+```
+
 ## Quick start
 
 A typical run is two commands, one to capture a source account into a local SQLite archive and one to push that archive into a JMAP target.
