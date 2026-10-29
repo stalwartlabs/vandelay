@@ -13,4 +13,4 @@ pub mod pool;
 
 pub mod coordinator;
 
-pub use coordinator::{ImapAuth, ImapImportConfig, run};
+pub use coordinator::{ImapAuth, ImapImportConfig, run, run_reporting};

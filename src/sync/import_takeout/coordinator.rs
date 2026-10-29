@@ -15,7 +15,7 @@ use crate::db::sources::SourceKey;
 use crate::db::takeout_ids;
 use crate::error::Error;
 use crate::logging::{LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
-use crate::sync::{CommonConfig, Summary, TypeCounts};
+use crate::sync::{CommonConfig, RunOutcome, Summary, TypeCounts};
 
 use super::calendar;
 use super::contacts;
@@ -31,6 +31,20 @@ pub struct TakeoutImportConfig {
 }
 
 pub fn run(common: CommonConfig, config: TakeoutImportConfig) -> Result<Summary, Error> {
+    run_reporting(common, config).into_result()
+}
+
+pub fn run_reporting(common: CommonConfig, config: TakeoutImportConfig) -> RunOutcome {
+    let mut summary = Summary::default();
+    let error = run_into(common, config, &mut summary).err();
+    RunOutcome { summary, error }
+}
+
+fn run_into(
+    common: CommonConfig,
+    config: TakeoutImportConfig,
+    summary: &mut Summary,
+) -> Result<(), Error> {
     let logger = common.logger;
     if common.threads > 1 && logger.enabled(LEVEL_PROGRESS) {
         eprintln!("takeout importer is single-threaded; --threads value will be ignored");
@@ -90,7 +104,8 @@ pub fn run(common: CommonConfig, config: TakeoutImportConfig) -> Result<Summary,
     };
 
     if common.dry_run {
-        return Ok(dry_run_summary(&conn, source_id, &walk_result, logger));
+        *summary = dry_run_summary(&conn, source_id, &walk_result, logger);
+        return Ok(());
     }
 
     let options = MappingOptions {
@@ -107,7 +122,8 @@ pub fn run(common: CommonConfig, config: TakeoutImportConfig) -> Result<Summary,
     let mut mailbox_cache: HashMap<String, i64> =
         takeout_ids::all_for_type(&conn, source_id, takeout_ids::MAILBOX)?;
 
-    process_mbox_files(
+    let mut aborted: Option<Error> = None;
+    if let Err(e) = process_mbox_files(
         &mut conn,
         source_id,
         &walk_result,
@@ -116,27 +132,38 @@ pub fn run(common: CommonConfig, config: TakeoutImportConfig) -> Result<Summary,
         &mut mailbox_counts,
         &mut email_counts,
         logger,
-    )?;
+    ) {
+        aborted = Some(e);
+    }
 
-    process_ics_files(
-        &mut conn,
-        source_id,
-        &walk_result,
-        &mut calendar_counts,
-        &mut calendar_event_counts,
-        logger,
-    )?;
+    if aborted.is_none()
+        && let Err(e) = process_ics_files(
+            &mut conn,
+            source_id,
+            &walk_result,
+            &mut calendar_counts,
+            &mut calendar_event_counts,
+            logger,
+        )
+    {
+        aborted = Some(e);
+    }
 
-    process_vcf_files(
-        &mut conn,
-        source_id,
-        &walk_result,
-        &mut book_counts,
-        &mut card_counts,
-        logger,
-    )?;
+    if aborted.is_none()
+        && let Err(e) = process_vcf_files(
+            &mut conn,
+            source_id,
+            &walk_result,
+            &mut book_counts,
+            &mut card_counts,
+            logger,
+        )
+    {
+        aborted = Some(e);
+    }
 
-    let no_failures = mailbox_counts.failed == 0
+    let no_failures = aborted.is_none()
+        && mailbox_counts.failed == 0
         && email_counts.failed == 0
         && calendar_counts.failed == 0
         && calendar_event_counts.failed == 0
@@ -171,7 +198,7 @@ pub fn run(common: CommonConfig, config: TakeoutImportConfig) -> Result<Summary,
         );
     }
 
-    Ok(Summary {
+    *summary = Summary {
         per_type: vec![
             ("mailbox", mailbox_counts),
             ("email", email_counts),
@@ -182,7 +209,11 @@ pub fn run(common: CommonConfig, config: TakeoutImportConfig) -> Result<Summary,
         ],
         retries_observed: 0,
         retry_after_sleeps: 0,
-    })
+    };
+    match aborted {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -212,6 +243,7 @@ fn process_mbox_files(
         };
         match mail::process_file(conn, &file.path, ctx, mailbox_counts, email_counts, logger) {
             Ok(()) => {}
+            Err(e) if e.aborts_run() => return Err(e),
             Err(e) => {
                 logger.warn(&format!("mbox {:?}: {e}", file.path));
                 email_counts.failed += 1;
@@ -244,6 +276,9 @@ fn process_ics_files(
             event_counts,
             logger,
         ) {
+            if e.aborts_run() {
+                return Err(e);
+            }
             logger.warn(&format!("ics {:?}: {e}", file.path));
             event_counts.failed += 1;
         }
@@ -274,6 +309,9 @@ fn process_vcf_files(
             card_counts,
             logger,
         ) {
+            if e.aborts_run() {
+                return Err(e);
+            }
             logger.warn(&format!("vcf {:?}: {e}", file.path));
             card_counts.failed += 1;
         }

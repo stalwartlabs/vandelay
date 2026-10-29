@@ -14,6 +14,7 @@ pub const CALENDAR: &str = "calendar";
 pub const CALENDAR_EVENT: &str = "calendarevent";
 pub const ADDRESS_BOOK: &str = "addressbook";
 pub const CONTACT_CARD: &str = "contactcard";
+pub const FILE_NODE: &str = "filenode";
 
 #[derive(Debug, Clone)]
 pub struct IdRow {

@@ -13,6 +13,7 @@ use super::common::{create_batch, jid, retry_if_blob_missing, target_query_get};
 use super::{Net, Plan, Uploader};
 use crate::error::Error;
 use crate::jmap::wire::JmapId;
+use crate::jmap::wire::file_node::NodeKind;
 use crate::logging::Logger;
 use crate::sync::import_jmap::mapping::{
     FILE_NODE_SELECT, MAILBOX_SELECT, TargetResolver, row_to_file_node, row_to_mailbox,
@@ -61,19 +62,33 @@ fn load_local(ctx: &Context, ty: ObjectType) -> Result<Vec<LocalNode>, Error> {
 fn load_target(net: &Net, ty: ObjectType) -> Result<Vec<TargetNode>, Error> {
     let props: &[&str] = &["role", "name", "parentId", "myRights"];
     let list = target_query_get(net, ty, Some(props)).map_err(Error::from)?;
+    let mut own_rights: HashMap<&str, bool> = HashMap::with_capacity(list.len());
+    for v in &list {
+        if let (Some(id), Some(may)) = (
+            v.get("id").and_then(Value::as_str),
+            v.get("myRights")
+                .and_then(|r| r.get("mayDelete"))
+                .and_then(Value::as_bool),
+        ) {
+            own_rights.insert(id, may);
+        }
+    }
     Ok(list
         .iter()
         .filter_map(|v| {
+            let id = jid(v)?;
+            let parent = v.get("parentId").and_then(Value::as_str);
+            let may_delete = own_rights
+                .get(id.as_str())
+                .or_else(|| parent.and_then(|p| own_rights.get(p)))
+                .copied()
+                .unwrap_or(true);
             Some(TargetNode {
-                id: jid(v)?,
-                parent: v.get("parentId").and_then(Value::as_str).map(str::to_owned),
+                id,
+                parent: parent.map(str::to_owned),
                 name: v.get("name").and_then(Value::as_str)?.to_owned(),
                 role: v.get("role").and_then(Value::as_str).map(str::to_owned),
-                may_delete: v
-                    .get("myRights")
-                    .and_then(|r| r.get("mayDelete"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true),
+                may_delete,
             })
         })
         .collect())
@@ -441,15 +456,13 @@ fn build_create(
         .map_err(|e| Error::Partial(e.to_string()))?
         .map_err(Error::from)?;
     let mut wire = fnrow.wire;
-    if let (crate::jmap::wire::file_node::NodeType::File, Some(blob_local)) =
-        (&wire.node_type, fnrow.blob_local_id)
-    {
-        let ct = wire
+    if let (NodeKind::File(file), Some(blob_local)) = (&mut wire.kind, fnrow.blob_local_id) {
+        let ct = file
             .media_type
-            .clone()
-            .unwrap_or_else(|| "application/octet-stream".to_owned());
-        let id = uploader.upload_with(blob_local, &ct).map_err(Error::from)?;
-        wire.blob_id = Some(id);
+            .as_deref()
+            .unwrap_or("application/octet-stream");
+        let id = uploader.upload_with(blob_local, ct).map_err(Error::from)?;
+        file.blob_id = Some(id);
     }
     let mut obj = serde_json::to_value(&wire).map_err(|e| Error::Partial(e.to_string()))?;
     if let Value::Object(m) = &mut obj {

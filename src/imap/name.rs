@@ -4,10 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+use encodify::utf7::{self, Utf7};
+
 use super::error::ImapError;
 
-const MODIFIED_UTF7_ALPHABET: &[u8] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+,";
+const RECEIVED_NAME: Utf7 = utf7::IMAP.lenient();
 
 pub fn canonicalise_inbox(name: &str) -> String {
     if name.eq_ignore_ascii_case("INBOX") {
@@ -22,132 +23,17 @@ pub fn decode_mailbox_name(input: &str) -> Result<String, ImapError> {
 }
 
 pub fn decode_mailbox_name_with(input: &str, utf8_accept: bool) -> Result<String, ImapError> {
-    if utf8_accept {
+    if utf8_accept || ends_in_open_shift(input) {
         return Ok(input.to_owned());
     }
-    if input.is_ascii() && !input.contains('&') {
-        return Ok(input.to_owned());
-    }
-    let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'&' {
-            out.push(bytes[i] as char);
-            i += 1;
-            continue;
-        }
-        if i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-            out.push('&');
-            i += 2;
-            continue;
-        }
-        let mut end = i + 1;
-        while end < bytes.len() && bytes[end] != b'-' {
-            end += 1;
-        }
-        if end == bytes.len() {
-            return Err(ImapError::Parse(
-                "unterminated modified UTF-7 sequence".into(),
-            ));
-        }
-        let encoded = &bytes[i + 1..end];
-        let decoded = decode_b64_modified(encoded)?;
-        let u16s: Vec<u16> = decoded
-            .chunks(2)
-            .filter(|c| c.len() == 2)
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
-            .collect();
-        let s = String::from_utf16(&u16s).map_err(|e| ImapError::Parse(format!("utf-16: {e}")))?;
-        out.push_str(&s);
-        i = end + 1;
-    }
-    Ok(out)
+    RECEIVED_NAME
+        .decode(input)
+        .map_err(|e| ImapError::Parse(format!("modified UTF-7 mailbox name: {e}")))
 }
 
-pub fn encode_mailbox_name(input: &str) -> String {
-    encode_mailbox_name_with(input, false)
-}
-
-pub fn encode_mailbox_name_with(input: &str, utf8_accept: bool) -> String {
-    if utf8_accept {
-        return input.to_owned();
-    }
-    let mut out = String::with_capacity(input.len());
-    let mut pending: Vec<u16> = Vec::new();
-    let flush = |pending: &mut Vec<u16>, out: &mut String| {
-        if pending.is_empty() {
-            return;
-        }
-        out.push('&');
-        let mut raw = Vec::with_capacity(pending.len() * 2);
-        for w in pending.iter() {
-            raw.extend_from_slice(&w.to_be_bytes());
-        }
-        out.push_str(&encode_b64_modified(&raw));
-        out.push('-');
-        pending.clear();
-    };
-    for c in input.chars() {
-        let cp = c as u32;
-        if c == '&' {
-            flush(&mut pending, &mut out);
-            out.push_str("&-");
-        } else if (0x20..=0x7E).contains(&cp) {
-            flush(&mut pending, &mut out);
-            out.push(c);
-        } else {
-            let mut buf = [0u16; 2];
-            let units = c.encode_utf16(&mut buf);
-            pending.extend_from_slice(units);
-        }
-    }
-    flush(&mut pending, &mut out);
-    out
-}
-
-fn decode_b64_modified(bytes: &[u8]) -> Result<Vec<u8>, ImapError> {
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    let mut acc: u32 = 0;
-    let mut bits: u32 = 0;
-    for &b in bytes {
-        let v = match MODIFIED_UTF7_ALPHABET.iter().position(|&x| x == b) {
-            Some(idx) => idx as u32,
-            None => {
-                return Err(ImapError::Parse(format!(
-                    "invalid modified UTF-7 byte {b:#04x}"
-                )));
-            }
-        };
-        acc = (acc << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            let byte = ((acc >> bits) & 0xFF) as u8;
-            out.push(byte);
-        }
-    }
-    Ok(out)
-}
-
-fn encode_b64_modified(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 4 / 3 + 1);
-    let mut acc: u32 = 0;
-    let mut bits: u32 = 0;
-    for &b in bytes {
-        acc = (acc << 8) | b as u32;
-        bits += 8;
-        while bits >= 6 {
-            bits -= 6;
-            let idx = ((acc >> bits) & 0x3F) as usize;
-            out.push(MODIFIED_UTF7_ALPHABET[idx] as char);
-        }
-    }
-    if bits > 0 {
-        let idx = ((acc << (6 - bits)) & 0x3F) as usize;
-        out.push(MODIFIED_UTF7_ALPHABET[idx] as char);
-    }
-    out
+fn ends_in_open_shift(name: &str) -> bool {
+    name.rsplit_once('&')
+        .is_some_and(|(_, tail)| !tail.is_empty() && !tail.contains('-'))
 }
 
 #[cfg(test)]
@@ -173,27 +59,52 @@ mod tests {
     }
 
     #[test]
-    fn unterminated_sequence_errors() {
-        let err = decode_mailbox_name("&ZeVnLIqe").unwrap_err();
+    fn raw_ampersand_without_a_closing_dash_keeps_the_name_verbatim() {
+        for name in [
+            "R&D",
+            "AT&T",
+            "Tom&Jerry",
+            "A&-B&C",
+            "R&D Team",
+            "&ZeVnLIqe",
+            "Envoy&AOk",
+        ] {
+            assert_eq!(decode_mailbox_name(name).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn trailing_lone_ampersand_is_literal() {
+        assert_eq!(decode_mailbox_name("Sales&").unwrap(), "Sales&");
+        assert_eq!(decode_mailbox_name("&AOk-s&").unwrap(), "és&");
+        assert_eq!(decode_mailbox_name("&").unwrap(), "&");
+    }
+
+    #[test]
+    fn encoded_name_with_a_later_escaped_ampersand_decodes() {
+        assert_eq!(decode_mailbox_name("Envoy&AOk-s").unwrap(), "Envoyés");
+        assert_eq!(decode_mailbox_name("&AOk-/R&-D").unwrap(), "é/R&D");
+    }
+
+    #[test]
+    fn byte_outside_the_alphabet_inside_a_shift_errors() {
+        for name in ["&AOk.s-", "&AOk&-", "&AOké-"] {
+            let err = decode_mailbox_name(name).unwrap_err();
+            assert!(matches!(err, ImapError::Parse(_)), "{name}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn unpaired_surrogate_errors() {
+        let err = decode_mailbox_name("&2D0-").unwrap_err();
         assert!(matches!(err, ImapError::Parse(_)));
     }
 
     #[test]
-    fn ascii_passes_through_encode() {
-        assert_eq!(encode_mailbox_name("INBOX"), "INBOX");
-        assert_eq!(encode_mailbox_name("Sent Items"), "Sent Items");
-    }
-
-    #[test]
-    fn literal_amp_encodes_to_amp_dash() {
-        assert_eq!(encode_mailbox_name("R&D"), "R&-D");
-        assert_eq!(encode_mailbox_name("&"), "&-");
-    }
-
-    #[test]
-    fn non_ascii_encode_japanese() {
-        let encoded = encode_mailbox_name("~peter/mail/日本語/台北");
-        assert_eq!(encoded, "~peter/mail/&ZeVnLIqe-/&U,BTFw-");
+    fn encoded_printable_ascii_and_leftover_bits_are_accepted() {
+        assert_eq!(decode_mailbox_name("&AGE-").unwrap(), "a");
+        assert_eq!(decode_mailbox_name("&AOl-").unwrap(), "é");
+        assert_eq!(decode_mailbox_name("&AOk-&AOk-").unwrap(), "éé");
     }
 
     #[test]
@@ -207,7 +118,7 @@ mod tests {
             "INBOX.Projects.Alpha",
             "Junk E-mail",
         ] {
-            let enc = encode_mailbox_name(s);
+            let enc = utf7::IMAP.encode(s);
             let dec = decode_mailbox_name(&enc).unwrap();
             assert_eq!(dec, s, "roundtrip failed for {s:?}, enc={enc:?}");
         }
@@ -222,14 +133,26 @@ mod tests {
     }
 
     #[test]
-    fn utf8_accept_skips_mutf7_decode_so_ampersand_passes_through() {
-        assert_eq!(decode_mailbox_name_with("R&D", true).unwrap(), "R&D");
-        assert_eq!(decode_mailbox_name_with("日本語", true).unwrap(), "日本語");
+    fn raw_utf8_name_survives_mutf7_decode_untouched() {
+        assert_eq!(decode_mailbox_name("Envoyés").unwrap(), "Envoyés");
+        assert_eq!(
+            decode_mailbox_name("L/Le Vent Se Lève").unwrap(),
+            "L/Le Vent Se Lève"
+        );
+        assert_eq!(decode_mailbox_name("R&-D é").unwrap(), "R&D é");
     }
 
     #[test]
-    fn utf8_accept_skips_mutf7_encode_so_input_passes_through() {
-        assert_eq!(encode_mailbox_name_with("日本語", true), "日本語");
-        assert_eq!(encode_mailbox_name_with("R&D", true), "R&D");
+    fn raw_utf8_name_round_trips_through_encode() {
+        for s in ["Envoyés", "Gönderilmiş Postalar", "Çöp kutusu"] {
+            assert_eq!(decode_mailbox_name(&utf7::IMAP.encode(s)).unwrap(), s);
+            assert_eq!(decode_mailbox_name(s).unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn utf8_accept_skips_mutf7_decode_so_ampersand_passes_through() {
+        assert_eq!(decode_mailbox_name_with("R&D", true).unwrap(), "R&D");
+        assert_eq!(decode_mailbox_name_with("日本語", true).unwrap(), "日本語");
     }
 }

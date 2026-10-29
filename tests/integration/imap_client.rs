@@ -189,6 +189,12 @@ impl ImapSeed {
         Ok(names)
     }
 
+    pub fn list_raw(&mut self) -> ContainerResult<Vec<String>> {
+        let tag = self.next_tag();
+        self.send(&format!(r#"{tag} LIST "" "*""#))?;
+        self.read_tagged(&tag)
+    }
+
     pub fn select(&mut self, mailbox: &str) -> ContainerResult<usize> {
         let tag = self.next_tag();
         self.send(&format!("{tag} SELECT {}", quote(mailbox)))?;

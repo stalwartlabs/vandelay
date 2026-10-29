@@ -20,7 +20,6 @@ use crate::error::Error;
 use crate::imap::client::{ConnectMode, ImapClient};
 use crate::imap::command;
 use crate::imap::error::ImapError;
-use crate::imap::name::encode_mailbox_name_with;
 use crate::imap::response::{NamespaceEntry, Untagged};
 use crate::imap::retry::{
     BackoffState, Disposition, RetryPolicy, classify, is_negotiation_failure,
@@ -29,7 +28,7 @@ use crate::imap::transport::Connector;
 use crate::logging::{LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
 use crate::sync::emailmeta::email_index_from_blob;
 use crate::sync::keys::index_to_json;
-use crate::sync::{CommonConfig, Summary, TypeCounts};
+use crate::sync::{CommonConfig, RunOutcome, Summary, TypeCounts};
 
 use super::fetch;
 use super::folders::{
@@ -111,6 +110,14 @@ pub(super) fn control_run_collect(
     }
 }
 
+pub(super) fn select_folder(
+    client: &mut ImapClient,
+    ctx: &ControlCtx,
+    folder: &ResolvedFolder,
+) -> Result<crate::imap::CollectedResponse, Error> {
+    control_run_collect(client, ctx, &command::select(&folder.wire_name))
+}
+
 pub(super) fn call_with_retry<F, T>(
     client: &mut ImapClient,
     ctx: &ControlCtx,
@@ -155,6 +162,7 @@ fn reconnect_control(client: &mut ImapClient, ctx: &ControlCtx) -> Result<(), Im
         &ctx.endpoint.host,
         ctx.endpoint.port,
         ctx.mode,
+        ctx.logger,
     )?;
     *client = new_client;
     authenticate_client(client, &ctx.auth).map_err(|e| ImapError::AuthFailed(e.to_string()))?;
@@ -198,6 +206,20 @@ pub enum ImapAuth {
 }
 
 pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Error> {
+    run_reporting(common, config).into_result()
+}
+
+pub fn run_reporting(common: CommonConfig, config: ImapImportConfig) -> RunOutcome {
+    let mut summary = Summary::default();
+    let error = run_into(common, config, &mut summary).err();
+    RunOutcome { summary, error }
+}
+
+fn run_into(
+    common: CommonConfig,
+    config: ImapImportConfig,
+    summary: &mut Summary,
+) -> Result<(), Error> {
     let logger = common.logger;
     let mut conn = db::init::open(&common.archive)?;
 
@@ -224,7 +246,7 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
     } else {
         ConnectMode::StartTls
     };
-    let mut client = ImapClient::connect(&connector, &endpoint.host, endpoint.port, mode)
+    let mut client = ImapClient::connect(&connector, &endpoint.host, endpoint.port, mode, logger)
         .map_err(|e| Error::Connection(e.to_string()))?;
 
     let account_id = authenticate(&mut client, &config.auth)?;
@@ -340,14 +362,15 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
 
     if common.dry_run {
         let existing_source = db::sources::find_source(&conn, &source_key)?;
-        return dry_run_summary(
+        *summary = dry_run_summary(
             &conn,
             existing_source,
             &mut client,
             &control_ctx,
             &resolved,
             logger,
-        );
+        )?;
+        return Ok(());
     }
 
     let mut mailbox_counts = TypeCounts::default();
@@ -356,7 +379,7 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
     let local_mailboxes = db::imap_ids::mailbox_folders(&conn, source_id)?;
     let server_folder_set: HashSet<String> = resolved.iter().map(|f| f.name.clone()).collect();
 
-    upsert_mailboxes(&mut conn, source_id, &resolved, &mut mailbox_counts)?;
+    upsert_mailboxes(&mut conn, source_id, &resolved, &mut mailbox_counts, logger)?;
 
     let server_delimiter = resolved.iter().find_map(|f| f.delimiter).unwrap_or('/');
 
@@ -389,12 +412,13 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
             compress: config.compress,
             policy,
             backoff: backoff.clone(),
+            logger,
         },
         config.imap_connections.max(1),
     )
     .map_err(|e| Error::Connection(format!("worker pool: {e}")))?;
 
-    for (i, folder) in resolved.iter().enumerate() {
+    for (i, folder) in resolved.iter().filter(|f| f.selectable).enumerate() {
         if i > 0 {
             let _ = control_run_collect(&mut client, &control_ctx, "NOOP");
         }
@@ -408,6 +432,16 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
             &mut email_counts,
         ) {
             Ok(()) => {}
+            Err(e) if e.aborts_run() => {
+                pool.shutdown();
+                let _ = client.logout();
+                *summary = Summary {
+                    per_type: vec![("mailbox", mailbox_counts), ("email", email_counts)],
+                    retries_observed: backoff.total_retries(),
+                    retry_after_sleeps: backoff.transient_retries() as u64,
+                };
+                return Err(e);
+            }
             Err(e) => {
                 log_at(
                     logger,
@@ -422,11 +456,12 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
     pool.shutdown();
     let _ = client.logout();
 
-    Ok(Summary {
+    *summary = Summary {
         per_type: vec![("mailbox", mailbox_counts), ("email", email_counts)],
         retries_observed: backoff.total_retries(),
         retry_after_sleeps: backoff.transient_retries() as u64,
-    })
+    };
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -550,16 +585,29 @@ fn upsert_mailboxes(
     source_id: i64,
     folders: &[ResolvedFolder],
     counts: &mut TypeCounts,
+    logger: Logger,
 ) -> Result<(), Error> {
     let tx = conn.transaction()?;
     let mut local_ids: HashMap<String, i64> = HashMap::new();
     for folder in folders {
         let parent_local = match &folder.parent_path {
-            Some(p) => local_ids.get(p.as_str()).copied().or_else(|| {
-                db::imap_ids::local_for_mailbox(&tx, source_id, p)
-                    .ok()
-                    .flatten()
-            }),
+            Some(p) => {
+                let found = match local_ids.get(p.as_str()) {
+                    Some(id) => Some(*id),
+                    None => db::imap_ids::local_for_mailbox(&tx, source_id, p)?,
+                };
+                if found.is_none() {
+                    log_at(
+                        logger,
+                        LEVEL_DEFAULT,
+                        &format!(
+                            "folder {:?}: parent {p:?} could not be resolved; storing it at the top level",
+                            folder.name
+                        ),
+                    );
+                }
+                found
+            }
             None => None,
         };
         let existing = db::imap_ids::local_for_mailbox(&tx, source_id, &folder.name)?;
@@ -685,8 +733,7 @@ fn reconcile_folder(
         }
     }
 
-    let wire_name = encode_mailbox_name_with(&folder.name, client.utf8_accept());
-    let resp = control_run_collect(client, control_ctx, &command::select(&wire_name))?;
+    let resp = select_folder(client, control_ctx, folder)?;
     let mut uidvalidity: u32 = 0;
     let mut uidnext: u32 = 0;
     for u in &resp.untagged {
@@ -772,6 +819,7 @@ fn reconcile_folder(
         for batch in &batches {
             pool.submit(FetchJob {
                 folder: folder.name.clone(),
+                wire_name: folder.wire_name.clone(),
                 uidvalidity,
                 uids: batch.to_vec(),
             });
@@ -1094,9 +1142,8 @@ fn dry_run_summary(
         );
     }
 
-    for folder in folders {
-        let wire = encode_mailbox_name_with(&folder.name, client.utf8_accept());
-        let select_resp = match control_run_collect(client, control_ctx, &command::select(&wire)) {
+    for folder in folders.iter().filter(|f| f.selectable) {
+        let select_resp = match select_folder(client, control_ctx, folder) {
             Ok(r) => r,
             Err(e) => {
                 log_at(

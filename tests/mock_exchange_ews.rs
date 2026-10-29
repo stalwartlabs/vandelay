@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+use encodify::base64::{LENIENT, STANDARD};
 use mockito::Matcher;
 use vandelay::exchange_ews::EwsClient;
 use vandelay::exchange_ews::autodiscover::{DiscoverySource, discover};
@@ -220,7 +221,7 @@ fn get_item_mixed_success_and_per_item_error() {
            </m:GetItemResponseMessage>\
          </m:ResponseMessages></m:GetItemResponse>"
     ));
-    let r = parse_response_messages(body.as_bytes(), b"GetItemResponseMessage").unwrap();
+    let r = parse_response_messages(body.as_bytes(), "GetItemResponseMessage").unwrap();
     assert_eq!(r.len(), 2);
     assert!(r[0].success);
     assert!(r[0].inner_xml.contains("SGVsbG8="));
@@ -300,8 +301,7 @@ fn http_401_surfaces_as_auth_error() {
 #[test]
 fn mime_content_round_trips_through_base64_decode() {
     let original = b"From: alice@x\r\nSubject: hi\r\n\r\nbody";
-    use base64::Engine;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(original);
+    let encoded = STANDARD.encode(original);
     let body = envelope(&format!(
         "<m:GetItemResponse{NS}><m:ResponseMessages>\
          <m:GetItemResponseMessage ResponseClass=\"Success\">\
@@ -312,13 +312,10 @@ fn mime_content_round_trips_through_base64_decode() {
              </t:Message></m:Items></m:GetItemResponseMessage>\
          </m:ResponseMessages></m:GetItemResponse>"
     ));
-    let r = parse_response_messages(body.as_bytes(), b"GetItemResponseMessage").unwrap();
+    let r = parse_response_messages(body.as_bytes(), "GetItemResponseMessage").unwrap();
     let item = vandelay::exchange_ews::parse::parse_message_item(&r[0].inner_xml).unwrap();
     let s = item.mime_content.unwrap();
-    let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(cleaned.as_bytes())
-        .unwrap();
+    let bytes = LENIENT.decode(&s).unwrap();
     assert_eq!(bytes, original);
 }
 
@@ -372,6 +369,78 @@ fn calendar_item_master_inlines_modified_and_deleted_occurrences() {
         "occurrence ItemId must populate the occurrence, not overwrite the master"
     );
     assert_eq!(item.deleted_occurrences.len(), 1);
+}
+
+#[test]
+fn organizer_and_attendee_addresses_survive_an_ex_routing_type() {
+    let body = "<vandelay-inner xmlns:t=\"http://schemas.microsoft.com/exchange/services/2006/types\">\
+         <t:CalendarItem>\
+         <t:ItemId Id=\"M3\" ChangeKey=\"K1\"/>\
+         <t:Subject>Review</t:Subject>\
+         <t:UID>uid-3</t:UID>\
+         <t:Start>2025-06-15T14:00:00Z</t:Start>\
+         <t:End>2025-06-15T15:00:00Z</t:End>\
+         <t:Organizer><t:Mailbox><t:Name>Alice</t:Name>\
+           <t:EmailAddress>alice@example.com</t:EmailAddress>\
+           <t:RoutingType>EX</t:RoutingType><t:MailboxType>Mailbox</t:MailboxType></t:Mailbox></t:Organizer>\
+         <t:RequiredAttendees><t:Attendee><t:Mailbox><t:Name>Kristina Morgental</t:Name>\
+           <t:EmailAddress>/o=ExchangeLabs/ou=Exchange Administrative Group (FYDIBOHF23SPDLT)/cn=Recipients/cn=bdc77b18152647a29d28ce1188376dc9-kristina</t:EmailAddress>\
+           <t:RoutingType>EX</t:RoutingType></t:Mailbox><t:ResponseType>Unknown</t:ResponseType></t:Attendee></t:RequiredAttendees>\
+         </t:CalendarItem></vandelay-inner>";
+    let item = vandelay::exchange_ews::parse::parse_calendar_item(body).unwrap();
+    let event = vandelay::exchange_ews::calendar_map::to_jscalendar(&item);
+
+    assert_eq!(
+        event.data["organizerCalendarAddress"], "mailto:alice@example.com",
+        "a usable address must be kept even when RoutingType says EX"
+    );
+    let participants = event.data["participants"].as_object().unwrap();
+    let organizer = participants
+        .values()
+        .find(|p| p["calendarAddress"] == "mailto:alice@example.com")
+        .expect("organizer participant");
+    assert_eq!(organizer["email"], "alice@example.com");
+
+    let attendee = participants
+        .values()
+        .find(|p| p["name"] == "Kristina Morgental")
+        .expect("attendee participant");
+    assert!(
+        attendee["calendarAddress"]
+            .as_str()
+            .unwrap()
+            .starts_with("urn:x-vandelay:attendee:"),
+        "a legacy directory reference cannot be resolved and stays synthetic"
+    );
+    assert!(
+        attendee.get("email").is_none(),
+        "no email is invented for a directory reference"
+    );
+}
+
+#[test]
+fn recurrence_end_date_with_a_timezone_offset_yields_a_bounded_series() {
+    let body = "<vandelay-inner xmlns:t=\"http://schemas.microsoft.com/exchange/services/2006/types\">\
+         <t:CalendarItem>\
+         <t:ItemId Id=\"M2\" ChangeKey=\"K1\"/>\
+         <t:Subject>Biweekly</t:Subject>\
+         <t:UID>uid-2</t:UID>\
+         <t:Start>2021-08-04T21:15:00Z</t:Start>\
+         <t:End>2021-08-04T22:15:00Z</t:End>\
+         <t:CalendarItemType>RecurringMaster</t:CalendarItemType>\
+         <t:Recurrence>\
+           <t:WeeklyRecurrence><t:Interval>2</t:Interval><t:DaysOfWeek>Wednesday</t:DaysOfWeek></t:WeeklyRecurrence>\
+           <t:EndDateRecurrence><t:StartDate>2021-08-04-06:00</t:StartDate><t:EndDate>2021-09-30-06:00</t:EndDate></t:EndDateRecurrence>\
+         </t:Recurrence>\
+         </t:CalendarItem></vandelay-inner>";
+    let item = vandelay::exchange_ews::parse::parse_calendar_item(body).unwrap();
+    let event = vandelay::exchange_ews::calendar_map::to_jscalendar(&item);
+    let rule = &event.data["recurrenceRule"];
+    assert_eq!(rule["frequency"], "weekly");
+    assert_eq!(
+        rule["until"], "2021-09-30T23:59:59",
+        "an EndDate carrying a UTC offset must still produce a valid LocalDateTime"
+    );
 }
 
 #[test]
@@ -821,7 +890,7 @@ fn warning_response_class_is_treated_as_success_in_mock() {
          <m:Items><t:Message><t:ItemId Id=\"W1\" ChangeKey=\"K\"/></t:Message></m:Items>\
          </m:GetItemResponseMessage></m:ResponseMessages></m:GetItemResponse>"
     ));
-    let r = parse_response_messages(body.as_bytes(), b"GetItemResponseMessage").unwrap();
+    let r = parse_response_messages(body.as_bytes(), "GetItemResponseMessage").unwrap();
     assert!(r[0].success);
 }
 
@@ -861,7 +930,7 @@ fn get_folder_messages_preserve_position_when_one_errors() {
          </m:GetFolderResponseMessage>\
          </m:ResponseMessages></m:GetFolderResponse>"
     ));
-    let msgs = parse_response_messages(body.as_bytes(), b"GetFolderResponseMessage").unwrap();
+    let msgs = parse_response_messages(body.as_bytes(), "GetFolderResponseMessage").unwrap();
     assert_eq!(msgs.len(), 3, "all three messages must be present");
     assert!(msgs[0].success);
     assert!(!msgs[1].success);

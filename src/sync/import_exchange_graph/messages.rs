@@ -5,7 +5,7 @@
  */
 
 use rusqlite::{Connection, Transaction, params};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::db::{blobs, exchange_graph_ids};
 use crate::error::Error;
@@ -35,7 +35,7 @@ pub fn reconcile_all(
 
     for folder in folders {
         let url = ctx.endpoints.folder_messages_ids(&folder.graph_id, ctx.top);
-        let ids = match api::collect_all_ids(ctx.client, &url, &[]) {
+        let stubs = match api::collect_all_values(ctx.client, &url, &[]) {
             Ok(v) => v,
             Err(e) => {
                 ctx.logger.warn(&format!(
@@ -51,16 +51,21 @@ pub fn reconcile_all(
             eprintln!(
                 "graph folder {} enumerated {} messages",
                 folder.graph_id,
-                ids.len()
+                stubs.len()
             );
         }
-        for id in &ids {
-            server_total.insert(id.clone());
+        let mut new_ids: Vec<(String, String)> = Vec::new();
+        for stub in &stubs {
+            let Some(id) = stub.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            server_total.insert(id.to_owned());
+            if local.contains_key(id) {
+                counts.fetched += 1;
+            } else if planned.insert(id.to_owned()) {
+                new_ids.push((id.to_owned(), keyword_array(stub)));
+            }
         }
-        let new_ids: Vec<String> = ids
-            .into_iter()
-            .filter(|id| !local.contains_key(id) && planned.insert(id.clone()))
-            .collect();
         if new_ids.is_empty() {
             continue;
         }
@@ -82,9 +87,13 @@ fn fetch_and_insert(
     conn: &mut Connection,
     ctx: &GraphCoordinator<'_>,
     folder: &MailFolder,
-    ids: &[String],
+    ids: &[(String, String)],
     counts: &mut TypeCounts,
 ) -> Result<(), Error> {
+    let keywords_by_id: std::collections::HashMap<&str, &str> = ids
+        .iter()
+        .map(|(id, kw)| (id.as_str(), kw.as_str()))
+        .collect();
     let client = ctx.client.clone();
     let endpoints: crate::exchange_graph::api::Endpoints = (*ctx.endpoints).clone();
     type FetchResult = (String, Result<Vec<u8>, GraphError>);
@@ -95,7 +104,7 @@ fn fetch_and_insert(
             Err(e) => (id, Err(e)),
         }
     });
-    for id in ids {
+    for (id, _) in ids {
         pool.submit(id.clone());
     }
     let mut tx_opt: Option<Transaction<'_>> = None;
@@ -110,7 +119,11 @@ fn fetch_and_insert(
                     tx_opt = Some(conn.unchecked_transaction()?);
                 }
                 let tx = tx_opt.as_mut().expect("tx is Some");
-                apply_message_in_tx(tx, ctx, folder, &graph_id, &bytes, counts)?;
+                let keywords = keywords_by_id
+                    .get(graph_id.as_str())
+                    .copied()
+                    .unwrap_or("[]");
+                apply_message_in_tx(tx, ctx, folder, &graph_id, &bytes, keywords, counts)?;
                 in_batch += 1;
                 if in_batch >= CHUNK_SIZE {
                     if let Some(t) = tx_opt.take() {
@@ -141,13 +154,13 @@ fn apply_message_in_tx(
     folder: &MailFolder,
     graph_id: &str,
     bytes: &[u8],
+    keywords: &str,
     counts: &mut TypeCounts,
 ) -> Result<(), Error> {
     let (idx, date_header) = email_meta_from_blob(bytes);
     let message_match = index_to_json(&idx);
     let received_at = date_header.unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned());
     let mailbox_ids = json!([folder.local_id]).to_string();
-    let keywords = "[]".to_owned();
 
     let blob_id = blobs::intern_blob(tx, bytes)?;
     tx.execute(
@@ -165,6 +178,33 @@ fn apply_message_in_tx(
     )?;
     counts.created += 1;
     Ok(())
+}
+
+fn keyword_array(stub: &Value) -> String {
+    let mut kws: Vec<String> = Vec::new();
+    if stub.get("isRead").and_then(Value::as_bool) == Some(true) {
+        kws.push("$seen".to_owned());
+    }
+    if stub.get("isDraft").and_then(Value::as_bool) == Some(true) {
+        kws.push("$draft".to_owned());
+    }
+    if stub.get("isReadReceiptRequested").and_then(Value::as_bool) == Some(true) {
+        kws.push("$notified".to_owned());
+    }
+    if stub
+        .get("flag")
+        .and_then(|f| f.get("flagStatus"))
+        .and_then(Value::as_str)
+        == Some("flagged")
+    {
+        kws.push("$flagged".to_owned());
+    }
+    if let Some(cats) = stub.get("categories").and_then(Value::as_array) {
+        for cat in cats.iter().filter_map(Value::as_str) {
+            kws.push(cat.to_ascii_lowercase());
+        }
+    }
+    Value::Array(kws.into_iter().map(Value::String).collect()).to_string()
 }
 
 fn delete_vanished(

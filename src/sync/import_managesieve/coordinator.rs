@@ -65,6 +65,7 @@ fn reconnect(client: &mut SieveClient, ctx: &ControlCtx) -> Result<(), SieveErro
         ctx.port,
         ctx.mode,
         ctx.allow_cleartext,
+        ctx.logger,
     )?;
     *client = new;
     match do_authenticate(client, &ctx.auth) {
@@ -128,6 +129,7 @@ pub fn run(common: CommonConfig, config: ManageSieveImportConfig) -> Result<Summ
         endpoint.port,
         mode,
         config.allow_cleartext,
+        logger,
     )
     .map_err(|e| Error::Connection(e.to_string()))?;
 

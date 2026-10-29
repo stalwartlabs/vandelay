@@ -78,13 +78,13 @@ fn classify_ns(ns: &ResolveResult<'_>) -> NsKind {
     match ns {
         ResolveResult::Bound(prefix) => {
             let p = prefix.as_ref();
-            if p == NS_DAV.as_bytes() {
+            if p == NS_DAV {
                 NsKind::Dav
-            } else if p == NS_CALDAV.as_bytes() {
+            } else if p == NS_CALDAV {
                 NsKind::Caldav
-            } else if p == NS_CARDDAV.as_bytes() {
+            } else if p == NS_CARDDAV {
                 NsKind::Carddav
-            } else if p == NS_APPLE_ICAL.as_bytes() {
+            } else if p == NS_APPLE_ICAL {
                 NsKind::Apple
             } else {
                 NsKind::Other
@@ -94,7 +94,7 @@ fn classify_ns(ns: &ResolveResult<'_>) -> NsKind {
     }
 }
 
-fn is(ns: NsKind, local: &[u8], expected_ns: NsKind, target: &[u8]) -> bool {
+fn is(ns: NsKind, local: &str, expected_ns: NsKind, target: &str) -> bool {
     ns == expected_ns && local.eq_ignore_ascii_case(target)
 }
 
@@ -102,17 +102,17 @@ fn is(ns: NsKind, local: &[u8], expected_ns: NsKind, target: &[u8]) -> bool {
 enum Step {
     StartElement {
         ns: NsKind,
-        local: Vec<u8>,
-        attrs: Vec<(Vec<u8>, Vec<u8>)>,
+        local: String,
+        attrs: Vec<(String, String)>,
     },
     EmptyElement {
         ns: NsKind,
-        local: Vec<u8>,
-        attrs: Vec<(Vec<u8>, Vec<u8>)>,
+        local: String,
+        attrs: Vec<(String, String)>,
     },
     EndElement {
         ns: NsKind,
-        local: Vec<u8>,
+        local: String,
     },
     Text(String),
     CData(String),
@@ -125,7 +125,7 @@ fn resolve_entity(g: &BytesRef) -> Option<char> {
     if let Ok(Some(c)) = g.resolve_char_ref() {
         return Some(c);
     }
-    match g.decode().ok()?.as_ref() {
+    match g.as_ref() {
         "amp" => Some('&'),
         "lt" => Some('<'),
         "gt" => Some('>'),
@@ -141,11 +141,12 @@ fn next_step<R: BufRead>(xml: &mut NsReader<R>, buf: &mut Vec<u8>) -> Result<Ste
     let ns_kind = classify_ns(&ns);
     Ok(match ev {
         Event::Start(e) => {
-            let local = e.local_name().as_ref().to_vec();
-            let mut attrs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            for a in e.attributes().flatten() {
-                attrs.push((a.key.as_ref().to_vec(), a.value.as_ref().to_vec()));
-            }
+            let local = e.local_name().as_ref().to_owned();
+            let attrs = e
+                .attributes()
+                .flatten()
+                .map(|a| (a.key.as_ref().to_owned(), a.value.into_owned()))
+                .collect();
             Step::StartElement {
                 ns: ns_kind,
                 local,
@@ -153,11 +154,12 @@ fn next_step<R: BufRead>(xml: &mut NsReader<R>, buf: &mut Vec<u8>) -> Result<Ste
             }
         }
         Event::Empty(e) => {
-            let local = e.local_name().as_ref().to_vec();
-            let mut attrs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            for a in e.attributes().flatten() {
-                attrs.push((a.key.as_ref().to_vec(), a.value.as_ref().to_vec()));
-            }
+            let local = e.local_name().as_ref().to_owned();
+            let attrs = e
+                .attributes()
+                .flatten()
+                .map(|a| (a.key.as_ref().to_owned(), a.value.into_owned()))
+                .collect();
             Step::EmptyElement {
                 ns: ns_kind,
                 local,
@@ -166,13 +168,10 @@ fn next_step<R: BufRead>(xml: &mut NsReader<R>, buf: &mut Vec<u8>) -> Result<Ste
         }
         Event::End(e) => Step::EndElement {
             ns: ns_kind,
-            local: e.local_name().as_ref().to_vec(),
+            local: e.local_name().as_ref().to_owned(),
         },
-        Event::Text(t) => {
-            let s = t.decode().map_err(|e| ParseError::Xml(e.to_string()))?;
-            Step::Text(s.into_owned())
-        }
-        Event::CData(cd) => Step::CData(String::from_utf8_lossy(cd.as_ref()).into_owned()),
+        Event::Text(t) => Step::Text(t.into_inner().into_owned()),
+        Event::CData(cd) => Step::CData(cd.into_inner().into_owned()),
         Event::GeneralRef(g) => match resolve_entity(&g) {
             Some(c) => Step::Entity(c),
             None => Step::Other,
@@ -194,7 +193,7 @@ pub fn parse_multistatus<R: BufRead>(
     loop {
         let step = next_step(&mut xml, &mut buf)?;
         match step {
-            Step::StartElement { ns, local, .. } if is(ns, &local, NsKind::Dav, b"response") => {
+            Step::StartElement { ns, local, .. } if is(ns, &local, NsKind::Dav, "response") => {
                 if let Some(r) = parse_response(&mut xml, base_url)?
                     && seen.insert(r.href.as_str().to_owned())
                 {
@@ -222,15 +221,15 @@ fn parse_response<R: BufRead>(
         let step = next_step(xml, &mut buf)?;
         match step {
             Step::StartElement { ns, local, .. } => {
-                if is(ns, &local, NsKind::Dav, b"href") {
+                if is(ns, &local, NsKind::Dav, "href") {
                     let text = read_token(xml)?;
                     if href.is_none() {
                         href = Some(text);
                     }
-                } else if is(ns, &local, NsKind::Dav, b"status") {
+                } else if is(ns, &local, NsKind::Dav, "status") {
                     let text = read_token(xml)?;
                     status = parse_http_status(&text);
-                } else if is(ns, &local, NsKind::Dav, b"propstat") {
+                } else if is(ns, &local, NsKind::Dav, "propstat") {
                     let (block_status, block_props) = parse_propstat(xml)?;
                     match block_status {
                         Some(s) if (200..300).contains(&s) => merge_props(&mut props, block_props),
@@ -241,7 +240,7 @@ fn parse_response<R: BufRead>(
                     skip_element(xml, &local)?;
                 }
             }
-            Step::EndElement { ns, local } if is(ns, &local, NsKind::Dav, b"response") => break,
+            Step::EndElement { ns, local } if is(ns, &local, NsKind::Dav, "response") => break,
             Step::Eof => return Err(ParseError::Xml("unexpected EOF in <response>".into())),
             _ => {}
         }
@@ -270,16 +269,16 @@ fn parse_propstat<R: BufRead>(
         let step = next_step(xml, &mut buf)?;
         match step {
             Step::StartElement { ns, local, .. } => {
-                if is(ns, &local, NsKind::Dav, b"status") {
+                if is(ns, &local, NsKind::Dav, "status") {
                     let text = read_token(xml)?;
                     status = parse_http_status(&text);
-                } else if is(ns, &local, NsKind::Dav, b"prop") {
+                } else if is(ns, &local, NsKind::Dav, "prop") {
                     parse_prop_block(xml, &mut props)?;
                 } else {
                     skip_element(xml, &local)?;
                 }
             }
-            Step::EndElement { ns, local } if is(ns, &local, NsKind::Dav, b"propstat") => break,
+            Step::EndElement { ns, local } if is(ns, &local, NsKind::Dav, "propstat") => break,
             Step::Eof => return Err(ParseError::Xml("unexpected EOF in <propstat>".into())),
             _ => {}
         }
@@ -299,7 +298,7 @@ fn parse_prop_block<R: BufRead>(
                 handle_prop_element(xml, props, ns, &local)?;
             }
             Step::EmptyElement { .. } => {}
-            Step::EndElement { ns, local } if is(ns, &local, NsKind::Dav, b"prop") => break,
+            Step::EndElement { ns, local } if is(ns, &local, NsKind::Dav, "prop") => break,
             Step::Eof => return Err(ParseError::Xml("unexpected EOF in <prop>".into())),
             _ => {}
         }
@@ -311,53 +310,53 @@ fn handle_prop_element<R: BufRead>(
     xml: &mut NsReader<R>,
     props: &mut ResourceProps,
     ns: NsKind,
-    local: &[u8],
+    local: &str,
 ) -> Result<(), ParseError> {
-    if is(ns, local, NsKind::Dav, b"resourcetype") {
+    if is(ns, local, NsKind::Dav, "resourcetype") {
         consume_resourcetype(xml, props)?;
-    } else if is(ns, local, NsKind::Dav, b"displayname") {
+    } else if is(ns, local, NsKind::Dav, "displayname") {
         props.displayname = Some(read_token(xml)?);
-    } else if is(ns, local, NsKind::Dav, b"current-user-principal") {
-        props.current_user_principal = read_first_href(xml, b"current-user-principal")?;
-    } else if is(ns, local, NsKind::Caldav, b"calendar-home-set") {
-        props.calendar_home_set = read_first_href(xml, b"calendar-home-set")?;
-    } else if is(ns, local, NsKind::Carddav, b"addressbook-home-set") {
-        props.addressbook_home_set = read_first_href(xml, b"addressbook-home-set")?;
-    } else if is(ns, local, NsKind::Dav, b"getetag") {
+    } else if is(ns, local, NsKind::Dav, "current-user-principal") {
+        props.current_user_principal = read_first_href(xml, "current-user-principal")?;
+    } else if is(ns, local, NsKind::Caldav, "calendar-home-set") {
+        props.calendar_home_set = read_first_href(xml, "calendar-home-set")?;
+    } else if is(ns, local, NsKind::Carddav, "addressbook-home-set") {
+        props.addressbook_home_set = read_first_href(xml, "addressbook-home-set")?;
+    } else if is(ns, local, NsKind::Dav, "getetag") {
         let raw = read_token(xml)?;
         if !raw.is_empty() {
             props.etag = Some(raw);
         }
-    } else if is(ns, local, NsKind::Dav, b"getcontenttype") {
+    } else if is(ns, local, NsKind::Dav, "getcontenttype") {
         props.content_type = Some(read_token(xml)?);
-    } else if is(ns, local, NsKind::Dav, b"getlastmodified") {
+    } else if is(ns, local, NsKind::Dav, "getlastmodified") {
         props.last_modified = Some(read_token(xml)?);
-    } else if is(ns, local, NsKind::Dav, b"creationdate") {
+    } else if is(ns, local, NsKind::Dav, "creationdate") {
         props.creation_date = Some(read_token(xml)?);
-    } else if is(ns, local, NsKind::Dav, b"getcontentlength") {
+    } else if is(ns, local, NsKind::Dav, "getcontentlength") {
         let raw = read_token(xml)?;
         props.content_length = raw.parse::<u64>().ok();
-    } else if is(ns, local, NsKind::Caldav, b"calendar-description") {
+    } else if is(ns, local, NsKind::Caldav, "calendar-description") {
         props.calendar_description = Some(read_token(xml)?);
-    } else if is(ns, local, NsKind::Carddav, b"addressbook-description") {
+    } else if is(ns, local, NsKind::Carddav, "addressbook-description") {
         props.addressbook_description = Some(read_token(xml)?);
-    } else if is(ns, local, NsKind::Apple, b"calendar-color") {
+    } else if is(ns, local, NsKind::Apple, "calendar-color") {
         props.calendar_color = Some(read_token(xml)?);
-    } else if is(ns, local, NsKind::Apple, b"calendar-order") {
+    } else if is(ns, local, NsKind::Apple, "calendar-order") {
         let raw = read_token(xml)?;
         props.calendar_order = raw.parse::<i64>().ok();
-    } else if is(ns, local, NsKind::Caldav, b"calendar-timezone") {
+    } else if is(ns, local, NsKind::Caldav, "calendar-timezone") {
         props.calendar_timezone = Some(read_token(xml)?);
     } else if is(
         ns,
         local,
         NsKind::Caldav,
-        b"supported-calendar-component-set",
+        "supported-calendar-component-set",
     ) {
         consume_supported_components(xml, props)?;
-    } else if is(ns, local, NsKind::Caldav, b"calendar-data") {
+    } else if is(ns, local, NsKind::Caldav, "calendar-data") {
         props.calendar_data = Some(read_text(xml)?);
-    } else if is(ns, local, NsKind::Carddav, b"address-data") {
+    } else if is(ns, local, NsKind::Carddav, "address-data") {
         props.address_data = Some(read_text(xml)?);
     } else {
         skip_element(xml, local)?;
@@ -380,7 +379,7 @@ fn consume_resourcetype<R: BufRead>(
             Step::EmptyElement { ns, local, .. } => {
                 mark_resourcetype(ns, &local, props);
             }
-            Step::EndElement { ns, local } if is(ns, &local, NsKind::Dav, b"resourcetype") => break,
+            Step::EndElement { ns, local } if is(ns, &local, NsKind::Dav, "resourcetype") => break,
             Step::Eof => {
                 return Err(ParseError::Xml("unexpected EOF in <resourcetype>".into()));
             }
@@ -390,12 +389,12 @@ fn consume_resourcetype<R: BufRead>(
     Ok(())
 }
 
-fn mark_resourcetype(ns: NsKind, local: &[u8], props: &mut ResourceProps) {
-    if is(ns, local, NsKind::Dav, b"collection") {
+fn mark_resourcetype(ns: NsKind, local: &str, props: &mut ResourceProps) {
+    if is(ns, local, NsKind::Dav, "collection") {
         props.is_collection = true;
-    } else if is(ns, local, NsKind::Caldav, b"calendar") {
+    } else if is(ns, local, NsKind::Caldav, "calendar") {
         props.is_calendar = true;
-    } else if is(ns, local, NsKind::Carddav, b"addressbook") {
+    } else if is(ns, local, NsKind::Carddav, "addressbook") {
         props.is_addressbook = true;
     }
 }
@@ -412,8 +411,8 @@ fn consume_supported_components<R: BufRead>(
                 ns,
                 local,
                 ref attrs,
-            } if is(ns, &local, NsKind::Caldav, b"comp") => {
-                if let Some(name) = attr_lookup(attrs, b"name") {
+            } if is(ns, &local, NsKind::Caldav, "comp") => {
+                if let Some(name) = attr_lookup(attrs, "name") {
                     props.supported_components.push(name);
                 }
                 skip_element(xml, &local)?;
@@ -422,8 +421,8 @@ fn consume_supported_components<R: BufRead>(
                 ns,
                 local,
                 ref attrs,
-            } if is(ns, &local, NsKind::Caldav, b"comp") => {
-                if let Some(name) = attr_lookup(attrs, b"name") {
+            } if is(ns, &local, NsKind::Caldav, "comp") => {
+                if let Some(name) = attr_lookup(attrs, "name") {
                     props.supported_components.push(name);
                 }
             }
@@ -432,7 +431,7 @@ fn consume_supported_components<R: BufRead>(
                     ns,
                     &local,
                     NsKind::Caldav,
-                    b"supported-calendar-component-set",
+                    "supported-calendar-component-set",
                 ) =>
             {
                 break;
@@ -448,13 +447,8 @@ fn consume_supported_components<R: BufRead>(
     Ok(())
 }
 
-fn attr_lookup(attrs: &[(Vec<u8>, Vec<u8>)], key: &[u8]) -> Option<String> {
-    for (k, v) in attrs {
-        if k == key {
-            return Some(String::from_utf8_lossy(v).into_owned());
-        }
-    }
-    None
+fn attr_lookup(attrs: &[(String, String)], key: &str) -> Option<String> {
+    attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
 }
 
 fn read_text<R: BufRead>(xml: &mut NsReader<R>) -> Result<String, ParseError> {
@@ -480,7 +474,7 @@ fn read_token<R: BufRead>(xml: &mut NsReader<R>) -> Result<String, ParseError> {
 
 fn read_first_href<R: BufRead>(
     xml: &mut NsReader<R>,
-    closing_local: &[u8],
+    closing_local: &str,
 ) -> Result<Option<String>, ParseError> {
     let mut buf = Vec::new();
     let mut out: Option<String> = None;
@@ -488,7 +482,7 @@ fn read_first_href<R: BufRead>(
         let step = next_step(xml, &mut buf)?;
         match step {
             Step::StartElement { ns, local, .. } => {
-                if out.is_none() && is(ns, &local, NsKind::Dav, b"href") {
+                if out.is_none() && is(ns, &local, NsKind::Dav, "href") {
                     out = Some(read_token(xml)?);
                 } else {
                     skip_element(xml, &local)?;
@@ -505,7 +499,7 @@ fn read_first_href<R: BufRead>(
     Ok(out)
 }
 
-fn skip_element<R: BufRead>(xml: &mut NsReader<R>, target: &[u8]) -> Result<(), ParseError> {
+fn skip_element<R: BufRead>(xml: &mut NsReader<R>, target: &str) -> Result<(), ParseError> {
     let mut buf = Vec::new();
     let mut depth: i32 = 1;
     while depth > 0 {

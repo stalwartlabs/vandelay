@@ -118,7 +118,8 @@ CREATE TABLE IF NOT EXISTS sync_id_exchange_graph (
     type_name   TEXT    NOT NULL CHECK (type_name IN (
                                             'mailbox','email',
                                             'calendar','calendarevent',
-                                            'addressbook','contactcard')),
+                                            'addressbook','contactcard',
+                                            'filenode')),
     graph_id    TEXT    NOT NULL,
     local_id    INTEGER NOT NULL,
     PRIMARY KEY (source_id, type_name, graph_id),
@@ -169,6 +170,17 @@ CREATE TABLE IF NOT EXISTS sieve_scripts (
 
 CREATE UNIQUE INDEX IF NOT EXISTS sieve_scripts_one_active_idx
     ON sieve_scripts (is_active) WHERE is_active = 1;
+
+CREATE TABLE IF NOT EXISTS vacation_response (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    source_id   INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    is_enabled  INTEGER NOT NULL DEFAULT 0,
+    from_date   TEXT,
+    to_date     TEXT,
+    subject     TEXT,
+    text_body   TEXT,
+    html_body   TEXT
+);
 
 CREATE TABLE IF NOT EXISTS address_books (
     id             INTEGER PRIMARY KEY,
@@ -234,6 +246,7 @@ CREATE TABLE IF NOT EXISTS file_nodes (
     modified       TEXT,
     is_subscribed  INTEGER NOT NULL DEFAULT 1,
     role           TEXT,
+    executable     INTEGER NOT NULL DEFAULT 0,
     UNIQUE (parent_id, name)
 );
 

@@ -15,7 +15,7 @@ use crate::db;
 use crate::db::sources::SourceKey;
 use crate::error::Error;
 use crate::logging::{LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
-use crate::sync::{CommonConfig, Summary, TypeCounts};
+use crate::sync::{CommonConfig, RunOutcome, Summary, TypeCounts};
 
 use super::messages;
 use super::tree;
@@ -32,6 +32,20 @@ pub struct MaildirImportConfig {
 }
 
 pub fn run(common: CommonConfig, config: MaildirImportConfig) -> Result<Summary, Error> {
+    run_reporting(common, config).into_result()
+}
+
+pub fn run_reporting(common: CommonConfig, config: MaildirImportConfig) -> RunOutcome {
+    let mut summary = Summary::default();
+    let error = run_into(common, config, &mut summary).err();
+    RunOutcome { summary, error }
+}
+
+fn run_into(
+    common: CommonConfig,
+    config: MaildirImportConfig,
+    summary: &mut Summary,
+) -> Result<(), Error> {
     let logger = common.logger;
     if common.threads > 1 {
         log_at(
@@ -121,8 +135,8 @@ pub fn run(common: CommonConfig, config: MaildirImportConfig) -> Result<Summary,
     );
 
     if common.dry_run {
-        let summary = build_dry_run_summary(&conn, source_id, &resolved, logger)?;
-        return Ok(summary);
+        *summary = build_dry_run_summary(&conn, source_id, &resolved, logger)?;
+        return Ok(());
     }
 
     let mut mailbox_counts = TypeCounts::default();
@@ -174,6 +188,14 @@ pub fn run(common: CommonConfig, config: MaildirImportConfig) -> Result<Summary,
             &mut email_counts,
             logger,
         ) {
+            if e.aborts_run() {
+                *summary = Summary {
+                    per_type: vec![("mailbox", mailbox_counts), ("email", email_counts)],
+                    retries_observed: 0,
+                    retry_after_sleeps: 0,
+                };
+                return Err(e);
+            }
             log_at(
                 logger,
                 LEVEL_DEFAULT,
@@ -207,11 +229,12 @@ pub fn run(common: CommonConfig, config: MaildirImportConfig) -> Result<Summary,
         ),
     );
 
-    Ok(Summary {
+    *summary = Summary {
         per_type: vec![("mailbox", mailbox_counts), ("email", email_counts)],
         retries_observed: 0,
         retry_after_sleeps: 0,
-    })
+    };
+    Ok(())
 }
 
 struct RunFlags {

@@ -6,7 +6,7 @@
 
 use std::thread::JoinHandle;
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
 use crate::jmap::session::Limits;
 
@@ -41,7 +41,7 @@ where
     {
         let threads = threads.max(1);
         let (job_tx, job_rx) = unbounded::<J>();
-        let (result_tx, result_rx) = unbounded::<R>();
+        let (result_tx, result_rx) = bounded::<R>(threads);
         let worker = std::sync::Arc::new(worker);
         let mut workers = Vec::with_capacity(threads);
         for _ in 0..threads {
@@ -75,10 +75,11 @@ where
 
     pub fn finish(mut self) -> Vec<R> {
         drop(self.job_tx.take());
+        let out = self.result_rx.iter().collect();
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
-        self.result_rx.try_iter().collect()
+        out
     }
 }
 
@@ -89,6 +90,7 @@ where
 {
     fn drop(&mut self) {
         drop(self.job_tx.take());
+        for _ in self.result_rx.iter() {}
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
@@ -130,5 +132,39 @@ mod tests {
         got.sort_unstable();
         let expected: Vec<u64> = (0..100).map(|n| n * n).collect();
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn pool_holds_at_most_one_unread_result_per_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        // Unread results back-pressure the workers instead of piling up.
+        let done = std::sync::Arc::new(AtomicUsize::new(0));
+        let pool: Pool<u64, u64> = Pool::new(2, {
+            let done = done.clone();
+            move |n| {
+                done.fetch_add(1, Ordering::SeqCst);
+                n
+            }
+        });
+        for n in 0..50 {
+            pool.submit(n);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(done.load(Ordering::SeqCst) <= 4);
+        let mut got = pool.finish();
+        got.sort_unstable();
+        assert_eq!(got, (0..50).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn dropping_pool_with_unread_results_does_not_hang() {
+        let pool: Pool<u64, u64> = Pool::new(2, |n| n);
+        for n in 0..50 {
+            pool.submit(n);
+        }
+        let _ = pool.results().recv();
+        drop(pool);
     }
 }

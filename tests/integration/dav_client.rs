@@ -4,10 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+use std::io;
 use std::time::Duration;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as B64;
+use encodify::base64::STANDARD as B64;
 use ureq::Agent;
 use ureq::http::{Method, Request};
 
@@ -21,6 +21,7 @@ pub struct DavSeed {
 
 impl DavSeed {
     pub fn new(base: impl Into<String>, user: &str, password: &str) -> Self {
+        super::install_crypto_provider();
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .allow_non_standard_methods(true)
@@ -55,24 +56,35 @@ impl DavSeed {
     ) -> ContainerResult<(u16, Vec<u8>)> {
         let parsed = Method::from_bytes(method.as_bytes())
             .map_err(|e| ContainerError::Protocol(format!("bad method {method}: {e}")))?;
-        let mut builder = Request::builder()
-            .method(parsed)
-            .uri(url)
-            .header("Authorization", &self.auth);
-        if let Some(d) = depth {
-            builder = builder.header("Depth", d.to_string());
-        }
-        if let Some(ct) = content_type {
-            builder = builder.header("Content-Type", ct);
-        }
         let payload: Vec<u8> = body.map(|b| b.to_vec()).unwrap_or_default();
-        let request = builder
-            .body(payload)
-            .map_err(|e| ContainerError::Protocol(format!("build request: {e}")))?;
-        let mut response = self.agent.run(request)?;
-        let status = response.status().as_u16();
-        let bytes = response.body_mut().read_to_vec()?;
-        Ok((status, bytes))
+        let mut attempt = 0u32;
+        loop {
+            let mut builder = Request::builder()
+                .method(parsed.clone())
+                .uri(url)
+                .header("Authorization", &self.auth);
+            if let Some(d) = depth {
+                builder = builder.header("Depth", d.to_string());
+            }
+            if let Some(ct) = content_type {
+                builder = builder.header("Content-Type", ct);
+            }
+            let request = builder
+                .body(payload.clone())
+                .map_err(|e| ContainerError::Protocol(format!("build request: {e}")))?;
+            match self.agent.run(request) {
+                Ok(mut response) => {
+                    let status = response.status().as_u16();
+                    let bytes = response.body_mut().read_to_vec()?;
+                    return Ok((status, bytes));
+                }
+                Err(e) if attempt < 20 && is_transient(&e) => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     pub fn mkcol(&self, path: &str, body: Option<&str>) -> ContainerResult<u16> {
@@ -150,6 +162,21 @@ impl DavSeed {
             )));
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+fn is_transient(e: &ureq::Error) -> bool {
+    match e {
+        ureq::Error::ConnectionFailed => true,
+        ureq::Error::Io(io) => matches!(
+            io.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::BrokenPipe
+        ),
+        _ => false,
     }
 }
 

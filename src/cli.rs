@@ -12,13 +12,13 @@ use regex::Regex;
 use crate::error::Error;
 use crate::exchange_ews::oauth::OAuthFlow;
 use crate::exchange_ews::types::MailboxKind;
-use crate::exchange_graph::types::{EventBodyFormat, MailboxKind as GraphMailboxKind};
+use crate::exchange_graph::types::{EventBodyFormat, MailboxKind as GraphMailboxKind, Surfaces};
 use crate::inspect::InspectConfig;
 use crate::jmap::account::AccountSelector;
 use crate::jmap::http::Auth;
 use crate::logging::Logger;
 use crate::secret;
-use crate::sync::import_dav::{DavAuth, DavImportConfig, DavKindArg};
+use crate::sync::import_dav::{DavAuth, DavImportConfig, DavKindArg, SourceChange};
 use crate::sync::import_exchange_ews::{EwsAuth, EwsImportConfig};
 use crate::sync::import_exchange_graph::{GraphAuth, GraphImportConfig};
 use crate::sync::import_imap::{ImapAuth, ImapImportConfig};
@@ -101,7 +101,7 @@ struct GlobalArgs {
         long_help = "Increase log verbosity (repeatable, max -vvv).\n  \
             (default) per-type start/finish lines and a final summary\n  \
             -v   per-chunk progress, account resolution, retry notices\n  \
-            -vv  every JMAP call (method, accountId, args, status, timing)\n  \
+            -vv  every protocol call (method/command, target, status, timing)\n  \
             -vvv full request/response bodies and backoff delays (stderr)"
     )]
     verbose: u8,
@@ -494,6 +494,13 @@ pub struct DavImportArgs {
     )]
     allow_source_change: bool,
 
+    #[arg(
+        long,
+        conflicts_with = "allow_source_change",
+        help = "Remove other recorded sources of this kind, and their items, before importing"
+    )]
+    replace_source: bool,
+
     #[command(flatten)]
     global: GlobalArgs,
 
@@ -715,7 +722,11 @@ fn resolve_dav_import(args: DavImportArgs, kind: DavKindArg) -> Result<Action, E
             allow_cleartext: args.allow_cleartext,
             dav_connections,
             multiget_batch,
-            allow_source_change: args.allow_source_change,
+            source_change: match (args.replace_source, args.allow_source_change) {
+                (true, _) => SourceChange::Replace,
+                (false, true) => SourceChange::Allow,
+                (false, false) => SourceChange::Reject,
+            },
         },
     ))
 }
@@ -1050,38 +1061,45 @@ fn resolve_exchange_ews_auth(args: &ExchangeEwsImportArgs) -> Result<EwsAuth, Er
     if let Some(token) = bearer.clone() {
         return Ok(EwsAuth::Bearer { token });
     }
-    let tenant = args
-        .ews_tenant
-        .clone()
-        .unwrap_or_else(|| "common".to_owned());
-    let client_id = args.ews_client_id.clone().ok_or_else(|| {
-        Error::Usage(
-            "--ews-client-id is required when --auth-bearer is used without an inline token"
-                .to_owned(),
-        )
-    })?;
+    let tenant = || {
+        args.ews_tenant
+            .clone()
+            .unwrap_or_else(|| "common".to_owned())
+    };
+    let required_client_id = || {
+        args.ews_client_id.clone().ok_or_else(|| {
+            Error::Usage(
+                "--ews-client-id is required with --ews-device-code or --ews-client-secret"
+                    .to_owned(),
+            )
+        })
+    };
     if args.ews_device_code {
-        return Ok(EwsAuth::OAuth(OAuthFlow::DeviceCode { tenant, client_id }));
-    }
-    if let Some(secret) = args.ews_client_secret.clone() {
-        let resolved = secret::resolve(
-            Some(secret.as_str()),
-            "VANDELAY_EWS_CLIENT_SECRET",
-            "client secret",
-        )?;
-        return Ok(EwsAuth::OAuth(OAuthFlow::ClientCredentials {
-            tenant,
-            client_id,
-            client_secret: resolved,
+        return Ok(EwsAuth::OAuth(OAuthFlow::DeviceCode {
+            tenant: tenant(),
+            client_id: required_client_id()?,
         }));
     }
-    if let Ok(env_secret) = std::env::var("VANDELAY_EWS_CLIENT_SECRET")
-        && !env_secret.is_empty()
+    if let Some(secret) = args.ews_client_secret.as_deref() {
+        return Ok(EwsAuth::OAuth(OAuthFlow::ClientCredentials {
+            tenant: tenant(),
+            client_id: required_client_id()?,
+            client_secret: secret.to_owned(),
+        }));
+    }
+    if let Ok(token) = std::env::var("VANDELAY_TOKEN")
+        && !token.is_empty()
+    {
+        return Ok(EwsAuth::Bearer { token });
+    }
+    if let Some(client_id) = args.ews_client_id.clone()
+        && let Ok(client_secret) = std::env::var("VANDELAY_EWS_CLIENT_SECRET")
+        && !client_secret.is_empty()
     {
         return Ok(EwsAuth::OAuth(OAuthFlow::ClientCredentials {
-            tenant,
+            tenant: tenant(),
             client_id,
-            client_secret: env_secret,
+            client_secret,
         }));
     }
     let token = secret::resolve(None, "VANDELAY_TOKEN", "bearer token")?;
@@ -1132,7 +1150,7 @@ pub struct ExchangeGraphImportArgs {
     #[arg(
         long,
         value_name = "LIST",
-        help = "Comma-separated surface list (mail,calendar,contacts; default all)"
+        help = "Comma-separated surface list: mail | calendar | contacts | files (default: all)"
     )]
     objects: Option<String>,
 
@@ -1160,6 +1178,32 @@ pub struct ExchangeGraphImportArgs {
         help = "Per-page size ($top query parameter, range [1, 1000])"
     )]
     top: usize,
+
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 5,
+        help = "Years either side of today to scan for edited recurrence occurrences (max 5)",
+        long_help = "Years either side of today to scan for edited recurrence occurrences.\n  \
+            Graph reports a series exception only inside an expanded calendar view, and caps\n  \
+            any single view at five years, so vandelay scans [today - N, today] and\n  \
+            [today, today + N]. An occurrence edited outside that span imports with the\n  \
+            series default instead of its edit."
+    )]
+    exception_window_years: i32,
+
+    #[arg(
+        long,
+        help = "Skip contact photos (saves one request per contact on large address books)",
+        long_help = "Skip contact photos.\n              Graph will not say which contacts have a photo: $expand=photo comes back empty\n              even when one exists, so the only way to find out is to ask for the bytes.\n              vandelay therefore spends one extra request per contact. Pass this to skip\n              photos entirely on a large address book."
+    )]
+    skip_contact_photos: bool,
+
+    #[arg(
+        long,
+        help = "Skip event file attachments (they are stored as JSCalendar enclosure links)"
+    )]
+    skip_event_attachments: bool,
 
     #[arg(
         long,
@@ -1203,11 +1247,12 @@ fn resolve_exchange_graph_import(args: ExchangeGraphImportArgs) -> Result<Action
         args.client_id.as_deref(),
         &args.tenant,
     )?;
-    let objects = args
+    let surfaces = args
         .objects
         .as_deref()
-        .map(crate::types::parse_object_list)
-        .transpose()?;
+        .map(Surfaces::parse_list)
+        .transpose()?
+        .unwrap_or_default();
     let top = args.top.clamp(1, 1000);
     let graph_connections = args
         .graph_connections
@@ -1220,10 +1265,13 @@ fn resolve_exchange_graph_import(args: ExchangeGraphImportArgs) -> Result<Action
             api_base: args.api_base,
             user_target: args.user,
             mailbox_kind,
-            objects,
+            surfaces,
             event_body_format,
             graph_connections,
             top,
+            exception_window_years: args.exception_window_years,
+            contact_photos: !args.skip_contact_photos,
+            event_attachments: !args.skip_event_attachments,
             allow_source_change: args.allow_source_change,
         },
     ))
@@ -1360,5 +1408,198 @@ mod tests {
         let bearer: Option<String> = Some("t".to_owned());
         let auth = resolve_auth(None, None, Some(&bearer)).unwrap();
         assert!(matches!(auth, Auth::Bearer { token } if token == "t"));
+    }
+
+    fn ews_auth(extra: &[&str]) -> Result<EwsAuth, Error> {
+        let mut argv = vec!["vandelay", "import", "exchange-ews", "archive.sqlite"];
+        argv.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("clap rejected args: {e}"));
+        match cli.resolve()? {
+            Action::ImportExchangeEws(_, config) => Ok(config.auth),
+            _ => panic!("expected ImportExchangeEws"),
+        }
+    }
+
+    fn set_ews_env(token: Option<&str>, client_secret: Option<&str>) {
+        unsafe {
+            match token {
+                Some(t) => env::set_var("VANDELAY_TOKEN", t),
+                None => env::remove_var("VANDELAY_TOKEN"),
+            }
+            match client_secret {
+                Some(s) => env::set_var("VANDELAY_EWS_CLIENT_SECRET", s),
+                None => env::remove_var("VANDELAY_EWS_CLIENT_SECRET"),
+            }
+        }
+    }
+
+    // A bare --auth-bearer takes VANDELAY_TOKEN without needing --ews-client-id.
+    #[test]
+    fn ews_bare_bearer_uses_env_token_without_client_id() {
+        let _g = lock();
+        set_ews_env(Some("envtok"), None);
+        let auth = ews_auth(&["--auth-bearer"]);
+        set_ews_env(None, None);
+        assert!(matches!(auth, Ok(EwsAuth::Bearer { token }) if token == "envtok"));
+    }
+
+    // VANDELAY_TOKEN wins over client credentials taken from the environment.
+    #[test]
+    fn ews_env_token_beats_env_client_secret() {
+        let _g = lock();
+        set_ews_env(Some("envtok"), Some("sec"));
+        let auth = ews_auth(&["--auth-bearer", "--ews-client-id", "cid"]);
+        set_ews_env(None, None);
+        assert!(matches!(auth, Ok(EwsAuth::Bearer { token }) if token == "envtok"));
+    }
+
+    // The env client secret is used when no token is exported.
+    #[test]
+    fn ews_env_client_secret_without_token_uses_client_credentials() {
+        let _g = lock();
+        set_ews_env(None, Some("sec"));
+        let auth = ews_auth(&["--auth-bearer", "--ews-client-id", "cid"]);
+        set_ews_env(None, None);
+        assert!(matches!(
+            auth,
+            Ok(EwsAuth::OAuth(OAuthFlow::ClientCredentials { client_id, client_secret, .. }))
+                if client_id == "cid" && client_secret == "sec"
+        ));
+    }
+
+    // An explicit --ews-device-code is not overridden by an exported token.
+    #[test]
+    fn ews_device_code_flag_beats_env_token() {
+        let _g = lock();
+        set_ews_env(Some("envtok"), None);
+        let auth = ews_auth(&[
+            "--auth-bearer",
+            "--ews-client-id",
+            "cid",
+            "--ews-device-code",
+        ]);
+        set_ews_env(None, None);
+        assert!(matches!(
+            auth,
+            Ok(EwsAuth::OAuth(OAuthFlow::DeviceCode { tenant, client_id }))
+                if tenant == "common" && client_id == "cid"
+        ));
+    }
+
+    // --ews-device-code still needs a client id.
+    #[test]
+    fn ews_device_code_without_client_id_is_usage_error() {
+        let _g = lock();
+        set_ews_env(Some("envtok"), None);
+        let auth = ews_auth(&["--auth-bearer", "--ews-device-code"]);
+        set_ews_env(None, None);
+        match auth {
+            Err(Error::Usage(m)) => assert!(m.contains("--ews-client-id"), "msg was: {m}"),
+            other => panic!("expected Usage error, got {other:?}"),
+        }
+    }
+
+    // An inline token wins over everything else.
+    #[test]
+    fn ews_inline_token_beats_env_and_flows() {
+        let _g = lock();
+        set_ews_env(Some("envtok"), None);
+        let auth = ews_auth(&[
+            "--auth-bearer=inline",
+            "--ews-client-id",
+            "cid",
+            "--ews-device-code",
+        ]);
+        set_ews_env(None, None);
+        assert!(matches!(auth, Ok(EwsAuth::Bearer { token }) if token == "inline"));
+    }
+
+    fn graph_config(objects: &[&str]) -> Result<GraphImportConfig, Error> {
+        let mut argv = vec![
+            "vandelay",
+            "import",
+            "exchange-graph",
+            "--access-token",
+            "tok",
+        ];
+        argv.extend_from_slice(objects);
+        argv.push("archive.sqlite");
+        let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("clap rejected args: {e}"));
+        match cli.resolve()? {
+            Action::ImportExchangeGraph(_, config) => Ok(config),
+            _ => panic!("expected ImportExchangeGraph"),
+        }
+    }
+
+    #[test]
+    fn graph_objects_contacts_selects_only_contacts() {
+        let _g = lock();
+        let config = graph_config(&["--objects", "contacts"]).unwrap();
+        assert_eq!(
+            config.surfaces,
+            Surfaces {
+                mail: false,
+                calendar: false,
+                contacts: true,
+                files: false
+            }
+        );
+    }
+
+    #[test]
+    fn graph_objects_absent_selects_every_surface() {
+        let _g = lock();
+        let config = graph_config(&[]).unwrap();
+        assert_eq!(config.surfaces, Surfaces::ALL);
+    }
+
+    #[test]
+    fn graph_objects_rejects_jmap_type_names() {
+        let _g = lock();
+        match graph_config(&["--objects", "contactcard"]) {
+            Err(Error::Usage(m)) => {
+                assert!(m.contains("unknown surface: contactcard"), "msg was: {m}");
+                assert!(
+                    m.contains("valid: mail, calendar, contacts"),
+                    "msg was: {m}"
+                );
+            }
+            other => panic!("expected Usage error, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    fn webdav_source_change(extra: &[&str]) -> Result<SourceChange, clap::Error> {
+        let mut argv = vec![
+            "vandelay",
+            "import",
+            "webdav",
+            "--url",
+            "https://dav.example/files/u/",
+            "--auth-bearer",
+            "tok",
+        ];
+        argv.extend_from_slice(extra);
+        argv.push("archive.sqlite");
+        let cli = Cli::try_parse_from(argv)?;
+        match cli.resolve() {
+            Ok(Action::ImportDav(_, config)) => Ok(config.source_change),
+            _ => panic!("expected ImportDav"),
+        }
+    }
+
+    // --replace-source maps to Replace and cannot be combined with --allow-source-change.
+    #[test]
+    fn dav_source_change_flags_resolve() {
+        let _g = lock();
+        assert_eq!(webdav_source_change(&[]).unwrap(), SourceChange::Reject);
+        assert_eq!(
+            webdav_source_change(&["--allow-source-change"]).unwrap(),
+            SourceChange::Allow
+        );
+        assert_eq!(
+            webdav_source_change(&["--replace-source"]).unwrap(),
+            SourceChange::Replace
+        );
+        assert!(webdav_source_change(&["--replace-source", "--allow-source-change"]).is_err());
     }
 }

@@ -176,6 +176,7 @@ pub fn teardown(base_url: &str) -> SeedResult<()> {
 
 pub fn provision(base_url: &str) -> SeedResult<Fixture> {
     let admin = Admin::connect(base_url, ADMIN_USER, ADMIN_PASSWORD)?;
+    admin.enable_directory_queries()?;
     admin.teardown_domain(DOMAIN)?;
     admin.invalidate_caches()?;
     let domain_id = admin.ensure_domain(DOMAIN)?;

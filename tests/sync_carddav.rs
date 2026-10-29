@@ -19,7 +19,7 @@ use vandelay::logging::Logger;
 fn base_url() -> &'static str {
     shared_stalwart().base_url()
 }
-use vandelay::sync::import_dav::{DavAuth, DavImportConfig, DavKindArg};
+use vandelay::sync::import_dav::{DavAuth, DavImportConfig, DavKindArg, SourceChange};
 use vandelay::sync::{self, CommonConfig, ConnectConfig, ExportConfig, ImportConfig};
 
 fn tmp_archive(tag: &str) -> PathBuf {
@@ -58,7 +58,7 @@ fn carddav_cfg(base_url: &str, domain: &str, localpart: &str) -> DavImportConfig
         allow_cleartext: false,
         dav_connections: 4,
         multiget_batch: 50,
-        allow_source_change: false,
+        source_change: SourceChange::Reject,
     }
 }
 

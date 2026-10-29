@@ -16,11 +16,10 @@ use crate::exchange_graph::error::GraphError;
 use crate::exchange_graph::oauth::{
     AcquiredToken, OAuthFlow, acquire, default_authority, refresh_access_token,
 };
-use crate::exchange_graph::types::{EventBodyFormat, MailboxKind, synthetic_account_id};
+use crate::exchange_graph::types::{EventBodyFormat, MailboxKind, Surfaces, synthetic_account_id};
 use crate::jmap::http::RetryPolicy;
 use crate::logging::LEVEL_DEFAULT;
 use crate::sync::{CommonConfig, Summary, TypeCounts};
-use crate::types::ObjectType;
 
 #[derive(Debug, Clone)]
 pub enum GraphAuth {
@@ -39,10 +38,13 @@ pub struct GraphImportConfig {
     pub api_base: String,
     pub user_target: Option<String>,
     pub mailbox_kind: MailboxKind,
-    pub objects: Option<Vec<ObjectType>>,
+    pub surfaces: Surfaces,
     pub event_body_format: EventBodyFormat,
     pub graph_connections: usize,
     pub top: usize,
+    pub exception_window_years: i32,
+    pub contact_photos: bool,
+    pub event_attachments: bool,
     pub allow_source_change: bool,
 }
 
@@ -56,6 +58,9 @@ pub struct GraphCoordinator<'a> {
     pub workers: usize,
     pub logger: crate::logging::Logger,
     pub event_body_format: EventBodyFormat,
+    pub exception_window_years: i32,
+    pub contact_photos: bool,
+    pub event_attachments: bool,
 }
 
 pub fn run(common: CommonConfig, config: GraphImportConfig) -> Result<Summary, Error> {
@@ -130,6 +135,7 @@ pub fn run(common: CommonConfig, config: GraphImportConfig) -> Result<Summary, E
     let mut event_counts = TypeCounts::default();
     let mut addressbook_counts = TypeCounts::default();
     let mut contact_counts = TypeCounts::default();
+    let mut file_counts = TypeCounts::default();
 
     let ctx = GraphCoordinator {
         client: &client,
@@ -139,34 +145,16 @@ pub fn run(common: CommonConfig, config: GraphImportConfig) -> Result<Summary, E
         workers: config.graph_connections.clamp(1, 16),
         logger,
         event_body_format: config.event_body_format,
+        exception_window_years: config.exception_window_years,
+        contact_photos: config.contact_photos,
+        event_attachments: config.event_attachments,
     };
 
-    let want_mail = config
-        .objects
-        .as_ref()
-        .map(|set| {
-            set.iter()
-                .any(|o| matches!(o, ObjectType::Mailbox | ObjectType::Email))
-        })
-        .unwrap_or(true);
-    let want_calendar = config
-        .objects
-        .as_ref()
-        .map(|set| {
-            set.iter()
-                .any(|o| matches!(o, ObjectType::Calendar | ObjectType::CalendarEvent))
-        })
-        .unwrap_or(true)
-        && !matches!(config.mailbox_kind, MailboxKind::Archive);
-    let want_contacts = config
-        .objects
-        .as_ref()
-        .map(|set| {
-            set.iter()
-                .any(|o| matches!(o, ObjectType::AddressBook | ObjectType::ContactCard))
-        })
-        .unwrap_or(true)
-        && !matches!(config.mailbox_kind, MailboxKind::Archive);
+    let primary = !matches!(config.mailbox_kind, MailboxKind::Archive);
+    let want_mail = config.surfaces.mail;
+    let want_calendar = config.surfaces.calendar && primary;
+    let want_contacts = config.surfaces.contacts && primary;
+    let want_files = config.surfaces.files && primary;
 
     if want_mail {
         let folders = super::folders::reconcile_mail(
@@ -195,12 +183,17 @@ pub fn run(common: CommonConfig, config: GraphImportConfig) -> Result<Summary, E
         super::contacts::reconcile_all(&mut conn, &ctx, &books, &mut contact_counts)?;
     }
 
+    if want_files {
+        super::files::reconcile_all(&mut conn, &ctx, &mut file_counts)?;
+    }
+
     summary.per_type.push(("mailbox", mailbox_counts));
     summary.per_type.push(("email", email_counts));
     summary.per_type.push(("calendar", calendar_counts));
     summary.per_type.push(("calendarevent", event_counts));
     summary.per_type.push(("addressbook", addressbook_counts));
     summary.per_type.push(("contactcard", contact_counts));
+    summary.per_type.push(("filenode", file_counts));
 
     if !summary.any_failed()
         && let Err(e) = run_gc(&conn)
@@ -263,25 +256,27 @@ pub fn enumerate_mail_folders(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let initial = endpoints.mail_folders_root(mailbox_kind, top);
     let level = crate::exchange_graph::api::collect_all_values(client, &initial, &[])?;
-    for f in &level {
-        if let Some(id) = f.get("id").and_then(Value::as_str)
-            && seen.insert(id.to_owned())
-        {
+    for folder in level {
+        let Some(id) = folder.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if seen.insert(id.to_owned()) {
             frontier.push(id.to_owned());
+            all.push(folder);
         }
     }
-    all.extend(level);
     while let Some(parent) = frontier.pop() {
         let url = endpoints.mail_folder_child_folders(&parent, top);
         let children = crate::exchange_graph::api::collect_all_values(client, &url, &[])?;
-        for c in &children {
-            if let Some(id) = c.get("id").and_then(Value::as_str)
-                && seen.insert(id.to_owned())
-            {
+        for child in children {
+            let Some(id) = child.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if seen.insert(id.to_owned()) {
                 frontier.push(id.to_owned());
+                all.push(child);
             }
         }
-        all.extend(children);
     }
     Ok(all)
 }
@@ -509,10 +504,13 @@ mod tests {
             api_base: "https://graph.microsoft.com/v1.0".to_owned(),
             user_target: None,
             mailbox_kind: MailboxKind::Primary,
-            objects: None,
+            surfaces: Surfaces::ALL,
             event_body_format: EventBodyFormat::Text,
             graph_connections: 4,
             top: 100,
+            exception_window_years: 5,
+            contact_photos: true,
+            event_attachments: true,
             allow_source_change: false,
         };
         let url = canonical_session_url(&config);

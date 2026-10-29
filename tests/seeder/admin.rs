@@ -121,6 +121,32 @@ impl Admin {
         Ok(())
     }
 
+    pub fn enable_directory_queries(&self) -> SeedResult<()> {
+        let response = self.jmap.call(
+            STALWART,
+            "x:Sharing/set",
+            &self.account_id,
+            json!({ "update": { "singleton": { "allowDirectoryQueries": true } } }),
+        )?;
+        if response.pointer("/updated/singleton").is_none() {
+            return Err(SeedError::Shape(format!(
+                "x:Sharing/set not applied: {response}"
+            )));
+        }
+        let response = self.jmap.call(
+            STALWART,
+            "x:Action/set",
+            &self.account_id,
+            json!({ "create": { "r": { "@type": "ReloadSettings" } } }),
+        )?;
+        if response.pointer("/created/r").is_none() {
+            return Err(SeedError::Shape(format!(
+                "ReloadSettings failed: {response}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn teardown_domain(&self, name: &str) -> SeedResult<()> {
         let Some(domain_id) = self.domain_id(name)? else {
             return Ok(());
@@ -197,7 +223,7 @@ impl Admin {
                 "encryptionAtRest": { "@type": "Disabled" },
                 "permissions": { "@type": "Inherit" },
                 "roles": { "@type": role },
-                "locale": "en_US"
+                "locale": "en-US"
             }
         });
         let response =

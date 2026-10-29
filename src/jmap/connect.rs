@@ -31,6 +31,9 @@ pub fn prepare(ctx: &Context, connect: &ConnectConfig) -> Result<Connected, Erro
     ctx.client.set_logger(ctx.common.logger);
 
     let session = Session::discover(&ctx.client, &connect.url)?;
+    for mismatch in session.origin_mismatches(&connect.url) {
+        ctx.common.logger.warn(&mismatch.to_string());
+    }
     let limits = session.core_limits()?;
     ctx.client.set_limits(&limits);
     let account_id = account::resolve(&connect.account, &session, &ctx.client)?;

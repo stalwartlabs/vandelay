@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use base64::Engine;
+use encodify::base64::STANDARD;
 use serde_json::{Value, json};
 use ureq::Agent;
 use ureq::config::RedirectAuthHeaders;
@@ -43,10 +43,9 @@ fn basic(user: &str, password: &str) -> String {
     raw.push_str(user);
     raw.push(':');
     raw.push_str(password);
-    format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(raw.as_bytes())
-    )
+    let mut header = String::from("Basic ");
+    STANDARD.encode_append(raw, &mut header);
+    header
 }
 
 impl Jmap {

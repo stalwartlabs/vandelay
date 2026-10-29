@@ -82,6 +82,10 @@ service managesieve-login {
   }
 }
 
+protocol imap {
+  mail_plugins = $mail_plugins imap_sieve
+}
+
 protocol sieve {
   managesieve_max_line_length = 1M
   managesieve_max_compile_errors = 5
@@ -96,6 +100,7 @@ info_log_path = /dev/stderr
 plugin {
   sieve = file:~/sieve;active=~/.dovecot.sieve
   sieve_max_script_size = 1M
+  imapsieve_url = sieve://127.0.0.1:4190
 }
 "#;
 
@@ -132,12 +137,14 @@ impl Dovecot {
             .with_exposed_port(IMAP_PORT.tcp())
             .with_exposed_port(SIEVE_PORT.tcp())
             .with_wait_for(WaitFor::message_on_stderr("starting up"))
-            .with_startup_timeout(Duration::from_secs(120));
+            .with_startup_timeout(Duration::from_secs(120))
+            .with_labels([(super::OWNER_LABEL, "1")]);
 
         let container = request.start()?;
         let host = container.get_host()?.to_string();
         let imap = Endpoint::new(host.clone(), container.get_host_port_ipv4(IMAP_PORT.tcp())?);
         let sieve = Endpoint::new(host, container.get_host_port_ipv4(SIEVE_PORT.tcp())?);
+        ImapSeed::connect(&imap.host, imap.port)?.logout()?;
 
         let accounts: Vec<Account> = layouts::accounts()
             .iter()
@@ -334,6 +341,38 @@ impl Dovecot {
             names,
             active: active_name.map(str::to_owned),
         })
+    }
+
+    pub fn create_non_ascii_mailbox(
+        &self,
+        account: &Account,
+        wire_name: &str,
+        message: &[u8],
+    ) -> ContainerResult<()> {
+        let mut client = ImapSeed::connect(&self.imap.host, self.imap.port)?;
+        client.login(&account.username, &account.password)?;
+        client.create(wire_name)?;
+        client.subscribe(wire_name)?;
+        client.append_with_flags(wire_name, &[], message)?;
+        client.logout()?;
+        Ok(())
+    }
+
+    pub fn create_leaves_without_parents(
+        &self,
+        account: &Account,
+        leaves: &[&str],
+        message: &[u8],
+    ) -> ContainerResult<Vec<String>> {
+        let mut client = ImapSeed::connect(&self.imap.host, self.imap.port)?;
+        client.login(&account.username, &account.password)?;
+        for name in leaves {
+            client.create(name)?;
+            client.append_with_flags(name, &[], message)?;
+        }
+        let listed = client.list_raw()?;
+        client.logout()?;
+        Ok(listed)
     }
 
     pub fn delete_first_inbox_message(&self, account: &Account) -> ContainerResult<()> {

@@ -19,13 +19,3 @@ pub mod managesieve;
 pub mod secret;
 pub mod sync;
 pub mod types;
-
-use std::sync::Once;
-
-static CRYPTO_INIT: Once = Once::new();
-
-pub fn install_default_crypto_provider() {
-    CRYPTO_INIT.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    });
-}

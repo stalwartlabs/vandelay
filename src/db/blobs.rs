@@ -27,6 +27,18 @@ pub fn blob_bytes(conn: &Connection, id: i64) -> Result<Option<Vec<u8>>, rusqlit
     .optional()
 }
 
+pub fn blob_len(conn: &Connection, id: i64) -> Result<Option<u64>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT length(data) FROM blobs WHERE id = ?1",
+        params![id],
+        |row| {
+            let len: i64 = row.get(0)?;
+            Ok(len.max(0) as u64)
+        },
+    )
+    .optional()
+}
+
 pub fn gc_orphan_blobs(conn: &Connection) -> Result<usize, rusqlite::Error> {
     conn.execute(
         "DELETE FROM blobs WHERE id NOT IN (
@@ -75,6 +87,14 @@ mod tests {
             Some(&b"payload"[..])
         );
         assert_eq!(blob_bytes(&c, 9999).unwrap(), None);
+    }
+
+    #[test]
+    fn blob_len_reports_byte_length() {
+        let c = mem();
+        let id = intern_blob(&c, b"payload").unwrap();
+        assert_eq!(blob_len(&c, id).unwrap(), Some(7));
+        assert_eq!(blob_len(&c, 9999).unwrap(), None);
     }
 
     #[test]

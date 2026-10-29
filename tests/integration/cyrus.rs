@@ -154,7 +154,8 @@ impl Cyrus {
         let request = image
             .with_exposed_port(IMAP_PORT.tcp())
             .with_wait_for(WaitFor::message_on_stdout("cyrus provisioned"))
-            .with_startup_timeout(Duration::from_secs(180));
+            .with_startup_timeout(Duration::from_secs(180))
+            .with_labels([(super::OWNER_LABEL, "1")]);
 
         let container = request.start()?;
         let host = container.get_host()?.to_string();
@@ -279,6 +280,21 @@ impl Cyrus {
             flagged_target,
             appends,
         })
+    }
+
+    pub fn create_non_ascii_mailbox(
+        &self,
+        account: &Account,
+        wire_name: &str,
+        message: &[u8],
+    ) -> ContainerResult<()> {
+        let mut client = ImapSeed::connect(&self.imap.host, self.imap.port)?;
+        client.login(&account.username, &account.password)?;
+        client.create(wire_name)?;
+        client.subscribe(wire_name)?;
+        client.append_with_flags(wire_name, &[], message)?;
+        client.logout()?;
+        Ok(())
     }
 
     pub fn delete_first_inbox_message(&self, account: &Account) -> ContainerResult<()> {

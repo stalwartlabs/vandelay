@@ -272,14 +272,14 @@ fn seed_filenodes(jmap: &Jmap, account_id: &str, tree: &[FileSpec]) -> SeedResul
             obj.insert("parentId".to_owned(), Value::String(format!("#{parent}")));
         }
         if spec.directory {
-            obj.insert("nodeType".to_owned(), Value::String("directory".to_owned()));
+            obj.insert("@type".to_owned(), Value::String("Directory".to_owned()));
         } else {
             let bytes = random_bytes(128 + i * 17)?;
             let blob_id = jmap.upload(account_id, "application/octet-stream", &bytes)?;
-            obj.insert("nodeType".to_owned(), Value::String("file".to_owned()));
+            obj.insert("@type".to_owned(), Value::String("File".to_owned()));
             obj.insert("blobId".to_owned(), Value::String(blob_id));
             obj.insert(
-                "type".to_owned(),
+                "mediaType".to_owned(),
                 Value::String("application/octet-stream".to_owned()),
             );
         }
@@ -398,6 +398,9 @@ fn seed_contacts_calendars(
             .clone();
         for immutable in ["method", "prodId"] {
             obj.remove(immutable);
+        }
+        if obj.contains_key("recurrenceRule") || obj.contains_key("recurrenceOverrides") {
+            obj.remove("recurrenceId");
         }
         let calendar = &calendars[i % calendars.len()];
         obj.insert("calendarIds".to_owned(), json!({ calendar.as_str(): true }));

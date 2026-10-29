@@ -7,24 +7,26 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use encodify::base64::STANDARD;
 use serde_json::Value;
 use ureq::Agent;
 use ureq::config::{Config, RedirectAuthHeaders};
 use ureq::tls::{RootCerts, TlsConfig};
+use ureq::{ResponseExt, http::Uri};
 
 use crate::jmap::error::JmapError;
 use crate::jmap::inflight::{Permit, Semaphore};
 use crate::jmap::retry::{self, Disposition, RateLimitState};
 use crate::jmap::session::Limits;
-use crate::logging::{LEVEL_BODIES, LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
+use crate::logging::{HttpCall, LEVEL_BODIES, LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
 
 const MAX_BODY: u64 = 512 * 1024 * 1024;
 
 const LONG_RETRY_THRESHOLD: Duration = Duration::from_secs(10);
+
+const BASIC: &str = "Basic ";
 
 #[derive(Debug, Clone)]
 pub enum Auth {
@@ -36,7 +38,12 @@ impl Auth {
     pub fn header_value(&self) -> String {
         match self {
             Auth::Basic { user, password } => {
-                format!("Basic {}", STANDARD.encode(format!("{user}:{password}")))
+                let credentials = format!("{user}:{password}");
+                let mut header =
+                    String::with_capacity(BASIC.len() + STANDARD.encoded_len(credentials.len()));
+                header.push_str(BASIC);
+                STANDARD.encode_append(credentials, &mut header);
+                header
             }
             Auth::Bearer { token } => format!("Bearer {token}"),
         }
@@ -102,6 +109,9 @@ impl HttpClient {
             .redirect_auth_headers(RedirectAuthHeaders::SameHost)
             .tls_config(
                 TlsConfig::builder()
+                    .unversioned_rustls_crypto_provider(std::sync::Arc::new(
+                        rustls::crypto::aws_lc_rs::default_provider(),
+                    ))
                     .root_certs(RootCerts::PlatformVerifier)
                     .disable_verification(allow_invalid_certs)
                     .build(),
@@ -250,7 +260,7 @@ impl HttpClient {
                 } else {
                     None
                 };
-                self.one_attempt(url, body, content_type)
+                self.one_attempt(method, url, body, content_type)
             };
             match attempt_outcome {
                 Attempt::Ok { status, body, .. } if (200..300).contains(&status) => {
@@ -363,8 +373,16 @@ impl HttpClient {
         }
     }
 
-    fn one_attempt(&self, url: &str, body: Option<&[u8]>, content_type: Option<&str>) -> Attempt {
+    fn one_attempt(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<&[u8]>,
+        content_type: Option<&str>,
+    ) -> Attempt {
         let auth = self.inner.auth.header_value();
+        let logger = self.logger();
+        let started = Instant::now();
         let result = if let Some(payload) = body {
             let mut req = self
                 .inner
@@ -387,6 +405,12 @@ impl HttpClient {
         match result {
             Ok(mut resp) => {
                 let status = resp.status().as_u16();
+                let final_uri = resp.get_uri().clone();
+                let response_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
                 let retry_after = resp
                     .headers()
                     .get("retry-after")
@@ -408,18 +432,37 @@ impl HttpClient {
                     })
                     .collect();
                 match resp.body_mut().with_config().limit(MAX_BODY).read_to_vec() {
-                    Ok(bytes) => Attempt::Ok {
-                        status,
-                        body: bytes,
-                        retry_after,
-                        rate_limit_headers,
-                    },
+                    Ok(bytes) => {
+                        warn_on_redirect(&logger, method, url, &final_uri);
+                        logger.trace_http(&HttpCall {
+                            proto: "JMAP",
+                            method,
+                            url,
+                            status,
+                            elapsed: started.elapsed(),
+                            note: None,
+                            request: body,
+                            request_type: content_type,
+                            response: &bytes,
+                            response_type: response_type.as_deref(),
+                        });
+                        Attempt::Ok {
+                            status,
+                            body: bytes,
+                            retry_after,
+                            rate_limit_headers,
+                        }
+                    }
                     Err(e) => Attempt::Transport(JmapError::Transport(format!(
                         "reading response body: {e}"
                     ))),
                 }
             }
-            Err(e) => Attempt::Transport(map_ureq_error(e)),
+            Err(e) => {
+                let err = map_ureq_error(e);
+                logger.trace_http_error("JMAP", method, url, &err.to_string(), started.elapsed());
+                Attempt::Transport(err)
+            }
         }
     }
 
@@ -495,6 +538,26 @@ struct RetryLog<'a> {
     body: &'a [u8],
 }
 
+fn warn_on_redirect(logger: &Logger, method: &str, requested: &str, final_uri: &Uri) {
+    let landed = final_uri.to_string();
+    if cross_host(requested, &landed) {
+        logger.warn(&format!(
+            "{method} {requested} was redirected across hosts to {landed}; a \
+            JMAP endpoint must not redirect: verify the server's advertised base \
+            URL and that the request host matches its configured hostname"
+        ));
+    }
+}
+
+pub fn cross_host(requested: &str, landed: &str) -> bool {
+    match (url::Url::parse(requested), url::Url::parse(landed)) {
+        (Ok(a), Ok(b)) => {
+            a.host_str() != b.host_str() || a.port_or_known_default() != b.port_or_known_default()
+        }
+        _ => false,
+    }
+}
+
 fn transport_disposition(err: &JmapError) -> Disposition {
     match err {
         JmapError::Connect(_) => Disposition::Fatal,
@@ -560,9 +623,11 @@ fn format_rate_headers(headers: &[(String, String)]) -> Option<String> {
     Some(parts.join("; "))
 }
 
-fn format_retry_wait(d: Duration) -> String {
+pub fn format_retry_wait(d: Duration) -> String {
     let total = d.as_secs();
-    if total < 60 {
+    if total == 0 {
+        format!("{}ms", d.as_millis())
+    } else if total < 60 {
         format!("{total}s")
     } else if total < 3600 {
         format!("{}m{:02}s", total / 60, total % 60)
@@ -595,6 +660,30 @@ mod tests {
             token: "abc.def".to_owned(),
         };
         assert_eq!(auth.header_value(), "Bearer abc.def");
+    }
+
+    #[test]
+    fn cross_host_detects_hostname_change() {
+        assert!(cross_host(
+            "https://mail.example.com/jmap",
+            "https://login.example.net/sso"
+        ));
+    }
+
+    #[test]
+    fn cross_host_ignores_same_host_path_change() {
+        assert!(!cross_host(
+            "https://mail.example.com/jmap",
+            "https://mail.example.com/jmap/api"
+        ));
+    }
+
+    #[test]
+    fn cross_host_flags_port_change() {
+        assert!(cross_host(
+            "https://mail.example.com/jmap",
+            "https://mail.example.com:8443/jmap"
+        ));
     }
 
     #[test]
@@ -745,6 +834,7 @@ mod tests {
 
     #[test]
     fn format_retry_wait_short_medium_long() {
+        assert_eq!(format_retry_wait(Duration::from_millis(250)), "250ms");
         assert_eq!(format_retry_wait(Duration::from_secs(7)), "7s");
         assert_eq!(format_retry_wait(Duration::from_secs(67)), "1m07s");
         assert_eq!(format_retry_wait(Duration::from_secs(1427)), "23m47s");

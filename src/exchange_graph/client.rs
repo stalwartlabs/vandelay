@@ -7,18 +7,19 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use ureq::Agent;
 use ureq::config::{Config, RedirectAuthHeaders};
 use ureq::tls::{RootCerts, TlsConfig};
+use ureq::{ResponseExt, http::Uri};
 
 use crate::exchange_graph::error::GraphError;
 use crate::exchange_graph::retry::{HttpClass, classify_http_status, is_throttled};
-use crate::jmap::http::{RetryPolicy, retry_after_header};
+use crate::jmap::http::{RetryPolicy, cross_host, retry_after_header};
 use crate::jmap::retry::{self, RateLimitState};
-use crate::logging::{LEVEL_BODIES, LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
+use crate::logging::{HttpCall, LEVEL_BODIES, LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
 
 const MAX_BODY: u64 = 256 * 1024 * 1024;
 const LONG_RETRY_THRESHOLD: Duration = Duration::from_secs(10);
@@ -27,6 +28,7 @@ const LONG_RETRY_THRESHOLD: Duration = Duration::from_secs(10);
 pub enum Accept {
     Json,
     Text,
+    Binary,
 }
 
 impl Accept {
@@ -34,6 +36,7 @@ impl Accept {
         match self {
             Accept::Json => "application/json",
             Accept::Text => "text/plain",
+            Accept::Binary => "application/octet-stream",
         }
     }
 }
@@ -91,6 +94,9 @@ impl GraphClient {
             .redirect_auth_headers(RedirectAuthHeaders::SameHost)
             .tls_config(
                 TlsConfig::builder()
+                    .unversioned_rustls_crypto_provider(std::sync::Arc::new(
+                        rustls::crypto::aws_lc_rs::default_provider(),
+                    ))
                     .root_certs(RootCerts::PlatformVerifier)
                     .disable_verification(allow_invalid_certs)
                     .build(),
@@ -318,9 +324,12 @@ impl GraphClient {
         for value in extra_prefer {
             req = req.header("Prefer", *value);
         }
+        let logger = self.logger();
+        let started = Instant::now();
         match req.call() {
             Ok(mut resp) => {
                 let status = resp.status().as_u16();
+                let final_uri = resp.get_uri().clone();
                 let retry_after = resp
                     .headers()
                     .get("retry-after")
@@ -332,18 +341,37 @@ impl GraphClient {
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_owned);
                 match resp.body_mut().with_config().limit(MAX_BODY).read_to_vec() {
-                    Ok(bytes) => Attempt::Ok {
-                        status,
-                        body: bytes,
-                        retry_after,
-                        content_type,
-                    },
+                    Ok(bytes) => {
+                        warn_on_redirect(&logger, method, url, &final_uri);
+                        logger.trace_http(&HttpCall {
+                            proto: "Graph",
+                            method,
+                            url,
+                            status,
+                            elapsed: started.elapsed(),
+                            note: None,
+                            request: None,
+                            request_type: None,
+                            response: &bytes,
+                            response_type: content_type.as_deref(),
+                        });
+                        Attempt::Ok {
+                            status,
+                            body: bytes,
+                            retry_after,
+                            content_type,
+                        }
+                    }
                     Err(e) => Attempt::Transport(GraphError::Transport(format!(
                         "reading response body: {e}"
                     ))),
                 }
             }
-            Err(e) => Attempt::Transport(map_ureq_error(e)),
+            Err(e) => {
+                let err = map_ureq_error(e);
+                logger.trace_http_error("Graph", method, url, &err.to_string(), started.elapsed());
+                Attempt::Transport(err)
+            }
         }
     }
 
@@ -382,6 +410,22 @@ struct RetryLog<'a> {
     delay: Duration,
     status: u16,
     body: &'a [u8],
+}
+
+fn warn_on_redirect(logger: &Logger, method: &str, requested: &str, final_uri: &Uri) {
+    if requested.ends_with("/content") {
+        return;
+    }
+    let landed = final_uri.to_string();
+    if cross_host(requested, &landed) {
+        let host = url::Url::parse(&landed)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .unwrap_or_else(|| "another host".to_owned());
+        logger.warn(&format!(
+            "{method} {requested} was redirected across hosts to {host}; verify the Graph endpoint host is reachable directly without redirection"
+        ));
+    }
 }
 
 fn map_ureq_error(err: ureq::Error) -> GraphError {

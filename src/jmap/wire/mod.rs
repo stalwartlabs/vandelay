@@ -16,5 +16,6 @@ pub mod identity;
 pub mod mailbox;
 pub mod participant_identity;
 pub mod sieve_script;
+pub mod vacation_response;
 
 pub use common::{Date, EmailAddress, JmapId, UtcDate};

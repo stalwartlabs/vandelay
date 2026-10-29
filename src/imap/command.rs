@@ -6,6 +6,11 @@
 
 use std::fmt::Write as _;
 
+use encodify::base64::STANDARD;
+
+const AUTHENTICATE: &str = "AUTHENTICATE ";
+const CRLF: &[u8] = b"\r\n";
+
 pub struct CommandBuilder {
     next_tag: u32,
 }
@@ -84,8 +89,22 @@ pub fn authenticate(mechanism: &str) -> String {
     format!("AUTHENTICATE {mechanism}")
 }
 
-pub fn authenticate_with_ir(mechanism: &str, initial_response: &str) -> String {
-    format!("AUTHENTICATE {mechanism} {initial_response}")
+pub fn authenticate_with_ir(mechanism: &str, initial_response: &[u8]) -> String {
+    let mut out = String::with_capacity(
+        AUTHENTICATE.len() + mechanism.len() + 1 + STANDARD.encoded_len(initial_response.len()),
+    );
+    out.push_str(AUTHENTICATE);
+    out.push_str(mechanism);
+    out.push(' ');
+    STANDARD.encode_append(initial_response, &mut out);
+    out
+}
+
+pub fn sasl_response(response: &[u8]) -> Vec<u8> {
+    let mut line = Vec::with_capacity(STANDARD.encoded_len(response.len()) + CRLF.len());
+    STANDARD.encode_append(response, &mut line);
+    line.extend_from_slice(CRLF);
+    line
 }
 
 pub fn capability() -> &'static str {
@@ -280,6 +299,24 @@ mod tests {
         assert_eq!(b.next_tag(), "A0001");
         assert_eq!(b.next_tag(), "A0002");
         assert_eq!(b.next_tag(), "A0003");
+    }
+
+    #[test]
+    fn authenticate_with_ir_appends_the_base64_initial_response() {
+        assert_eq!(
+            authenticate_with_ir("PLAIN", b"\0foo\0bar"),
+            "AUTHENTICATE PLAIN AGZvbwBiYXI="
+        );
+        assert_eq!(
+            authenticate_with_ir("XOAUTH2", b""),
+            "AUTHENTICATE XOAUTH2 "
+        );
+    }
+
+    #[test]
+    fn sasl_response_is_base64_with_crlf() {
+        assert_eq!(sasl_response(b"\0foo\0bar"), b"AGZvbwBiYXI=\r\n");
+        assert_eq!(sasl_response(b""), b"\r\n");
     }
 
     #[test]

@@ -5,7 +5,7 @@
  */
 
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::SyncRunner;
@@ -56,11 +56,14 @@ impl Radicale {
         let request = image
             .with_copy_to("/config/config", CONFIG.as_bytes().to_vec())
             .with_copy_to("/config/users", users.into_bytes())
-            .with_startup_timeout(Duration::from_secs(90));
+            .with_startup_timeout(Duration::from_secs(90))
+            .with_labels([(super::OWNER_LABEL, "1")]);
 
         let container = request.start()?;
         let host = container.get_host()?.to_string();
         let port = container.get_host_port_ipv4(RADICALE_PORT.tcp())?;
+
+        wait_ready(&format!("http://{host}:{port}/"), Duration::from_secs(30))?;
 
         let accounts: Vec<Account> = layouts::accounts()
             .iter()
@@ -336,6 +339,26 @@ impl AccountSeed {
             .flat_map(|c| c.items.iter().map(|i| i.uid.clone()))
             .collect()
     }
+}
+
+fn wait_ready(base: &str, total: Duration) -> ContainerResult<()> {
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(5)))
+        .build()
+        .new_agent();
+    let deadline = Instant::now() + total;
+    let mut last_err = String::from("no probe attempted");
+    while Instant::now() < deadline {
+        match agent.get(base).call() {
+            Ok(_) => return Ok(()),
+            Err(e) => last_err = e.to_string(),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Err(ContainerError::Protocol(format!(
+        "radicale did not become ready in {total:?}: {last_err}"
+    )))
 }
 
 fn collection_segment(prefix: &str, idx: usize, name: &str) -> String {

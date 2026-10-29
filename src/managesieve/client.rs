@@ -5,11 +5,12 @@
  */
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::time::Instant;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use encodify::base64::STANDARD;
 
 use crate::imap::transport::{Connector, ImapStream};
+use crate::logging::Logger;
 
 use super::command;
 use super::error::SieveError;
@@ -30,6 +31,7 @@ pub struct SieveClient {
     pub capabilities: Capabilities,
     closed: bool,
     fresh_post_auth_caps: bool,
+    logger: Logger,
 }
 
 impl SieveClient {
@@ -39,6 +41,7 @@ impl SieveClient {
         port: u16,
         mode: ConnectMode,
         allow_cleartext: bool,
+        logger: Logger,
     ) -> Result<SieveClient, SieveError> {
         let stream: Box<dyn ImapStream> = match mode {
             ConnectMode::ImplicitTls => connector
@@ -54,6 +57,7 @@ impl SieveClient {
             capabilities: Capabilities::default(),
             closed: false,
             fresh_post_auth_caps: false,
+            logger,
         };
         client.read_initial_capabilities()?;
         if matches!(mode, ConnectMode::StartTls) {
@@ -143,14 +147,28 @@ impl SieveClient {
     }
 
     pub fn run(&mut self, command: &str) -> Result<ResponseBlock, SieveError> {
+        let started = Instant::now();
         self.write_all(command.as_bytes())?;
         let block = read_response(&mut self.reader)?;
+        self.logger.trace_cmd(
+            "SIEVE",
+            command,
+            &sieve_status(&block.status),
+            started.elapsed(),
+        );
         finish_block(block, &mut self.closed)
     }
 
     pub fn run_raw(&mut self, bytes: &[u8]) -> Result<ResponseBlock, SieveError> {
+        let started = Instant::now();
         self.write_all(bytes)?;
         let block = read_response(&mut self.reader)?;
+        self.logger.trace_cmd(
+            "SIEVE",
+            &String::from_utf8_lossy(bytes),
+            &sieve_status(&block.status),
+            started.elapsed(),
+        );
         finish_block(block, &mut self.closed)
     }
 
@@ -182,17 +200,17 @@ impl SieveClient {
         payload.extend_from_slice(authcid.as_bytes());
         payload.push(0);
         payload.extend_from_slice(password.as_bytes());
-        let encoded = BASE64.encode(&payload);
+        let encoded = STANDARD.encode(&payload);
         self.send_authenticate("PLAIN", &encoded)
     }
 
     pub fn authenticate_login(&mut self, authcid: &str, password: &str) -> Result<(), SieveError> {
         self.fresh_post_auth_caps = false;
         self.write_all(command::authenticate("LOGIN").as_bytes())?;
-        let user_payload = BASE64.encode(authcid.as_bytes());
+        let user_payload = STANDARD.encode(authcid);
         self.expect_continuation()?;
         self.write_all(command::continuation_payload(&user_payload).as_bytes())?;
-        let pass_payload = BASE64.encode(password.as_bytes());
+        let pass_payload = STANDARD.encode(password);
         self.expect_continuation()?;
         self.write_all(command::continuation_payload(&pass_payload).as_bytes())?;
         let block = read_response(&mut self.reader)?;
@@ -218,7 +236,7 @@ impl SieveClient {
         payload.push_str(token);
         payload.push('\x01');
         payload.push('\x01');
-        let encoded = BASE64.encode(payload.as_bytes());
+        let encoded = STANDARD.encode(&payload);
         self.send_authenticate("OAUTHBEARER", &encoded)
     }
 
@@ -300,6 +318,7 @@ impl SieveClient {
             capabilities: Capabilities::default(),
             closed: false,
             fresh_post_auth_caps: false,
+            logger: Logger::from_flags(true, 0),
         }
     }
 
@@ -343,6 +362,15 @@ fn finish_block(block: ResponseBlock, closed: &mut bool) -> Result<ResponseBlock
             Err(SieveError::Bye(block.status.text))
         }
     }
+}
+
+fn sieve_status(status: &StatusLine) -> String {
+    let word = match status.status {
+        Status::Ok => "OK",
+        Status::No => "NO",
+        Status::Bye => "BYE",
+    };
+    format!("{word} {}", status.text)
 }
 
 fn noop_stream() -> Box<dyn ImapStream> {

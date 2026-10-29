@@ -6,14 +6,13 @@
 
 use std::collections::BTreeSet;
 use std::io::{BufReader, Read, Write};
-
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use std::time::Instant;
 
 use super::command::{self, CommandBuilder};
 use super::error::{ImapError, NoError};
 use super::response::{Response, Status, StatusLine, Untagged, parse_response};
 use super::transport::{Connector, ImapStream};
+use crate::logging::Logger;
 
 pub struct ImapClient {
     reader: BufReader<Box<dyn ImapStream>>,
@@ -22,6 +21,7 @@ pub struct ImapClient {
     pub host: String,
     closed: bool,
     utf8_accept: bool,
+    logger: Logger,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +44,7 @@ impl ImapClient {
         host: &str,
         port: u16,
         mode: ConnectMode,
+        logger: Logger,
     ) -> Result<ImapClient, ImapError> {
         let stream: Box<dyn ImapStream> = match mode {
             ConnectMode::ImplicitTls => connector.connect_tls(host, port)?,
@@ -56,6 +57,7 @@ impl ImapClient {
             host: host.to_owned(),
             closed: false,
             utf8_accept: false,
+            logger,
         };
         client.read_greeting()?;
         client.send_capability()?;
@@ -196,9 +198,8 @@ impl ImapClient {
         payload.extend_from_slice(authcid.as_bytes());
         payload.push(0);
         payload.extend_from_slice(password.as_bytes());
-        let encoded = BASE64.encode(&payload);
         if self.has_capability("SASL-IR") {
-            let cmd = command::authenticate_with_ir("PLAIN", &encoded);
+            let cmd = command::authenticate_with_ir("PLAIN", &payload);
             return match self.run_collect(&cmd) {
                 Ok(_) => Ok(()),
                 Err(ImapError::No(no)) if no.is_auth_failed() => {
@@ -213,9 +214,7 @@ impl ImapClient {
             let resp = parse_response(&mut self.reader)?;
             match resp {
                 Response::Continuation(_) => {
-                    let mut line = encoded.clone().into_bytes();
-                    line.extend_from_slice(b"\r\n");
-                    self.write_all(&line)?;
+                    self.write_all(&command::sasl_response(&payload))?;
                 }
                 Response::Tagged { tag: t, line } if t == tag => {
                     self.update_capabilities_from_code(&line);
@@ -255,9 +254,8 @@ impl ImapClient {
     }
 
     fn drive_bearer_sasl(&mut self, mechanism: &str, payload: &[u8]) -> Result<(), ImapError> {
-        let encoded = BASE64.encode(payload);
         if self.has_capability("SASL-IR") {
-            let cmd = command::authenticate_with_ir(mechanism, &encoded);
+            let cmd = command::authenticate_with_ir(mechanism, payload);
             return match self.run_collect(&cmd) {
                 Ok(_) => Ok(()),
                 Err(ImapError::No(no)) if no.is_auth_failed() => {
@@ -276,9 +274,7 @@ impl ImapClient {
                     if sent {
                         self.write_all(b"\r\n")?;
                     } else {
-                        let mut line = encoded.clone().into_bytes();
-                        line.extend_from_slice(b"\r\n");
-                        self.write_all(&line)?;
+                        self.write_all(&command::sasl_response(payload))?;
                         sent = true;
                     }
                 }
@@ -337,12 +333,19 @@ impl ImapClient {
                     .into(),
             ));
         }
+        let started = Instant::now();
         self.write_all(&bytes)?;
         loop {
             let resp = parse_response(&mut self.reader)?;
             match resp {
                 Response::Tagged { tag: t, line } if t == tag => {
                     self.update_capabilities_from_code(&line);
+                    self.logger.trace_cmd(
+                        "IMAP",
+                        command,
+                        &format!("{} {}", status_word(&line.status), line.text),
+                        started.elapsed(),
+                    );
                     return match line.status {
                         Status::Ok => Ok(line),
                         Status::No => Err(ImapError::No(line.into_no_error())),
@@ -388,6 +391,7 @@ impl ImapClient {
                     .into(),
             ));
         }
+        let started = Instant::now();
         self.write_all(&bytes)?;
         let mut untagged = Vec::new();
         loop {
@@ -395,6 +399,12 @@ impl ImapClient {
             match resp {
                 Response::Tagged { tag: t, line } if t == tag => {
                     self.update_capabilities_from_code(&line);
+                    self.logger.trace_cmd(
+                        "IMAP",
+                        command,
+                        &format!("{} {}", status_word(&line.status), line.text),
+                        started.elapsed(),
+                    );
                     return match line.status {
                         Status::Ok => Ok(CollectedResponse {
                             tag,
@@ -473,6 +483,16 @@ pub struct CollectedResponse {
     pub tag: String,
     pub line: StatusLine,
     pub untagged: Vec<Untagged>,
+}
+
+fn status_word(status: &Status) -> &'static str {
+    match status {
+        Status::Ok => "OK",
+        Status::No => "NO",
+        Status::Bad => "BAD",
+        Status::Bye => "BYE",
+        Status::PreAuth => "PREAUTH",
+    }
 }
 
 fn parse_caps(s: &str) -> BTreeSet<String> {
@@ -569,6 +589,7 @@ mod tests {
             host: "test.example".to_owned(),
             closed: false,
             utf8_accept: false,
+            logger: Logger::from_flags(true, 0),
         }
     }
 
@@ -632,6 +653,16 @@ mod tests {
         let mut c = client_with(server);
         c.capabilities.insert("SASL-IR".to_owned());
         c.authenticate_plain("alice", "p@ss").unwrap();
+    }
+
+    #[test]
+    fn authenticate_plain_accepts_dovecot_post_login_untagged_capability() {
+        let server = b"* CAPABILITY IMAP4rev1 SASL-IR MOVE IMAPSIEVE=sieve://127.0.0.1:4190 QUOTA\r\nA0001 OK [CAPABILITY IMAP4rev1 SASL-IR MOVE IMAPSIEVE=sieve://127.0.0.1:4190 QUOTA] Logged in\r\n";
+        let mut c = client_with(server);
+        c.capabilities.insert("SASL-IR".to_owned());
+        c.authenticate_plain("alice", "p@ss").unwrap();
+        assert!(c.has_capability("MOVE"));
+        assert!(c.has_capability("IMAPSIEVE=sieve://127.0.0.1:4190"));
     }
 
     #[test]

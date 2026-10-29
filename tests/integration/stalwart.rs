@@ -5,10 +5,11 @@
  */
 
 use std::net::TcpListener;
+use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use base64::Engine;
+use encodify::base64::STANDARD;
 use serde_json::Value;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::SyncRunner;
@@ -17,6 +18,7 @@ use ureq::Agent;
 use ureq::config::RedirectAuthHeaders;
 use ureq::tls::{TlsConfig, TlsProvider};
 
+use super::OWNER_LABEL;
 use super::error::{ContainerError, ContainerResult};
 
 const IMAGE_NAME: &str = "stalwartlabs/stalwart";
@@ -45,6 +47,7 @@ pub struct Stalwart {
 
 impl Stalwart {
     pub fn start() -> ContainerResult<Self> {
+        sweep_abandoned_containers();
         let https_port = pick_free_port()?;
         let imap_port = pick_free_port()?;
         let imaps_port = pick_free_port()?;
@@ -63,6 +66,7 @@ impl Stalwart {
         let request = image
             .with_env_var("STALWART_PUBLIC_URL", &public_url)
             .with_env_var("STALWART_RECOVERY_ADMIN", "admin:admin")
+            .with_labels([(OWNER_LABEL, "1")])
             .with_copy_to(CONFIG_PATH, CONFIG_JSON.as_bytes().to_vec())
             .with_mapped_port(https_port, HTTPS_PORT.tcp())
             .with_mapped_port(imap_port, IMAP_PORT.tcp())
@@ -70,7 +74,7 @@ impl Stalwart {
             .with_mapped_port(sieve_port, SIEVE_PORT.tcp())
             .with_startup_timeout(Duration::from_secs(180));
 
-        let container = request.start()?;
+        let container = request.pull_image()?.start()?;
 
         let me = Self {
             _container: container,
@@ -132,6 +136,27 @@ pub fn shared() -> &'static Stalwart {
     SHARED.get_or_init(|| Stalwart::start().expect("start shared stalwart container"))
 }
 
+fn sweep_abandoned_containers() {
+    let Ok(listed) = Command::new("docker")
+        .args(["ps", "-aq", "--filter", &format!("label={OWNER_LABEL}")])
+        .output()
+    else {
+        return;
+    };
+    let ids: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    eprintln!("removing {} abandoned test container(s)", ids.len());
+    let _ = Command::new("docker")
+        .args(["rm", "-f"])
+        .args(&ids)
+        .output();
+}
+
 fn pick_free_port() -> ContainerResult<u16> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     Ok(listener.local_addr()?.port())
@@ -158,8 +183,7 @@ fn basic(user: &str, password: &str) -> String {
     raw.push_str(user);
     raw.push(':');
     raw.push_str(password);
-    format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(raw.as_bytes())
-    )
+    let mut header = String::from("Basic ");
+    STANDARD.encode_append(raw, &mut header);
+    header
 }

@@ -115,6 +115,7 @@ pub fn reconcile_filenodes(
                     }
                 }
             }
+            Err(e) if e.aborts_run() => return Err(e),
             Err(e) => {
                 logger.warn(&format!("PROPFIND {url}: {e}"));
                 counts.failed += 1;
@@ -394,7 +395,7 @@ fn walk_one(
     let body = xml::propfind_webdav_listing();
     let ms = client
         .propfind_responses(url, 1, &body, url)
-        .map_err(Error::from)?;
+        .map_err(super::per_collection_failure)?;
     if ms.status >= 400 {
         return Err(Error::Partial(format!("http {}", ms.status)));
     }

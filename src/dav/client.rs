@@ -7,7 +7,7 @@
 use std::io::{BufReader, Read};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ureq::Agent;
 use ureq::Body;
@@ -20,7 +20,7 @@ use crate::dav::retry::{DavOutcome, classify};
 use crate::jmap::error::JmapError;
 use crate::jmap::http::{Auth, RetryPolicy, retry_after_header};
 use crate::jmap::retry::{self, RateLimitState};
-use crate::logging::{LEVEL_BODIES, LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
+use crate::logging::{HttpCall, LEVEL_BODIES, LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
 
 const MAX_BODY: u64 = 512 * 1024 * 1024;
 const LONG_RETRY_THRESHOLD: Duration = Duration::from_secs(10);
@@ -70,6 +70,9 @@ impl DavClient {
             .redirect_auth_headers(RedirectAuthHeaders::SameHost)
             .tls_config(
                 TlsConfig::builder()
+                    .unversioned_rustls_crypto_provider(std::sync::Arc::new(
+                        rustls::crypto::aws_lc_rs::default_provider(),
+                    ))
                     .root_certs(RootCerts::PlatformVerifier)
                     .disable_verification(allow_invalid_certs)
                     .build(),
@@ -419,6 +422,7 @@ impl DavClient {
         let mut include_auth = true;
         loop {
             self.inner.rate_limit.cooldown().wait();
+            let started = Instant::now();
             let send = self.build_and_send(WireRequest {
                 method,
                 url: &current_url,
@@ -470,6 +474,18 @@ impl DavClient {
                     }
                     if (200..300).contains(&status) {
                         self.inner.rate_limit.on_success();
+                        logger.trace_http(&HttpCall {
+                            proto: "DAV",
+                            method,
+                            url: &current_url,
+                            status,
+                            elapsed: started.elapsed(),
+                            note: Some("streamed multistatus"),
+                            request: body,
+                            request_type: Some("application/xml"),
+                            response: b"",
+                            response_type: None,
+                        });
                         let parse_base = if current_url == url {
                             base_url
                         } else {
@@ -495,6 +511,18 @@ impl DavClient {
                                 )));
                             }
                         };
+                    logger.trace_http(&HttpCall {
+                        proto: "DAV",
+                        method,
+                        url: &current_url,
+                        status,
+                        elapsed: started.elapsed(),
+                        note: None,
+                        request: body,
+                        request_type: Some("application/xml"),
+                        response: &body_bytes,
+                        response_type: None,
+                    });
                     let disposition = classify(status, &body_bytes);
                     match disposition {
                         DavOutcome::Vanished => {
@@ -629,6 +657,12 @@ impl DavClient {
     }
 
     fn one_attempt(&self, req: WireRequest<'_>) -> Attempt {
+        let logger = self.logger();
+        let method = req.method;
+        let url = req.url;
+        let request = req.body;
+        let request_type = req.content_type;
+        let started = Instant::now();
         match self.build_and_send(req) {
             Ok(mut resp) => {
                 let status = resp.status().as_u16();
@@ -642,6 +676,18 @@ impl DavClient {
                     .and_then(|v| v.to_str().ok())
                     .and_then(retry_after_header);
                 if is_redirect_status(status) && location.is_some() {
+                    logger.trace_http(&HttpCall {
+                        proto: "DAV",
+                        method,
+                        url,
+                        status,
+                        elapsed: started.elapsed(),
+                        note: location.as_deref(),
+                        request,
+                        request_type,
+                        response: b"",
+                        response_type: None,
+                    });
                     return Attempt::Ok {
                         status,
                         body: Vec::new(),
@@ -663,21 +709,39 @@ impl DavClient {
                     .limit(body_limit)
                     .read_to_vec()
                 {
-                    Ok(bytes) => Attempt::Ok {
-                        status,
-                        body: bytes,
-                        retry_after,
-                        etag,
-                        content_type: content_type_header,
-                        last_modified,
-                        location,
-                    },
+                    Ok(bytes) => {
+                        logger.trace_http(&HttpCall {
+                            proto: "DAV",
+                            method,
+                            url,
+                            status,
+                            elapsed: started.elapsed(),
+                            note: None,
+                            request,
+                            request_type,
+                            response: &bytes,
+                            response_type: content_type_header.as_deref(),
+                        });
+                        Attempt::Ok {
+                            status,
+                            body: bytes,
+                            retry_after,
+                            etag,
+                            content_type: content_type_header,
+                            last_modified,
+                            location,
+                        }
+                    }
                     Err(e) => Attempt::Transport(JmapError::Transport(format!(
                         "reading response body: {e}"
                     ))),
                 }
             }
-            Err(e) => Attempt::Transport(map_ureq_error(e)),
+            Err(e) => {
+                let err = map_ureq_error(e);
+                logger.trace_http_error("DAV", method, url, &err.to_string(), started.elapsed());
+                Attempt::Transport(err)
+            }
         }
     }
 
@@ -691,6 +755,8 @@ impl DavClient {
             accept: ACCEPT_BINARY,
             include_auth,
         };
+        let logger = self.logger();
+        let started = Instant::now();
         match self.build_and_send(req) {
             Ok(resp) => {
                 let status = resp.status().as_u16();
@@ -703,6 +769,18 @@ impl DavClient {
                     .get("retry-after")
                     .and_then(|v| v.to_str().ok())
                     .and_then(retry_after_header);
+                logger.trace_http(&HttpCall {
+                    proto: "DAV",
+                    method: "GET",
+                    url,
+                    status,
+                    elapsed: started.elapsed(),
+                    note: Some("streamed download"),
+                    request: None,
+                    request_type: None,
+                    response: b"",
+                    response_type: None,
+                });
                 let body_reader = resp.into_body().into_reader();
                 AttemptStream::Ok {
                     status,
@@ -714,7 +792,11 @@ impl DavClient {
                     retry_after,
                 }
             }
-            Err(e) => AttemptStream::Transport(map_ureq_error(e)),
+            Err(e) => {
+                let err = map_ureq_error(e);
+                logger.trace_http_error("DAV", "GET", url, &err.to_string(), started.elapsed());
+                AttemptStream::Transport(err)
+            }
         }
     }
 

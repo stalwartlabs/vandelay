@@ -4,12 +4,13 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use serde_json::{Value, json};
-
 use crate::error::Error;
+use crate::jmap::error::JmapError;
 use crate::jmap::http::HttpClient;
 use crate::jmap::request::{Request, check_method_error};
 use crate::jmap::session::Session;
+use serde_json::{Value, json};
+use std::fmt::Write;
 
 #[derive(Debug, Clone)]
 pub enum AccountSelector {
@@ -17,7 +18,7 @@ pub enum AccountSelector {
     Name(String),
 }
 
-const OWNER_URN: &str = "urn:ietf:params:jmap:principals:owner";
+const PRINCIPALS_URN: &str = "urn:ietf:params:jmap:principals";
 
 pub fn resolve(
     selector: &AccountSelector,
@@ -42,6 +43,10 @@ fn resolve_via_principal(
     session: &Session,
     client: &HttpClient,
 ) -> Result<String, Error> {
+    if !session.capabilities.contains_key(PRINCIPALS_URN) {
+        return Err(unsupported_principals(name, session));
+    }
+
     let mut req = Request::new();
     req.call(
         "Principal/query",
@@ -56,9 +61,17 @@ fn resolve_via_principal(
         }),
         "g",
     );
-    let resp = req
-        .send(client, &session.api_url)
-        .map_err(|e| Error::Account(format!("principal resolution request failed: {e}")))?;
+    let resp = match req.send(client, &session.api_url) {
+        Ok(resp) => resp,
+        Err(JmapError::HttpStatus { status: 400, body }) if body.contains("unknownCapability") => {
+            return Err(unsupported_principals(name, session));
+        }
+        Err(e) => {
+            return Err(Error::Account(format!(
+                "principal resolution request failed: {e}"
+            )));
+        }
+    };
 
     let query = resp
         .by_call_id("q")
@@ -103,23 +116,37 @@ fn resolve_via_principal(
     }
 }
 
+fn unsupported_principals(name: &str, session: &Session) -> Error {
+    let mut available = String::new();
+    for (id, account) in &session.accounts {
+        if !available.is_empty() {
+            available.push_str(", ");
+        }
+        let _ = write!(available, "{} ({id})", account.name);
+    }
+    if available.is_empty() {
+        available.push_str("(none)");
+    }
+    Error::Account(format!(
+        "account name '{name}' is not enumerated in this session and the source server does not \
+         support '{PRINCIPALS_URN}', which is required to resolve an account by name from an \
+         administrator session. Accounts visible to these credentials: {available}. Pass \
+         --account-id <id> to use an account id verbatim (no principals lookup is performed), \
+         authenticate directly as the target user, or import over IMAP instead."
+    ))
+}
+
 fn extract_account_id(principal: &Value, name: &str) -> Result<String, Error> {
     if let Some(accounts) = principal.get("accounts").and_then(Value::as_object) {
-        for data in accounts.values() {
-            if let Some(owner) = data.get(OWNER_URN)
-                && let Some(id) = owner.get("accountIdForPrincipal").and_then(Value::as_str)
-            {
-                return Ok(id.to_owned());
-            }
+        let mut keys = accounts.keys();
+        if let (Some(only), None) = (keys.next(), keys.next()) {
+            return Ok(only.clone());
         }
-        for data in accounts.values() {
-            if let Some(cap) = data.as_object() {
-                for v in cap.values() {
-                    if let Some(id) = v.get("accountId").and_then(Value::as_str) {
-                        return Ok(id.to_owned());
-                    }
-                }
-            }
+        let named = accounts
+            .iter()
+            .find(|(_, account)| account.get("name").and_then(Value::as_str) == Some(name));
+        if let Some((id, _)) = named {
+            return Ok(id.clone());
         }
     }
     principal
@@ -198,17 +225,55 @@ mod tests {
     }
 
     #[test]
+    fn missing_principals_capability_is_actionable_without_a_request() {
+        let s = session_with("alice@example.org", "w");
+        let err = resolve(
+            &AccountSelector::Name("bob@example.org".into()),
+            &s,
+            &client(),
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 3);
+        let msg = err.to_string();
+        assert!(msg.contains(PRINCIPALS_URN));
+        assert!(msg.contains("--account-id"));
+        assert!(msg.contains("alice@example.org (w)"));
+        assert!(msg.contains("bob@example.org"));
+    }
+
+    #[test]
     fn extract_falls_back_to_principal_id() {
         let p = json!({ "id": "acc-7", "name": "bob", "accounts": {} });
         assert_eq!(extract_account_id(&p, "bob").unwrap(), "acc-7");
     }
 
+    // RFC 9670: the data account is the key of "accounts", not accountIdForPrincipal.
     #[test]
-    fn extract_uses_per_capability_account_id() {
+    fn extract_uses_accounts_key_not_account_id_for_principal() {
+        let p = json!({
+            "id": "px",
+            "name": "bob@example.org",
+            "accounts": { "data-9": {
+                "name": "bob@example.org",
+                "isPersonal": false,
+                "accountCapabilities": {
+                    "urn:ietf:params:jmap:principals:owner":
+                        { "accountIdForPrincipal": "admin-1", "principalId": "px" }
+                }
+            } }
+        });
+        assert_eq!(extract_account_id(&p, "bob@example.org").unwrap(), "data-9");
+    }
+
+    #[test]
+    fn extract_picks_the_named_account_among_several() {
         let p = json!({
             "id": "px",
             "name": "bob",
-            "accounts": { "z": { "urn:ietf:params:jmap:mail": { "accountId": "data-9" } } }
+            "accounts": {
+                "shared-1": { "name": "team" },
+                "data-9": { "name": "bob" }
+            }
         });
         assert_eq!(extract_account_id(&p, "bob").unwrap(), "data-9");
     }

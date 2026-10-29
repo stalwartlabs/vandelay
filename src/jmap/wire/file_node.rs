@@ -4,10 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use serde::{Deserialize, Serialize};
-
 use super::common::bool_or_true;
 use super::{JmapId, UtcDate};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -18,18 +17,7 @@ pub struct FileNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<JmapId>,
 
-    pub node_type: NodeType,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blob_id: Option<JmapId>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<Vec<String>>,
-
     pub name: String,
-
-    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
-    pub media_type: Option<String>,
 
     #[serde(with = "time::serde::rfc3339")]
     pub created: UtcDate,
@@ -41,19 +29,61 @@ pub struct FileNode {
     )]
     pub modified: Option<UtcDate>,
 
-    #[serde(default = "default_true", deserialize_with = "bool_or_true")]
-    pub is_subscribed: bool,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
+    #[serde(flatten)]
+    pub kind: NodeKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum NodeType {
-    File,
-    Directory,
-    Symlink,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "@type")]
+pub enum NodeKind {
+    File(FileProps),
+    Directory(DirectoryProps),
+    SymLink(SymLinkProps),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileProps {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_id: Option<JmapId>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+
+    #[serde(default, deserialize_with = "bool_or_false")]
+    pub executable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryProps {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+
+    #[serde(default = "default_true", deserialize_with = "bool_or_true")]
+    pub is_subscribed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymLinkProps {
+    pub target: Vec<String>,
+}
+
+impl NodeKind {
+    pub fn db_name(&self) -> &'static str {
+        match self {
+            NodeKind::File(_) => "file",
+            NodeKind::Directory(_) => "directory",
+            NodeKind::SymLink(_) => "symlink",
+        }
+    }
+}
+
+fn bool_or_false<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<bool>::deserialize(d)?.unwrap_or_default())
 }
 
 fn default_true() -> bool {

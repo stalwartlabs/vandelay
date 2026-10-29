@@ -16,6 +16,7 @@ use crate::exchange_graph::calendar_map::{graph_calendar_color_to_hex, windows_o
 use crate::exchange_graph::types::MailboxKind;
 use crate::logging::LEVEL_PROGRESS;
 use crate::sync::TypeCounts;
+use crate::types::ObjectType;
 
 use super::coordinator::{CHUNK_SIZE, GraphCoordinator, enumerate_mail_folders};
 
@@ -242,18 +243,28 @@ pub fn reconcile_address_books(
         .filter_map(|f| f.get("id").and_then(Value::as_str))
         .map(str::to_owned)
         .collect();
+    let mut default_id: Option<String> = None;
+    if let Some(default) = default_contact_folder(ctx)
+        && let Some(id) = default.get("id").and_then(Value::as_str)
+    {
+        default_id = Some(id.to_owned());
+        if seen.insert(id.to_owned()) {
+            server.insert(0, default);
+        }
+    }
     let mut frontier: Vec<String> = seen.iter().cloned().collect();
     while let Some(parent) = frontier.pop() {
         let url = ctx.endpoints.contact_folder_children(&parent, ctx.top);
         let children = api::collect_all_values(ctx.client, &url, &[]).map_err(Error::from)?;
-        for c in &children {
-            if let Some(id) = c.get("id").and_then(Value::as_str)
-                && seen.insert(id.to_owned())
-            {
+        for child in children {
+            let Some(id) = child.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if seen.insert(id.to_owned()) {
                 frontier.push(id.to_owned());
+                server.push(child);
             }
         }
-        server.extend(children);
     }
 
     let local: HashMap<String, i64> =
@@ -272,19 +283,32 @@ pub fn reconcile_address_books(
                 .and_then(Value::as_str)
                 .unwrap_or("Contacts")
                 .to_owned();
+            let is_default = default_id.as_deref() == Some(graph_id);
             let existing = local.get(graph_id).copied();
             let local_id = if let Some(id) = existing {
+                let is_default = crate::db::defaults::unique_default(
+                    &tx,
+                    ObjectType::AddressBook,
+                    is_default,
+                    Some(id),
+                )?;
                 tx.execute(
-                    "UPDATE address_books SET name = ?1 WHERE id = ?2",
-                    params![name, id],
+                    "UPDATE address_books SET name = ?1, is_default = ?2 WHERE id = ?3",
+                    params![name, is_default as i64, id],
                 )?;
                 counts.fetched += 1;
                 id
             } else {
+                let is_default = crate::db::defaults::unique_default(
+                    &tx,
+                    ObjectType::AddressBook,
+                    is_default,
+                    None,
+                )?;
                 tx.execute(
-                    "INSERT INTO address_books (name, sort_order, is_subscribed)
-                     VALUES (?1, 0, 1)",
-                    params![name],
+                    "INSERT INTO address_books (name, sort_order, is_default, is_subscribed)
+                     VALUES (?1, 0, ?2, 1)",
+                    params![name, is_default as i64],
                 )?;
                 let new_id = tx.last_insert_rowid();
                 exchange_graph_ids::insert(
@@ -315,6 +339,30 @@ pub fn reconcile_address_books(
         counts,
     )?;
     Ok(out)
+}
+
+fn default_contact_folder(ctx: &GraphCoordinator<'_>) -> Option<Value> {
+    match ctx.client.get_json(&ctx.endpoints.default_contact_folder()) {
+        Ok(value) if value.get("id").and_then(Value::as_str).is_some() => return Some(value),
+        Ok(_) => {}
+        Err(e) => ctx.logger.warn(&format!(
+            "graph default contact folder lookup failed ({e}); \
+             falling back to deriving it from an existing contact"
+        )),
+    }
+    let probe = ctx
+        .client
+        .get_json(&ctx.endpoints.any_contact_parent())
+        .ok()?;
+    let parent = probe
+        .get("value")
+        .and_then(Value::as_array)?
+        .first()?
+        .get("parentFolderId")
+        .and_then(Value::as_str)?;
+    ctx.client
+        .get_json(&ctx.endpoints.contact_folder(parent))
+        .ok()
 }
 
 fn mailbox_timezone(ctx: &GraphCoordinator<'_>) -> Option<String> {

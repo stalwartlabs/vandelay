@@ -8,8 +8,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as B64;
+use encodify::base64::STANDARD as B64;
 
 use super::error::{ContainerError, ContainerResult};
 

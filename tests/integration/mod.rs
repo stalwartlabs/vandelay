@@ -22,6 +22,18 @@ pub mod webdav;
 
 pub use error::{ContainerError, ContainerResult};
 
+pub const OWNER_LABEL: &str = "art.stalw.vandelay.itest";
+
+use std::sync::Once;
+
+static CRYPTO_INIT: Once = Once::new();
+
+pub fn install_crypto_provider() {
+    CRYPTO_INIT.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub host: String,

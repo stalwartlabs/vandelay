@@ -9,6 +9,7 @@ mod seeder;
 
 use std::path::{Path, PathBuf};
 
+use encodify::base64::STANDARD;
 use integration::stalwart::shared as shared_stalwart;
 use rusqlite::Connection;
 use serde_json::{Map, Value, json};
@@ -294,8 +295,8 @@ fn seed_deep_filenode_chain(jmap: &seeder::jmap::Jmap, account_id: &str, depth: 
             serde_json::Value::String(format!("dir-{i}")),
         );
         obj.insert(
-            "nodeType".to_owned(),
-            serde_json::Value::String("directory".to_owned()),
+            "@type".to_owned(),
+            serde_json::Value::String("Directory".to_owned()),
         );
         if i > 0 {
             obj.insert(
@@ -689,6 +690,193 @@ fn prune_non_tree_type_contact_card() {
     seeder::teardown(base_url()).expect("teardown");
 }
 
+const ISSUE30_CARD_UID: &str = "vandelay-issue30-card";
+const ISSUE30_EVENT_UID: &str = "vandelay-issue30-event";
+
+struct Target<'a> {
+    client: &'a HttpClient,
+    session: &'a Session,
+    account: &'a str,
+}
+
+fn resource_bytes(
+    target: &Target<'_>,
+    resource: &Value,
+    uri_key: &str,
+    type_key: &str,
+    expect_media_type: &str,
+) -> Vec<u8> {
+    if let Some(uri) = resource.get(uri_key).and_then(Value::as_str) {
+        let prefix = format!("data:{expect_media_type};base64,");
+        let payload = uri
+            .strip_prefix(&prefix)
+            .unwrap_or_else(|| panic!("{uri_key} is not a {prefix}... data URI: {resource}"));
+        return STANDARD.decode(payload).expect("base64 payload");
+    }
+    let blob_id = resource
+        .get("blobId")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("neither {uri_key} nor blobId on {resource}"));
+    assert_eq!(
+        resource.get(type_key).and_then(Value::as_str),
+        Some(expect_media_type),
+        "embedded blob keeps its media type: {resource}"
+    );
+    vandelay::jmap::blobxfer::download_bytes(
+        target.client,
+        target.session,
+        target.account,
+        blob_id,
+        expect_media_type,
+        "blob",
+    )
+    .unwrap_or_else(|e| panic!("target blobId {blob_id} does not download: {e}"))
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn export_inlines_contact_and_event_blobs_instead_of_blob_ids() {
+    let fx = seeder::provision(base_url()).expect("provision");
+    let tgt = fx.account("test6").expect("test6");
+    let archive = tmp_archive("issue30");
+
+    let photo: &[u8] = b"\x89PNG\r\n\x1a\nvandelay issue 30 contact photo bytes";
+    let agenda: &[u8] = b"vandelay issue 30 calendar enclosure bytes";
+    {
+        let conn = vandelay::db::init::open(&archive).expect("init archive");
+        conn.execute(
+            "INSERT INTO address_books (id,name,is_default) VALUES (1,'Issue30 Book',1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendars (id,name,is_default) VALUES (1,'Issue30 Calendar',1)",
+            [],
+        )
+        .unwrap();
+        let photo_blob = vandelay::db::blobs::intern_blob(&conn, photo).unwrap();
+        let agenda_blob = vandelay::db::blobs::intern_blob(&conn, agenda).unwrap();
+        let card = json!({
+            "@type": "Card",
+            "version": "1.0",
+            "name": { "full": "Issue Thirty" },
+            "media": { "photo": {
+                "@type": "Media", "kind": "photo",
+                "@blob": photo_blob, "mediaType": "image/png"
+            } }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO contact_cards (id,uid,address_book_ids,data) VALUES (1,?1,'[1]',?2)",
+            [ISSUE30_CARD_UID, card.as_str()],
+        )
+        .unwrap();
+        let event = json!({
+            "@type": "Event",
+            "uid": ISSUE30_EVENT_UID,
+            "title": "Issue 30 review",
+            "start": "2026-03-01T09:00:00",
+            "duration": "PT1H",
+            "timeZone": "Etc/UTC",
+            "links": { "1": {
+                "@type": "Link", "rel": "enclosure",
+                "@blob": agenda_blob, "contentType": "text/plain", "title": "agenda.txt"
+            } }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO calendar_events (id,calendar_ids,is_draft,use_default_alerts,data)
+             VALUES (1,'[1]',0,0,?1)",
+            [event.as_str()],
+        )
+        .unwrap();
+    }
+
+    let summary = sync::export::run(
+        common(&archive, false),
+        export_cfg("test6", &tgt.account_id, false),
+    )
+    .expect("export");
+    for name in ["ContactCard", "CalendarEvent"] {
+        let counts = summary
+            .per_type
+            .iter()
+            .find(|(t, _)| *t == name)
+            .map(|(_, c)| c.clone())
+            .unwrap_or_else(|| panic!("{name} counts missing: {summary:?}"));
+        assert_eq!(counts.created, 1, "{name} created exactly one: {counts:?}");
+        assert_eq!(counts.failed, 0, "{name} had no failures: {counts:?}");
+    }
+
+    let client = HttpClient::new(basic("test6"), RetryPolicy::new(5), true);
+    let session = Session::discover(&client, base_url()).expect("discover target session");
+    let api = session.api_url.clone();
+
+    let cards = client
+        .post_json(
+            &api,
+            &json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:contacts"],
+                "methodCalls": [["ContactCard/get",
+                    { "accountId": tgt.account_id, "ids": Value::Null }, "g"]]
+            }),
+        )
+        .expect("ContactCard/get");
+    let card = cards
+        .pointer("/methodResponses/0/1/list")
+        .and_then(Value::as_array)
+        .expect("ContactCard list")
+        .iter()
+        .find(|c| c.get("uid").and_then(Value::as_str) == Some(ISSUE30_CARD_UID))
+        .unwrap_or_else(|| panic!("exported card not found on the target: {cards}"))
+        .clone();
+    let photo_resource = card
+        .pointer("/media/photo")
+        .unwrap_or_else(|| panic!("card has no media.photo: {card}"));
+    let target = Target {
+        client: &client,
+        session: &session,
+        account: &tgt.account_id,
+    };
+    assert_eq!(
+        resource_bytes(&target, photo_resource, "uri", "mediaType", "image/png"),
+        photo,
+        "contact photo bytes survived the export: {card}"
+    );
+
+    let events = client
+        .post_json(
+            &api,
+            &json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"],
+                "methodCalls": [["CalendarEvent/get",
+                    { "accountId": tgt.account_id, "ids": Value::Null }, "g"]]
+            }),
+        )
+        .expect("CalendarEvent/get");
+    let event = events
+        .pointer("/methodResponses/0/1/list")
+        .and_then(Value::as_array)
+        .expect("CalendarEvent list")
+        .iter()
+        .find(|e| e.get("uid").and_then(Value::as_str) == Some(ISSUE30_EVENT_UID))
+        .unwrap_or_else(|| panic!("exported event not found on the target: {events}"))
+        .clone();
+    let link = event
+        .get("links")
+        .and_then(Value::as_object)
+        .and_then(|m| m.values().next())
+        .unwrap_or_else(|| panic!("event has no links: {event}"));
+    assert_eq!(
+        resource_bytes(&target, link, "href", "contentType", "text/plain"),
+        agenda,
+        "calendar enclosure bytes survived the export: {event}"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+    seeder::teardown(base_url()).expect("teardown");
+}
+
 #[test]
 #[ignore = "requires Docker"]
 fn export_round_trip_and_convergence() {
@@ -764,6 +952,80 @@ fn export_round_trip_and_convergence() {
     );
 
     drop(_quota_guard);
+    let _ = std::fs::remove_file(&archive);
+    seeder::teardown(base_url()).expect("teardown");
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn export_emails_in_multiple_import_batches() {
+    // With maxSetObjects lowered to 2 the email export spans several Email/import batches and still converges.
+    let fx = seeder::provision(base_url()).expect("provision");
+    let src = fx.account("test1").expect("test1");
+    let tgt = fx.account("test4").expect("test4");
+    let archive = tmp_archive("batches");
+
+    let imp = ImportConfig {
+        connect: ConnectConfig {
+            url: base_url().to_owned(),
+            auth: basic("test1"),
+            account: AccountSelector::Id(src.account_id.clone()),
+        },
+        objects: None,
+        allow_source_change: false,
+    };
+    let s = sync::import_jmap::run(common(&archive, false), imp).expect("import");
+    assert!(!s.any_failed());
+    let local_emails = {
+        let conn = Connection::open(&archive).unwrap();
+        count(&conn, "emails")
+    };
+    assert!(
+        local_emails > 2,
+        "need more than one batch of emails: {local_emails}"
+    );
+
+    let mut small = Map::new();
+    small.insert("maxSetObjects".to_owned(), json!(2));
+    let _guard = JmapSettingsGuard::override_settings(small);
+
+    let probe = HttpClient::new(basic("test4"), RetryPolicy::new(5), true);
+    let session = Session::discover(&probe, base_url()).expect("discover");
+    let limits = session.core_limits().expect("core limits");
+    assert_eq!(
+        limits.max_objects_in_set, 2,
+        "maxSetObjects override is advertised"
+    );
+
+    let e1 = sync::export::run(
+        common(&archive, false),
+        export_cfg("test4", &tgt.account_id, false),
+    )
+    .expect("export 1");
+    assert!(
+        !e1.per_type.iter().any(|(_, c)| c.failed > 0),
+        "export 1 had failures: {e1:?}"
+    );
+    let emails = e1
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.created)
+        .unwrap_or(0);
+    assert_eq!(
+        emails as i64, local_emails,
+        "every email created across batches"
+    );
+
+    let e2 = sync::export::run(
+        common(&archive, false),
+        export_cfg("test4", &tgt.account_id, false),
+    )
+    .expect("export 2");
+    let created_2: u64 = e2.per_type.iter().map(|(_, c)| c.created).sum();
+    assert_eq!(created_2, 0, "second export is convergent: {e2:?}");
+
+    drop(_guard);
     let _ = std::fs::remove_file(&archive);
     seeder::teardown(base_url()).expect("teardown");
 }
@@ -1084,6 +1346,10 @@ fn apply_jmap_settings(
             .is_some(),
         "x:Jmap/set not applied: {resp}"
     );
+    assert!(
+        resp.pointer("/methodResponses/1/1/created/r").is_some(),
+        "ReloadSettings failed, so the x:Jmap/set values are not in effect: {resp}"
+    );
 }
 
 #[test]
@@ -1096,8 +1362,13 @@ fn live_blob_quota_429_triggers_retry_after_then_succeeds() {
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test1").expect("test1");
 
+    let blob_size = 8 * 1024 * 1024;
     let mut updates = serde_json::Map::new();
     updates.insert("uploadTtl".to_owned(), serde_json::json!(5_000));
+    updates.insert(
+        "uploadQuota".to_owned(),
+        serde_json::json!(blob_size * 5 / 2),
+    );
     let _ttl_guard = JmapSettingsGuard::override_settings(updates);
 
     let client = HttpClient::new(basic("test1"), RetryPolicy::new(20), true);
@@ -1105,7 +1376,6 @@ fn live_blob_quota_429_triggers_retry_after_then_succeeds() {
     let limits = session.core_limits().expect("core limits");
     client.set_limits(&limits);
 
-    let blob_size = 8 * 1024 * 1024;
     let mut blob = vec![0u8; blob_size];
     let max_uploads = 8u32;
     let mut accepted = 0u32;

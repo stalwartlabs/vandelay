@@ -265,14 +265,9 @@ fn provision_seed_verify_and_teardown() {
     let owner = exact[0]
         .get("accounts")
         .and_then(Value::as_object)
-        .and_then(|m| {
-            m.iter().find_map(|(_, v)| {
-                v.get("urn:ietf:params:jmap:principals:owner")
-                    .and_then(|o| o.get("accountIdForPrincipal"))
-                    .and_then(Value::as_str)
-            })
-        })
-        .expect("accountIdForPrincipal");
+        .and_then(|m| m.keys().next())
+        .map(String::as_str)
+        .expect("principal accounts key");
     assert_eq!(owner, test1.account_id, "resolved account id matches test1");
 
     seeder::teardown(stalwart.base_url()).expect("teardown");

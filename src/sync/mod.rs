@@ -94,6 +94,34 @@ impl Summary {
     }
 }
 
+#[derive(Debug)]
+pub struct RunOutcome {
+    pub summary: Summary,
+    pub error: Option<Error>,
+}
+
+impl RunOutcome {
+    pub fn from_result(result: Result<Summary, Error>) -> RunOutcome {
+        match result {
+            Ok(summary) => RunOutcome {
+                summary,
+                error: None,
+            },
+            Err(error) => RunOutcome {
+                summary: Summary::default(),
+                error: Some(error),
+            },
+        }
+    }
+
+    pub fn into_result(self) -> Result<Summary, Error> {
+        match self.error {
+            Some(error) => Err(error),
+            None => Ok(self.summary),
+        }
+    }
+}
+
 pub struct Context {
     pub conn: Connection,
     pub client: HttpClient,
@@ -117,5 +145,30 @@ impl Context {
 
     pub fn dry_run(&self) -> bool {
         self.common.dry_run
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_aborted_run_keeps_its_error_and_its_partial_counts() {
+        let mut summary = Summary::default();
+        summary.per_type.push(("Mailbox", TypeCounts::default()));
+        let outcome = RunOutcome {
+            summary,
+            error: Some(Error::Connection("http status 404".to_owned())),
+        };
+        assert_eq!(outcome.summary.per_type.len(), 1);
+        let err = outcome.into_result().expect_err("aborted");
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn a_result_without_a_native_outcome_reports_nothing_on_abort() {
+        let outcome = RunOutcome::from_result(Err(Error::Partial("one object".to_owned())));
+        assert!(outcome.summary.per_type.is_empty());
+        assert!(outcome.error.is_some());
     }
 }

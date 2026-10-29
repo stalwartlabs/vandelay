@@ -13,10 +13,11 @@ use crate::db::sources::SourceKey;
 use crate::error::Error;
 use crate::jmap::http::{Auth, RetryPolicy};
 use crate::logging::{LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
-use crate::sync::{CommonConfig, Summary, TypeCounts};
+use crate::sync::{CommonConfig, RunOutcome, Summary, TypeCounts};
 
 use super::collections;
 use super::items;
+use super::replace::{self, Removed};
 use super::tree;
 
 #[derive(Debug, Clone, Copy)]
@@ -71,6 +72,13 @@ impl DavAuth {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceChange {
+    Reject,
+    Allow,
+    Replace,
+}
+
 #[derive(Debug)]
 pub struct DavImportConfig {
     pub kind: DavKindArg,
@@ -79,10 +87,24 @@ pub struct DavImportConfig {
     pub allow_cleartext: bool,
     pub dav_connections: usize,
     pub multiget_batch: usize,
-    pub allow_source_change: bool,
+    pub source_change: SourceChange,
 }
 
 pub fn run(common: CommonConfig, config: DavImportConfig) -> Result<Summary, Error> {
+    run_reporting(common, config).into_result()
+}
+
+pub fn run_reporting(common: CommonConfig, config: DavImportConfig) -> RunOutcome {
+    let mut summary = Summary::default();
+    let error = run_into(common, config, &mut summary).err();
+    RunOutcome { summary, error }
+}
+
+fn run_into(
+    common: CommonConfig,
+    config: DavImportConfig,
+    summary: &mut Summary,
+) -> Result<(), Error> {
     let logger = common.logger;
     enforce_tls_policy(&config.url, config.allow_cleartext)?;
 
@@ -112,6 +134,7 @@ pub fn run(common: CommonConfig, config: DavImportConfig) -> Result<Summary, Err
     };
 
     if !common.dry_run
+        && config.source_change == SourceChange::Reject
         && let Some((url, acc)) = db::sources::conflicting_source(
             &conn,
             config.kind.source_kind(),
@@ -119,11 +142,11 @@ pub fn run(common: CommonConfig, config: DavImportConfig) -> Result<Summary, Err
             &account_id,
         )
         .map_err(|e| Error::Partial(e.to_string()))?
-        && !config.allow_source_change
     {
         return Err(Error::SourceChange(format!(
             "archive already records {} source ({url}, account {acc}); \
-             pass --allow-source-change to import a different account",
+             pass --allow-source-change to import a different account, \
+             or --replace-source to drop the recorded one",
             config.kind.source_kind()
         )));
     }
@@ -138,27 +161,50 @@ pub fn run(common: CommonConfig, config: DavImportConfig) -> Result<Summary, Err
     }
 
     if common.dry_run {
-        let mut summary = run_dry_diff(&conn, &client, &discovery, &config, logger)?;
+        if config.source_change == SourceChange::Replace && logger.enabled(LEVEL_DEFAULT) {
+            for (_, url, acc) in
+                db::sources::other_sources(&conn, &key.kind, &session_url, &account_id)?
+            {
+                eprintln!(
+                    "dry-run: would remove {} source {url} (account {acc})",
+                    key.kind
+                );
+            }
+        }
+        let result = run_dry_diff(&conn, &client, &discovery, &config, logger, summary);
         summary.retries_observed = client.retries_observed();
         summary.retry_after_sleeps = client.retry_after_sleeps();
-        return Ok(summary);
+        return result;
     }
+
+    let removed = match config.source_change {
+        SourceChange::Replace => replace::remove_other_sources(&conn, &key, logger)?,
+        SourceChange::Reject | SourceChange::Allow => Removed::default(),
+    };
 
     let username = config.auth.username();
     let source_id = db::sources::upsert_source(&conn, &key, Some(&account_id), &username)
         .map_err(|e| Error::Partial(e.to_string()))?;
 
-    let summary = match config.kind {
+    let phase = match config.kind {
         DavKindArg::Caldav => {
-            run_caldav(&mut conn, &client, source_id, &discovery, &config, logger)?
+            run_caldav(&mut conn, &client, source_id, &discovery, &config, logger)
         }
         DavKindArg::Carddav => {
-            run_carddav(&mut conn, &client, source_id, &discovery, &config, logger)?
+            run_carddav(&mut conn, &client, source_id, &discovery, &config, logger)
         }
         DavKindArg::Webdav => {
-            run_webdav(&mut conn, &client, source_id, &discovery, &config, logger)?
+            run_webdav(&mut conn, &client, source_id, &discovery, &config, logger)
         }
     };
+
+    *summary = phase.summary;
+    removed.add_to(summary);
+    summary.retries_observed = client.retries_observed();
+    summary.retry_after_sleeps = client.retry_after_sleeps();
+    if let Some(e) = phase.error {
+        return Err(e);
+    }
 
     if !summary.any_failed()
         && let Err(e) = run_gc(&conn)
@@ -166,10 +212,7 @@ pub fn run(common: CommonConfig, config: DavImportConfig) -> Result<Summary, Err
         logger.warn(&format!("blob GC skipped: {e}"));
     }
 
-    let mut summary = summary;
-    summary.retries_observed = client.retries_observed();
-    summary.retry_after_sleeps = client.retry_after_sleeps();
-    Ok(summary)
+    Ok(())
 }
 
 type ReconcileCollections = fn(
@@ -198,25 +241,71 @@ fn run_collection_phase(
     config: &DavImportConfig,
     logger: Logger,
     phase: ItemPhase,
-) -> Result<Summary, Error> {
+) -> RunOutcome {
     let mut summary = Summary::default();
-    let mut container_counts = TypeCounts::default();
-    let mut item_counts = TypeCounts::default();
+    let mut counts = PhaseCounts::default();
+    let error = collection_phase_into(
+        conn,
+        client,
+        source_id,
+        PhaseInput {
+            discovery,
+            config,
+            logger,
+            phase: &phase,
+        },
+        &mut counts,
+    )
+    .err();
+
+    summary
+        .per_type
+        .push((phase.container_label, counts.container));
+    summary.per_type.push((phase.item_label, counts.items));
+    RunOutcome { summary, error }
+}
+
+#[derive(Default)]
+struct PhaseCounts {
+    container: TypeCounts,
+    items: TypeCounts,
+}
+
+struct PhaseInput<'a> {
+    discovery: &'a Discovery,
+    config: &'a DavImportConfig,
+    logger: Logger,
+    phase: &'a ItemPhase,
+}
+
+fn collection_phase_into(
+    conn: &mut Connection,
+    client: &DavClient,
+    source_id: i64,
+    input: PhaseInput<'_>,
+    counts: &mut PhaseCounts,
+) -> Result<(), Error> {
+    let PhaseInput {
+        discovery,
+        config,
+        logger,
+        phase,
+    } = input;
 
     let upserted = (phase.reconcile_collections)(
         conn,
         source_id,
         &discovery.collections,
-        &mut container_counts,
+        &mut counts.container,
         logger,
     )?;
     if logger.enabled(LEVEL_DEFAULT) {
         eprintln!(
             "import: {} done (upserted={} deleted={} failed={})",
             phase.container_label,
-            container_counts.created + container_counts.fetched,
-            container_counts.deleted,
-            container_counts.failed
+            counts.container.created + counts.container.fetched,
+            counts.container.deleted,
+            counts.container.failed
         );
     }
 
@@ -229,23 +318,19 @@ fn run_collection_phase(
         logger,
     };
     for (collection_href, local_id) in &upserted {
-        match (phase.reconcile_items)(conn, &ctx, collection_href, *local_id, &mut item_counts) {
+        match (phase.reconcile_items)(conn, &ctx, collection_href, *local_id, &mut counts.items) {
             Ok(()) => {}
+            Err(e) if e.aborts_run() => return Err(e),
             Err(e) => {
                 logger.warn(&format!(
                     "{} {collection_href:?}: items failed: {e}",
                     phase.container_label
                 ));
-                item_counts.failed += 1;
+                counts.items.failed += 1;
             }
         }
     }
-
-    summary
-        .per_type
-        .push((phase.container_label, container_counts));
-    summary.per_type.push((phase.item_label, item_counts));
-    Ok(summary)
+    Ok(())
 }
 
 fn run_dry_diff(
@@ -254,11 +339,11 @@ fn run_dry_diff(
     discovery: &Discovery,
     config: &DavImportConfig,
     logger: Logger,
-) -> Result<Summary, Error> {
+    summary: &mut Summary,
+) -> Result<(), Error> {
     use crate::dav::href::join_absolute;
     use crate::dav::xml;
     use crate::db::dav_ids;
-    let mut summary = Summary::default();
     let (container_label, item_label, container_type, item_type) = match config.kind {
         DavKindArg::Caldav => (
             "calendar",
@@ -295,33 +380,57 @@ fn run_dry_diff(
         for coll in &discovery.collections {
             let url = join_absolute(&discovery.home_set_url, coll.href.as_str())
                 .map_err(|e| Error::Partial(e.to_string()))?;
-            let ms = client
+            match client
                 .propfind_responses(&url, 1, &xml::propfind_dav_items(), &url)
-                .map_err(Error::from)?;
-            let new_count = ms
-                .responses
-                .iter()
-                .filter(|r| !r.props.is_collection)
-                .count();
-            item_counts.created += new_count as u64;
-            if logger.enabled(LEVEL_DEFAULT) {
-                eprintln!("  {} items: {new_count}", coll.href.as_str());
+                .map_err(super::per_collection_failure)
+            {
+                Ok(ms) => {
+                    let new_count = ms
+                        .responses
+                        .iter()
+                        .filter(|r| !r.props.is_collection)
+                        .count();
+                    item_counts.created += new_count as u64;
+                    if logger.enabled(LEVEL_DEFAULT) {
+                        eprintln!("  {} items: {new_count}", coll.href.as_str());
+                    }
+                }
+                Err(e) if e.aborts_run() => return Err(e),
+                Err(e) => {
+                    logger.warn(&format!(
+                        "{container_label} {:?}: enumeration failed: {e}",
+                        coll.href.as_str()
+                    ));
+                    item_counts.failed += 1;
+                }
             }
         }
     } else if let Some(root) = discovery.collections.first() {
         let url = join_absolute(&discovery.home_set_url, root.href.as_str())
             .map_err(|e| Error::Partial(e.to_string()))?;
-        let ms = client
+        match client
             .propfind_responses(&url, 1, &xml::propfind_webdav_listing(), &url)
-            .map_err(Error::from)?;
-        let new_count = ms
-            .responses
-            .iter()
-            .filter(|r| !r.props.is_collection)
-            .count();
-        item_counts.created += new_count as u64;
-        if logger.enabled(LEVEL_DEFAULT) {
-            eprintln!("  root {} files: {new_count}", root.href.as_str());
+            .map_err(super::per_collection_failure)
+        {
+            Ok(ms) => {
+                let new_count = ms
+                    .responses
+                    .iter()
+                    .filter(|r| !r.props.is_collection)
+                    .count();
+                item_counts.created += new_count as u64;
+                if logger.enabled(LEVEL_DEFAULT) {
+                    eprintln!("  root {} files: {new_count}", root.href.as_str());
+                }
+            }
+            Err(e) if e.aborts_run() => return Err(e),
+            Err(e) => {
+                logger.warn(&format!(
+                    "{container_label} {:?}: enumeration failed: {e}",
+                    root.href.as_str()
+                ));
+                container_counts.failed += 1;
+            }
         }
     }
 
@@ -332,7 +441,7 @@ fn run_dry_diff(
     if !matches!(config.kind, DavKindArg::Webdav) {
         summary.per_type.push((item_label, item_counts));
     }
-    Ok(summary)
+    Ok(())
 }
 
 fn run_caldav(
@@ -342,7 +451,7 @@ fn run_caldav(
     discovery: &Discovery,
     config: &DavImportConfig,
     logger: Logger,
-) -> Result<Summary, Error> {
+) -> RunOutcome {
     run_collection_phase(
         conn,
         client,
@@ -366,7 +475,7 @@ fn run_carddav(
     discovery: &Discovery,
     config: &DavImportConfig,
     logger: Logger,
-) -> Result<Summary, Error> {
+) -> RunOutcome {
     run_collection_phase(
         conn,
         client,
@@ -390,13 +499,16 @@ fn run_webdav(
     discovery: &Discovery,
     config: &DavImportConfig,
     logger: Logger,
-) -> Result<Summary, Error> {
+) -> RunOutcome {
     let mut summary = Summary::default();
     let mut file_counts = TypeCounts::default();
 
     if discovery.collections.is_empty() {
         summary.per_type.push(("filenode", file_counts));
-        return Ok(summary);
+        return RunOutcome {
+            summary,
+            error: None,
+        };
     }
     let root = &discovery.collections[0];
     let ctx = tree::WebDavCtx {
@@ -406,10 +518,10 @@ fn run_webdav(
         dav_connections: config.dav_connections,
         logger,
     };
-    tree::reconcile_filenodes(conn, &ctx, root, &mut file_counts)?;
+    let error = tree::reconcile_filenodes(conn, &ctx, root, &mut file_counts).err();
 
     summary.per_type.push(("filenode", file_counts));
-    Ok(summary)
+    RunOutcome { summary, error }
 }
 
 fn map_discovery_error(err: DiscoveryError) -> Error {

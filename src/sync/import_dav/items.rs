@@ -113,7 +113,7 @@ fn enumerate_items(client: &DavClient, url: &str) -> Result<Vec<ServerItem>, Err
     let body = xml::propfind_dav_items();
     let ms = client
         .propfind_responses(url, 1, &body, url)
-        .map_err(Error::from)?;
+        .map_err(super::per_collection_failure)?;
     if ms.status >= 400 {
         return Err(Error::Partial(format!(
             "enumerate {url}: http {}",

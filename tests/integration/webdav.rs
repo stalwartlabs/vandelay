@@ -6,8 +6,7 @@
 
 use std::time::Duration;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as B64;
+use encodify::base64::STANDARD as B64;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::{SyncBuilder, SyncRunner};
 use testcontainers::{Container, GenericBuildableImage, GenericImage, ImageExt};
@@ -148,7 +147,8 @@ impl WebDav {
         let request = image
             .with_exposed_port(HTTP_PORT.tcp())
             .with_wait_for(WaitFor::message_on_stderr("AH00558"))
-            .with_startup_timeout(Duration::from_secs(120));
+            .with_startup_timeout(Duration::from_secs(120))
+            .with_labels([(super::OWNER_LABEL, "1")]);
 
         let container = request.start()?;
         let host = container.get_host()?.to_string();

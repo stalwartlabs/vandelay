@@ -24,14 +24,22 @@
 
 <br>
 
-<img align="right" src="assets/importer-exporter.jpg" alt="He's an importer-exporter." hspace="20" vspace="6">
+<table>
+<tr>
+<td>
 
-- Jerry: Well, what does *he* do?
+- Jerry: Well, what does **he** do?
 - George: He's an importer.
 - Jerry: Just imports, no exports?
-- George: He's an importer/exporter, okay?
+- George: He's an **importer/exporter**, okay?
 
-<br clear="all">
+</td>
+<td>
+<img src="assets/importer-exporter.jpg" alt="He's an importer-exporter.">
+</td>
+</tr>
+</table>
+
 &nbsp;
 
 ## About
@@ -51,8 +59,8 @@ Because the archive is a self-contained SQLite file that fully describes one acc
     - ManageSieve
     - Maildir++
     - Google Takeout
-    - Microsoft Exchange via EWS (*experimental*)
-    - Microsoft Exchange Online via Graph (*experimental*)
+    - Microsoft Exchange Server (on-premises) via EWS
+    - Microsoft Exchange Online via Graph
 - **One target protocol:** JMAP, with type-by-type stateless re-matching on every run.
 - **Convergent:** Re-running an interrupted import or export picks up where it left off without bookkeeping flags.
 - **Multi-threaded, no async runtime:** Blocking HTTP with per-server concurrency caps respected automatically.
@@ -246,7 +254,9 @@ vandelay import exchange-ews \
   <ARCHIVE>
 ```
 
-Imports a mailbox via EWS, against either on-prem Exchange Server or Exchange Online. Autodiscover is used when `--url` is omitted (a `--mailbox` SMTP address is then required). Supports Basic, pre-acquired bearer, interactive device-code OAuth, and app-only client-credentials OAuth.
+Imports a mailbox via EWS from an on-premises Exchange Server. Autodiscover is used when `--url` is omitted (a `--mailbox` SMTP address is then required). Supports Basic, pre-acquired bearer, interactive device-code OAuth, and app-only client-credentials OAuth.
+
+For Exchange Online, use `exchange-graph` instead. Microsoft is retiring EWS in Exchange Online: from 1 October 2026 it is blocked unless a tenant administrator sets `EwsEnabled` to `True` and adds the client id to `EwsAllowedAppIDs`, and on 1 April 2027 it is switched off for every tenant. On-premises Exchange Server is not affected.
 
 #### Microsoft Exchange (Graph)
 
@@ -261,7 +271,7 @@ vandelay import exchange-graph \
   <ARCHIVE>
 ```
 
-Imports a mailbox from Exchange Online via Microsoft Graph. Without `--access-token`, the interactive device-code flow is used. `public-folders` is rejected here (use `exchange-ews` instead).
+Imports a mailbox from Exchange Online via Microsoft Graph. Without `--access-token`, the interactive device-code flow is used. `public-folders` is rejected here: Graph does not expose public folders, so they can only be imported with `exchange-ews`, which for Exchange Online is subject to the retirement described above.
 
 ### Export
 
