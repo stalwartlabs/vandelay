@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.14] - Unreleased
+
+### Added
+- A `Dockerfile` that builds a static image running as `nobody`, with the archive directory mounted at `/data` (#20)
+
+### Changed
+
+### Fixed
+
 ## [1.0.13] - 2026-10-25
 
 ### Added
