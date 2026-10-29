@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file. This projec
 ### Added
 
 ### Changed
+- README: the export section explains how an administrator exports into another user's account with `--account-name` (#34)
 
 ### Fixed
 - JMAP, CalDAV, CardDAV, WebDAV, MS Exchange: HTTP requests had no timeout, so a connection that died mid-request hung the run forever; connecting, and each read or write, now times out after 5 minutes and the request goes through the normal retry path (fixes #53)
