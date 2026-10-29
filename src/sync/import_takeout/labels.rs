@@ -69,6 +69,50 @@ fn decode_encoded_words(value: &str) -> Cow<'_, str> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SystemLabel {
+    Starred,
+    Important,
+    Opened,
+    Unread,
+    Category,
+    Mailbox(&'static str),
+}
+
+impl SystemLabel {
+    fn parse(token: &str) -> Option<SystemLabel> {
+        hashify::map!(
+            token.as_bytes(),
+            SystemLabel,
+            "Starred" => SystemLabel::Starred,
+            "Important" => SystemLabel::Important,
+            "Opened" => SystemLabel::Opened,
+            "Unread" => SystemLabel::Unread,
+            "Archived" => SystemLabel::Mailbox("Archive"),
+            "Category Personal" => SystemLabel::Category,
+            "Category Promotions" => SystemLabel::Category,
+            "Category Social" => SystemLabel::Category,
+            "Category Updates" => SystemLabel::Category,
+            "Category Forums" => SystemLabel::Category,
+            "Com estrela" => SystemLabel::Starred,
+            "Importante" => SystemLabel::Important,
+            "Aberto" => SystemLabel::Opened,
+            "Não lidas" => SystemLabel::Unread,
+            "Caixa de entrada" => SystemLabel::Mailbox("Inbox"),
+            "Enviado" => SystemLabel::Mailbox("Sent"),
+            "Rascunhos" => SystemLabel::Mailbox("Drafts"),
+            "Lixeira" => SystemLabel::Mailbox("Trash"),
+            "Arquivada" => SystemLabel::Mailbox("Archive"),
+            "Categoria: pessoal" => SystemLabel::Category,
+            "Categoria: promoções" => SystemLabel::Category,
+            "Categoria: social" => SystemLabel::Category,
+            "Categoria: atualizações" => SystemLabel::Category,
+            "Categoria: fóruns" => SystemLabel::Category,
+        )
+        .copied()
+    }
+}
+
 pub fn classify(tokens: &[String]) -> LabelClassification {
     let mut mailboxes: Vec<String> = Vec::new();
     let mut keywords: BTreeSet<String> = BTreeSet::new();
@@ -76,30 +120,34 @@ pub fn classify(tokens: &[String]) -> LabelClassification {
     let mut had_unread = false;
 
     for tok in tokens {
-        if is_category_token(tok) {
-            continue;
-        }
-        match tok.as_str() {
-            "Starred" => {
+        let mailbox = match SystemLabel::parse(tok) {
+            Some(SystemLabel::Category) => continue,
+            Some(SystemLabel::Starred) => {
                 keywords.insert("$flagged".to_owned());
+                continue;
             }
-            "Important" => {
+            Some(SystemLabel::Important) => {
                 keywords.insert("$important".to_owned());
+                continue;
             }
-            "Opened" => {
+            Some(SystemLabel::Opened) => {
                 had_opened = true;
-                keywords.insert("$seen".to_owned());
+                continue;
             }
-            "Unread" => {
+            Some(SystemLabel::Unread) => {
                 had_unread = true;
+                continue;
             }
-            other => {
-                let canonical = canonical_label(other);
-                if !mailboxes.iter().any(|m| m == &canonical) {
-                    mailboxes.push(canonical);
-                }
-            }
+            Some(SystemLabel::Mailbox(name)) => name,
+            None => tok.as_str(),
+        };
+        if !mailboxes.iter().any(|m| m == mailbox) {
+            mailboxes.push(mailbox.to_owned());
         }
+    }
+
+    if had_opened || (!had_unread && !tokens.is_empty()) {
+        keywords.insert("$seen".to_owned());
     }
 
     let opened_won_over_unread = had_opened && had_unread;
@@ -142,24 +190,6 @@ pub fn assignments_for(
             role: role_for_mailbox(p, opts),
         })
         .collect()
-}
-
-fn is_category_token(t: &str) -> bool {
-    matches!(
-        t,
-        "Category Personal"
-            | "Category Promotions"
-            | "Category Social"
-            | "Category Updates"
-            | "Category Forums"
-    )
-}
-
-fn canonical_label(raw: &str) -> String {
-    match raw {
-        "Archived" => "Archive".to_owned(),
-        other => other.to_owned(),
-    }
 }
 
 #[cfg(test)]
@@ -242,6 +272,57 @@ mod tests {
     #[test]
     fn unread_alone_means_no_seen() {
         let c = classify_str("Inbox,Unread");
+        assert!(!c.keywords.contains("$seen"));
+        assert!(c.had_unread_signal);
+    }
+
+    #[test]
+    fn neither_opened_nor_unread_means_seen() {
+        let c = classify_str("Inbox,Important");
+        assert!(c.keywords.contains("$seen"));
+        let c = classify_str("Sent");
+        assert!(c.keywords.contains("$seen"));
+    }
+
+    #[test]
+    fn no_labels_sets_no_keywords() {
+        assert!(classify(&[]).keywords.is_empty());
+    }
+
+    #[test]
+    fn pt_br_system_labels_map_like_english() {
+        let c = classify_str(
+            "Caixa de entrada,Enviado,Rascunhos,Lixeira,Arquivada,Importante,Com estrela,\
+             Aberto,Categoria: pessoal,Categoria: atualizações,Categoria: promoções,Spam,Clientes",
+        );
+        assert_eq!(
+            c.mailboxes,
+            [
+                "Inbox", "Sent", "Drafts", "Trash", "Archive", "Spam", "Clientes"
+            ]
+        );
+        assert_eq!(c.keywords_sorted(), ["$flagged", "$important", "$seen"]);
+        let roles: Vec<_> = assignments_for(&c, MappingOptions::default())
+            .into_iter()
+            .map(|a| a.role)
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                Some("inbox"),
+                Some("sent"),
+                Some("drafts"),
+                Some("trash"),
+                Some("archive"),
+                Some("junk"),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn pt_br_unread_label_means_no_seen() {
+        let c = classify_str("Caixa de entrada,Não lidas");
         assert!(!c.keywords.contains("$seen"));
         assert!(c.had_unread_signal);
     }

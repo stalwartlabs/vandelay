@@ -50,15 +50,7 @@ pub fn process_file(
     };
 
     for (ordinal, chunk) in chunks.into_iter().enumerate() {
-        match insert_card(
-            &tx,
-            source_id,
-            book_local,
-            file_path,
-            ordinal,
-            &chunk,
-            card_counts,
-        ) {
+        match insert_card(&tx, source_id, book_local, &chunk, card_counts) {
             Ok(()) => {}
             Err(e) => {
                 logger.warn(&format!("{file_path:?}#{ordinal}: vCard: {e}"));
@@ -106,13 +98,10 @@ fn insert_card(
     tx: &Transaction<'_>,
     source_id: i64,
     book_local: i64,
-    file_path: &Path,
-    ordinal: usize,
     chunk: &str,
     counts: &mut TypeCounts,
 ) -> Result<(), Error> {
-    let synthetic_href = format!("{}#{ordinal}", file_path.to_string_lossy());
-    let card = calcard::vcard_to_jscontact(chunk, &synthetic_href)
+    let card = calcard::vcard_to_jscontact(chunk, chunk)
         .map_err(|e| Error::Partial(format!("vCard parse: {e}")))?;
     let data_json = card.data.to_string();
     let address_book_ids = format!("[{book_local}]");

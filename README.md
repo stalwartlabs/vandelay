@@ -295,6 +295,8 @@ vandelay export \
 
 Stateless re-export of `ARCHIVE` into a target JMAP server account. The default behaviour is upsert-only: matched items are updated, unmatched local items are created, but pre-existing target items not covered by the archive are left alone.
 
+The credentials do not have to belong to the target account: an administrator can authenticate with their own credentials (`--auth-basic admin`) and select the user's account with `--account-name alice@example.org`, so a migration does not need every user's password.
+
 `--prune` enables destructive reconciliation: target objects that do not match anything in the archive are deleted. The confirmation prompt can be skipped with `--yes` for automation. Export speaks JMAP only; no other target protocols are currently supported.
 
 ### Inspect

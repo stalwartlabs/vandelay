@@ -258,9 +258,9 @@ fn synthetic_takeout_imports_expected_row_counts() {
     assert_eq!(count(&conn, "address_books"), 1);
     assert_eq!(
         count(&conn, "contact_cards"),
-        6,
+        4,
         "2 UID-bearing cards dedup across the two .vcf files (=2); \
-         2 UID-less cards get distinct synthetic UIDs per file (=4); total 6"
+         2 UID-less cards dedup by content across the two files (=2); total 4"
     );
 
     let by = |t: &str| {
@@ -455,9 +455,9 @@ fn contacts_dedup_by_uid_across_two_vcf_files() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!(
-        synthetic_uids >= 2,
-        "expected synthetic UIDs for the 2 UID-less cards * 2 files"
+    assert_eq!(
+        synthetic_uids, 2,
+        "the 2 UID-less cards appear in both files but are stored once each"
     );
 }
 

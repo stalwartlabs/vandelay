@@ -63,7 +63,8 @@ pub struct DavClient {
 
 impl DavClient {
     pub fn new(auth: Auth, retry: RetryPolicy, allow_invalid_certs: bool) -> Self {
-        let config: Config = Config::builder()
+        let config: Config = retry
+            .apply_timeouts(Config::builder())
             .http_status_as_error(false)
             .allow_non_standard_methods(true)
             .max_redirects(0)

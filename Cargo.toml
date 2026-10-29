@@ -32,7 +32,7 @@ blake3 = "1.8.5"
 time = { version = "0.3.47", features = ["serde-well-known", "macros"] }
 url= "2.5.8"
 thiserror  = "2.0.18"
-ureq = { version = "3.3.0", default-features = false, features = ["json", "gzip", "rustls-no-provider", "platform-verifier"] }
+ureq = { version = "3.5.0", default-features = false, features = ["json", "gzip", "rustls-no-provider", "platform-verifier"] }
 clap = { version = "4.6.1", features = ["derive"] }
 crossbeam-channel = "0.5.15"
 num_cpus = "1.17.0"
