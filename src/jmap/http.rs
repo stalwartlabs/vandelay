@@ -12,8 +12,9 @@ use std::time::{Duration, Instant, SystemTime};
 use encodify::base64::STANDARD;
 use serde_json::Value;
 use ureq::Agent;
-use ureq::config::{Config, RedirectAuthHeaders};
+use ureq::config::{Config, ConfigBuilder, RedirectAuthHeaders};
 use ureq::tls::{RootCerts, TlsConfig};
+use ureq::typestate::AgentScope;
 use ureq::{ResponseExt, http::Uri};
 
 use crate::jmap::error::JmapError;
@@ -27,6 +28,8 @@ const MAX_BODY: u64 = 512 * 1024 * 1024;
 const LONG_RETRY_THRESHOLD: Duration = Duration::from_secs(10);
 
 const BASIC: &str = "Basic ";
+
+const IO_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub enum Auth {
@@ -55,6 +58,7 @@ pub struct RetryPolicy {
     pub max_retries: u32,
     pub base: Duration,
     pub cap: Duration,
+    pub io_timeout: Duration,
 }
 
 impl RetryPolicy {
@@ -63,7 +67,16 @@ impl RetryPolicy {
             max_retries,
             base: Duration::from_millis(500),
             cap: Duration::from_secs(30),
+            io_timeout: IO_TIMEOUT,
         }
+    }
+
+    pub fn apply_timeouts(&self, builder: ConfigBuilder<AgentScope>) -> ConfigBuilder<AgentScope> {
+        let timeout = Some(self.io_timeout);
+        builder
+            .timeout_connect(timeout)
+            .timeout_per_read(timeout)
+            .timeout_per_write(timeout)
     }
 }
 
@@ -104,7 +117,8 @@ enum Attempt {
 
 impl HttpClient {
     pub fn new(auth: Auth, retry: RetryPolicy, allow_invalid_certs: bool) -> Self {
-        let config: Config = Config::builder()
+        let config: Config = retry
+            .apply_timeouts(Config::builder())
             .http_status_as_error(false)
             .redirect_auth_headers(RedirectAuthHeaders::SameHost)
             .tls_config(
@@ -660,6 +674,31 @@ mod tests {
             token: "abc.def".to_owned(),
         };
         assert_eq!(auth.header_value(), "Bearer abc.def");
+    }
+
+    // A server that accepts the connection but never answers fails the request instead of hanging.
+    #[test]
+    fn silent_server_times_out() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/jmap/session", listener.local_addr().unwrap());
+        let holder = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+        let mut retry = RetryPolicy::new(0);
+        retry.io_timeout = Duration::from_millis(200);
+        let client = HttpClient::new(
+            Auth::Bearer {
+                token: "t".to_owned(),
+            },
+            retry,
+            false,
+        );
+        let started = Instant::now();
+        let err = client.get(&url).unwrap_err();
+        assert!(
+            matches!(&err, JmapError::RetriesExhausted(m) if m.contains("timeout")),
+            "got {err:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        drop(holder.join().unwrap());
     }
 
     #[test]

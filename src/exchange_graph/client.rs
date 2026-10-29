@@ -89,7 +89,8 @@ enum Attempt {
 
 impl GraphClient {
     pub fn new(bearer: String, retry: RetryPolicy, allow_invalid_certs: bool) -> GraphClient {
-        let config: Config = Config::builder()
+        let config: Config = retry
+            .apply_timeouts(Config::builder())
             .http_status_as_error(false)
             .redirect_auth_headers(RedirectAuthHeaders::SameHost)
             .tls_config(

@@ -54,7 +54,8 @@ pub struct SoapResponse {
 
 impl EwsClient {
     pub fn new(auth: Auth, retry: RetryPolicy, allow_invalid_certs: bool) -> EwsClient {
-        let config: Config = Config::builder()
+        let config: Config = retry
+            .apply_timeouts(Config::builder())
             .http_status_as_error(false)
             .redirect_auth_headers(RedirectAuthHeaders::SameHost)
             .tls_config(

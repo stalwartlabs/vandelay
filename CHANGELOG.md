@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.14] - Unreleased
+
+### Added
+
+### Changed
+
+### Fixed
+- JMAP, CalDAV, CardDAV, WebDAV, MS Exchange: HTTP requests had no timeout, so a connection that died mid-request hung the run forever; connecting, and each read or write, now times out after 5 minutes and the request goes through the normal retry path (fixes #53)
+
 ## [1.0.13] - 2026-10-25
 
 ### Added
