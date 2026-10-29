@@ -135,7 +135,6 @@ All actions accept a set of global flags (verbosity, worker pool size, retry pol
 | `-q, --quiet` | Warnings and errors only. |
 | `--max-retries <N>` | Max retries per request on transient failures (default 5). |
 | `--allow-invalid-certs` | Accept self-signed / invalid TLS certs. |
-| `--account-name alice@example.com` | For export you can '--auth-basic admin@examplecom' as an admin account whilst targeting a given user account. This bypasses any rate limits that apply to users|
 
 Credentials should be supplied via the `VANDELAY_PASSWORD` / `VANDELAY_TOKEN` / `VANDELAY_EWS_CLIENT_SECRET` / `VANDELAY_GRAPH_TOKEN` environment variables, or via an interactive prompt; passing them on the command line is supported but not recommended.
 
@@ -286,6 +285,8 @@ vandelay export \
 ```
 
 Stateless re-export of `ARCHIVE` into a target JMAP server account. The default behaviour is upsert-only: matched items are updated, unmatched local items are created, but pre-existing target items not covered by the archive are left alone.
+
+The credentials do not have to belong to the target account: an administrator can authenticate with their own credentials (`--auth-basic admin`) and select the user's account with `--account-name alice@example.org`, so a migration does not need every user's password.
 
 `--prune` enables destructive reconciliation: target objects that do not match anything in the archive are deleted. The confirmation prompt can be skipped with `--yes` for automation. Export speaks JMAP only; no other target protocols are currently supported.
 

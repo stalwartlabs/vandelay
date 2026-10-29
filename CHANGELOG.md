@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.14] - Unreleased
+
+### Added
+
+### Changed
+- README: the export section explains how an administrator exports into another user's account with `--account-name` (#34)
+
+### Fixed
+
 ## [1.0.13] - 2026-10-25
 
 ### Added
