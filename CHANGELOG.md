@@ -10,6 +10,9 @@ All notable changes to this project will be documented in this file. This projec
 
 ### Fixed
 - JMAP, CalDAV, CardDAV, WebDAV, MS Exchange: HTTP requests had no timeout, so a connection that died mid-request hung the run forever; connecting, and each read or write, now times out after 5 minutes and the request goes through the normal retry path (fixes #53)
+- Google Takeout: Portuguese (Brazil) system labels (`Caixa de entrada`, `Enviado`, `Com estrela`, `Categoria: ...` and the rest) were imported as plain folders instead of mapping to mailbox roles, keywords or being dropped like their English counterparts (fixes #50)
+- Google Takeout: messages labeled neither `Opened` nor `Unread` were imported as unread; only `Unread` now marks a message unread (fixes #51)
+- Google Takeout: contacts without a `UID` were stored once per contact group file; they are now keyed by their content, so each is stored once. Archives imported with an earlier version keep the old copies, so re-import into a fresh archive (fixes #52)
 
 ## [1.0.13] - 2026-10-25
 
