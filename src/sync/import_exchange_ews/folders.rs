@@ -131,7 +131,7 @@ fn resolve_well_known_roles(
         }
     };
     let messages =
-        parse_response_messages(&resp.body, b"GetFolderResponseMessage").unwrap_or_default();
+        parse_response_messages(&resp.body, "GetFolderResponseMessage").unwrap_or_default();
     let mut map: HashMap<String, &'static str> = HashMap::new();
     for (msg, (_, role)) in messages.into_iter().zip(WELL_KNOWN_ROLES.iter()) {
         if !msg.success {

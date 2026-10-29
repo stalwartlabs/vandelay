@@ -7,8 +7,7 @@
 use std::io;
 use std::time::Duration;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as B64;
+use encodify::base64::STANDARD as B64;
 use ureq::Agent;
 use ureq::http::{Method, Request};
 

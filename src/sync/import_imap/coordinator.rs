@@ -20,7 +20,6 @@ use crate::error::Error;
 use crate::imap::client::{ConnectMode, ImapClient};
 use crate::imap::command;
 use crate::imap::error::ImapError;
-use crate::imap::name::encode_mailbox_name_with;
 use crate::imap::response::{NamespaceEntry, Untagged};
 use crate::imap::retry::{
     BackoffState, Disposition, RetryPolicy, classify, is_negotiation_failure,
@@ -109,6 +108,14 @@ pub(super) fn control_run_collect(
             },
         }
     }
+}
+
+pub(super) fn select_folder(
+    client: &mut ImapClient,
+    ctx: &ControlCtx,
+    folder: &ResolvedFolder,
+) -> Result<crate::imap::CollectedResponse, Error> {
+    control_run_collect(client, ctx, &command::select(&folder.wire_name))
 }
 
 pub(super) fn call_with_retry<F, T>(
@@ -372,7 +379,7 @@ fn run_into(
     let local_mailboxes = db::imap_ids::mailbox_folders(&conn, source_id)?;
     let server_folder_set: HashSet<String> = resolved.iter().map(|f| f.name.clone()).collect();
 
-    upsert_mailboxes(&mut conn, source_id, &resolved, &mut mailbox_counts)?;
+    upsert_mailboxes(&mut conn, source_id, &resolved, &mut mailbox_counts, logger)?;
 
     let server_delimiter = resolved.iter().find_map(|f| f.delimiter).unwrap_or('/');
 
@@ -411,7 +418,7 @@ fn run_into(
     )
     .map_err(|e| Error::Connection(format!("worker pool: {e}")))?;
 
-    for (i, folder) in resolved.iter().enumerate() {
+    for (i, folder) in resolved.iter().filter(|f| f.selectable).enumerate() {
         if i > 0 {
             let _ = control_run_collect(&mut client, &control_ctx, "NOOP");
         }
@@ -578,16 +585,29 @@ fn upsert_mailboxes(
     source_id: i64,
     folders: &[ResolvedFolder],
     counts: &mut TypeCounts,
+    logger: Logger,
 ) -> Result<(), Error> {
     let tx = conn.transaction()?;
     let mut local_ids: HashMap<String, i64> = HashMap::new();
     for folder in folders {
         let parent_local = match &folder.parent_path {
-            Some(p) => local_ids.get(p.as_str()).copied().or_else(|| {
-                db::imap_ids::local_for_mailbox(&tx, source_id, p)
-                    .ok()
-                    .flatten()
-            }),
+            Some(p) => {
+                let found = match local_ids.get(p.as_str()) {
+                    Some(id) => Some(*id),
+                    None => db::imap_ids::local_for_mailbox(&tx, source_id, p)?,
+                };
+                if found.is_none() {
+                    log_at(
+                        logger,
+                        LEVEL_DEFAULT,
+                        &format!(
+                            "folder {:?}: parent {p:?} could not be resolved; storing it at the top level",
+                            folder.name
+                        ),
+                    );
+                }
+                found
+            }
             None => None,
         };
         let existing = db::imap_ids::local_for_mailbox(&tx, source_id, &folder.name)?;
@@ -713,8 +733,7 @@ fn reconcile_folder(
         }
     }
 
-    let wire_name = encode_mailbox_name_with(&folder.name, client.utf8_accept());
-    let resp = control_run_collect(client, control_ctx, &command::select(&wire_name))?;
+    let resp = select_folder(client, control_ctx, folder)?;
     let mut uidvalidity: u32 = 0;
     let mut uidnext: u32 = 0;
     for u in &resp.untagged {
@@ -800,6 +819,7 @@ fn reconcile_folder(
         for batch in &batches {
             pool.submit(FetchJob {
                 folder: folder.name.clone(),
+                wire_name: folder.wire_name.clone(),
                 uidvalidity,
                 uids: batch.to_vec(),
             });
@@ -1122,9 +1142,8 @@ fn dry_run_summary(
         );
     }
 
-    for folder in folders {
-        let wire = encode_mailbox_name_with(&folder.name, client.utf8_accept());
-        let select_resp = match control_run_collect(client, control_ctx, &command::select(&wire)) {
+    for folder in folders.iter().filter(|f| f.selectable) {
+        let select_resp = match select_folder(client, control_ctx, folder) {
             Ok(r) => r,
             Err(e) => {
                 log_at(

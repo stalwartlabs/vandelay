@@ -9,8 +9,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use ureq::Agent;
 use ureq::config::{Config, RedirectAuthHeaders};
 use ureq::tls::{RootCerts, TlsConfig};
@@ -168,14 +166,11 @@ impl EwsClient {
     }
 
     fn auth_header(&self) -> String {
-        let auth = self.inner.auth.lock().ok().map(|g| g.clone());
-        match auth {
-            Some(Auth::Basic { user, password }) => {
-                format!("Basic {}", STANDARD.encode(format!("{user}:{password}")))
-            }
-            Some(Auth::Bearer { token }) => format!("Bearer {token}"),
-            None => String::new(),
-        }
+        self.inner
+            .auth
+            .lock()
+            .map(|auth| auth.header_value())
+            .unwrap_or_default()
     }
 
     fn anchor_header(&self) -> Option<String> {

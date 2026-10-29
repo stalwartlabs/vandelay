@@ -4,16 +4,22 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+use std::borrow::Cow;
+use std::fmt::Write;
+
+use calcard::Entry;
 use calcard::icalendar::ICalendar;
 use calcard::vcard::VCard;
 use serde_json::{Map, Value};
 
+const MAX_INVALID_LINE_CHARS: usize = 80;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CalcardError {
-    #[error("vcard parse failed")]
-    VCardParse,
-    #[error("icalendar parse failed")]
-    ICalParse,
+    #[error("vcard parse failed: {0}")]
+    VCardParse(String),
+    #[error("icalendar parse failed: {0}")]
+    ICalParse(String),
     #[error("jscontact serialisation: {0}")]
     Json(#[from] serde_json::Error),
     #[error("no parseable entries in iCalendar")]
@@ -29,7 +35,8 @@ pub struct JsContact {
 }
 
 pub fn vcard_to_jscontact(text: &str, item_href: &str) -> Result<JsContact, CalcardError> {
-    let vcard = VCard::parse(text).map_err(|_| CalcardError::VCardParse)?;
+    let vcard = VCard::parse(normalize_line_breaks(text))
+        .map_err(|e| CalcardError::VCardParse(describe_parse_error(e)))?;
     let js = vcard.into_jscontact::<String, String>();
     let value: Value = serde_json::from_str(&js.to_string_pretty())?;
     let uid = value
@@ -81,7 +88,8 @@ impl EntryType {
 }
 
 pub fn ical_to_jscalendar_entries(text: &str) -> Result<Vec<JsCalendarEntry>, CalcardError> {
-    let ical = ICalendar::parse(text).map_err(|_| CalcardError::ICalParse)?;
+    let ical = ICalendar::parse(normalize_line_breaks(text))
+        .map_err(|e| CalcardError::ICalParse(describe_parse_error(e)))?;
     let js = ical.into_jscalendar::<String, String>();
     let value: Value = serde_json::from_str(&js.to_string_pretty())?;
     let mut out = Vec::new();
@@ -90,6 +98,67 @@ pub fn ical_to_jscalendar_entries(text: &str) -> Result<Vec<JsCalendarEntry>, Ca
         return Err(CalcardError::NoEntries);
     }
     Ok(out)
+}
+
+fn normalize_line_breaks(text: &str) -> Cow<'_, str> {
+    let mut after_cr = text.split('\r').skip(1).peekable();
+    let mut has_bare_cr = false;
+    while let Some(rest) = after_cr.next() {
+        if is_bare_cr(rest, after_cr.peek().is_some()) {
+            has_bare_cr = true;
+            break;
+        }
+    }
+    if !has_bare_cr {
+        return Cow::Borrowed(text);
+    }
+    let mut parts = text.split('\r').peekable();
+    let mut out = String::with_capacity(text.len());
+    out.push_str(parts.next().unwrap_or_default());
+    while let Some(rest) = parts.next() {
+        if is_bare_cr(rest, parts.peek().is_some()) {
+            out.push('\n');
+        }
+        out.push_str(rest);
+    }
+    Cow::Owned(out)
+}
+
+fn is_bare_cr(rest: &str, more: bool) -> bool {
+    let followed_by_cr = rest.is_empty() && more;
+    !followed_by_cr && !rest.starts_with('\n')
+}
+
+fn describe_parse_error(entry: Entry) -> String {
+    let mut out = String::new();
+    match entry {
+        Entry::InvalidLine(line) => {
+            out.push_str("invalid line ");
+            let mut chars = line.chars();
+            let head: String = chars.by_ref().take(MAX_INVALID_LINE_CHARS).collect();
+            let _ = write!(out, "{head:?}");
+            if chars.next().is_some() {
+                out.push_str(" (truncated)");
+            }
+        }
+        Entry::UnexpectedComponentEnd { expected, found } => {
+            let _ = write!(
+                out,
+                "found END:{} where END:{} was expected",
+                found.as_str(),
+                expected.as_str()
+            );
+        }
+        Entry::UnterminatedComponent(name) => {
+            let _ = write!(out, "{name} is never closed");
+        }
+        Entry::TooManyComponents => out.push_str("too many components"),
+        Entry::Eof => out.push_str("no BEGIN line found"),
+        Entry::VCard(_) => out.push_str("found a vCard where an iCalendar was expected"),
+        Entry::ICalendar(_) => out.push_str("found an iCalendar where a vCard was expected"),
+        _ => out.push_str("unrecognised content"),
+    }
+    out
 }
 
 fn collect_entries(value: Value, out: &mut Vec<JsCalendarEntry>) {
@@ -227,7 +296,53 @@ END:VCALENDAR\r\n";
     #[test]
     fn vcard_garbage_fails_parse() {
         let err = vcard_to_jscontact("not a vcard", "/x").unwrap_err();
-        assert!(matches!(err, CalcardError::VCardParse));
+        assert!(matches!(err, CalcardError::VCardParse(_)));
+    }
+
+    // Kerio Connect sends calendar-data with bare CR line breaks (issue #48).
+    #[test]
+    fn ical_with_bare_cr_line_breaks_parses() {
+        let ical = SAMPLE_ICAL.replace("\r\n", "\r");
+        let entries = ical_to_jscalendar_entries(&ical).expect("bare CR parses");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].data["title"], "Test Event");
+    }
+
+    // A folded line split by a bare CR still unfolds.
+    #[test]
+    fn ical_with_bare_cr_unfolds_continuation_lines() {
+        let ical = "BEGIN:VCALENDAR\rVERSION:2.0\rBEGIN:VEVENT\rUID:k1@example\r\
+            DTSTAMP:20260101T000000Z\rDTSTART:20260101T090000Z\r\
+            SUMMARY:Quarterly\r  review\rEND:VEVENT\rEND:VCALENDAR\r";
+        let entries = ical_to_jscalendar_entries(ical).expect("parse");
+        assert_eq!(entries[0].data["title"], "Quarterly review");
+    }
+
+    #[test]
+    fn vcard_with_bare_cr_line_breaks_parses() {
+        let vcard = SAMPLE_VCARD.replace("\r\n", "\r");
+        let jc = vcard_to_jscontact(&vcard, "/x").expect("bare CR parses");
+        assert_eq!(jc.uid, "abc-123");
+    }
+
+    #[test]
+    fn line_break_normalization_borrows_unless_bare_cr() {
+        for text in ["A\nB\n", "A\r\nB\r\n", "A\r\r\nB\r\r\n", "no breaks"] {
+            assert!(
+                matches!(normalize_line_breaks(text), Cow::Borrowed(_)),
+                "{text:?}"
+            );
+        }
+        assert_eq!(normalize_line_breaks("A\rB\r\nC\r"), "A\nB\nC\n");
+    }
+
+    #[test]
+    fn ical_parse_error_names_the_offending_line() {
+        let err = ical_to_jscalendar_entries("Content-Type: text/calendar\r\nBEGIN:VCALENDAR\r\n")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid line"), "{msg}");
+        assert!(msg.contains("Content-Type"), "{msg}");
     }
 
     #[test]

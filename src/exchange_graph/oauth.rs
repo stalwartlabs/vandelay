@@ -7,16 +7,16 @@
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use encodify::base64::{Base64, Padding, URL_SAFE};
 use serde_json::Value;
 use ureq::config::Config;
 use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::exchange_graph::error::GraphError;
 
-pub const SCOPES: &str =
-    "offline_access User.Read Mail.Read MailboxSettings.Read Calendars.Read Contacts.Read";
+pub const SCOPES: &str = "offline_access User.Read Mail.Read MailboxSettings.Read Calendars.Read Contacts.Read Files.Read";
+
+const JWT_SEGMENT: Base64 = URL_SAFE.with_padding(Padding::Optional).any_alphabet();
 
 pub fn default_authority(tenant: &str) -> String {
     format!("https://login.microsoftonline.com/{tenant}")
@@ -53,11 +53,7 @@ pub fn decode_jwt_claims(token: &str) -> Option<JwtClaims> {
     let mut parts = token.split('.');
     let _header = parts.next()?;
     let payload = parts.next()?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(payload)
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload))
-        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(payload))
-        .ok()?;
+    let bytes = JWT_SEGMENT.decode(payload).ok()?;
     let value: Value = serde_json::from_slice(&bytes).ok()?;
     Some(JwtClaims {
         tenant_id: value.get("tid").and_then(Value::as_str).map(str::to_owned),
@@ -420,12 +416,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use encodify::base64::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 
     fn make_jwt(tid: &str, upn: &str, exp: u64) -> String {
         let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"none\"}");
         let claims = format!(r#"{{"tid":"{tid}","upn":"{upn}","exp":{exp}}}"#);
         let payload = URL_SAFE_NO_PAD.encode(claims.as_bytes());
         format!("{header}.{payload}.")
+    }
+
+    // Device code consent covers every --objects surface, including the drive.
+    #[test]
+    fn scopes_cover_every_surface() {
+        for required in [
+            "offline_access",
+            "Mail.Read",
+            "MailboxSettings.Read",
+            "Calendars.Read",
+            "Contacts.Read",
+            "Files.Read",
+        ] {
+            assert!(
+                SCOPES.split_whitespace().any(|s| s == required),
+                "missing {required}"
+            );
+        }
     }
 
     #[test]
@@ -435,6 +450,19 @@ mod tests {
         assert_eq!(claims.tenant_id.as_deref(), Some("t-1"));
         assert_eq!(claims.upn.as_deref(), Some("alice@x.com"));
         assert_eq!(claims.exp, Some(9999999999));
+    }
+
+    #[test]
+    fn jwt_payload_decodes_in_either_alphabet_with_or_without_padding() {
+        let claims = r#"{"tid":"t-3","upn":"??>>@xy","exp":1}"#;
+        for engine in [URL_SAFE_NO_PAD, URL_SAFE, STANDARD_NO_PAD, STANDARD] {
+            let token = format!("h.{}.s", engine.encode(claims));
+            let decoded = decode_jwt_claims(&token).unwrap();
+            assert_eq!(decoded.upn.as_deref(), Some("??>>@xy"), "{token}");
+        }
+        assert!(decode_jwt_claims("h.eyJ0aWQiOiJ0LTMifQ.s").is_some());
+        assert!(decode_jwt_claims("h.eyJ0aWQiOiJ0LTMifQ=.s").is_none());
+        assert!(decode_jwt_claims("h.eyJ0 aWQiOiJ0LTMifQ.s").is_none());
     }
 
     #[test]

@@ -16,7 +16,7 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::db;
 use crate::sync::TypeCounts;
-use crate::sync::emailmeta::email_index_from_blob;
+use crate::sync::emailmeta::email_meta_from_blob;
 use crate::sync::keys::index_to_json;
 
 use super::keywords::{Translation, flags_from_filename, translate_flags, unique_id_from_filename};
@@ -149,9 +149,10 @@ pub fn insert_new(
     if translation.has_trashed_flag && !ctx.include_deleted {
         return Ok(None);
     }
-    let received_at = format_unix_rfc3339(entry.mtime_unix);
+    let (index, date_header) = email_meta_from_blob(&bytes);
+    let received_at = pick_received_at(&entry.filename, entry.mtime_unix, date_header.as_deref());
     let blob_id = db::blobs::intern_blob(tx, &bytes)?;
-    let message_match = index_to_json(&email_index_from_blob(&bytes));
+    let message_match = index_to_json(&index);
     let mailbox_ids = Value::Array(vec![Value::from(ctx.mailbox_local)]);
     let keywords = keywords_json(&translation);
     tx.execute(
@@ -168,6 +169,37 @@ pub fn insert_new(
     let local_id = tx.last_insert_rowid();
     db::maildir_ids::insert_email(tx, ctx.source_id, ctx.folder, &entry.unique_id, local_id)?;
     Ok(Some(local_id))
+}
+
+pub fn delivery_time_from_filename(filename: &str) -> Option<u64> {
+    let digits: String = filename.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() || digits.len() > 12 {
+        return None;
+    }
+    let secs: u64 = digits.parse().ok()?;
+    if secs == 0 {
+        return None;
+    }
+    let now = OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
+    if secs > now.saturating_add(86_400) {
+        return None;
+    }
+    Some(secs)
+}
+
+pub fn pick_received_at(filename: &str, mtime_unix: u64, date_header: Option<&str>) -> String {
+    if let Some(secs) = delivery_time_from_filename(filename) {
+        return format_unix_rfc3339(secs);
+    }
+    if let Some(d) = date_header {
+        return d.to_owned();
+    }
+    if mtime_unix > 0 {
+        return format_unix_rfc3339(mtime_unix);
+    }
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -720,5 +752,50 @@ mod tests {
             PresentOutcome::Unchanged
         );
         tx.commit().unwrap();
+    }
+
+    #[test]
+    fn filename_delivery_time_wins_over_mtime() {
+        let got = pick_received_at(
+            "1763065233.M12345P678.host,S=1234:2,S",
+            99,
+            Some("2025-05-12T10:00:00+02:00"),
+        );
+        assert_eq!(got, "2025-11-13T20:20:33Z");
+    }
+
+    #[test]
+    fn date_header_used_when_the_filename_carries_no_timestamp() {
+        let got = pick_received_at(
+            "M12345P678.host:2,S",
+            1763065233,
+            Some("2025-05-12T10:00:00+02:00"),
+        );
+        assert_eq!(got, "2025-05-12T10:00:00+02:00");
+    }
+
+    #[test]
+    fn mtime_is_the_last_resort_before_now() {
+        let got = pick_received_at("M12345P678.host:2,S", 1763065233, None);
+        assert_eq!(got, "2025-11-13T20:20:33Z");
+    }
+
+    #[test]
+    fn implausible_filename_timestamps_are_rejected() {
+        assert_eq!(delivery_time_from_filename("0.M1P1.host"), None);
+        assert_eq!(delivery_time_from_filename("M1P1.host"), None);
+        assert_eq!(
+            delivery_time_from_filename("99999999999999.M1P1.host"),
+            None
+        );
+        let far_future = (OffsetDateTime::now_utc().unix_timestamp() as u64) + 400_000;
+        assert_eq!(
+            delivery_time_from_filename(&format!("{far_future}.M1P1.host")),
+            None
+        );
+        assert_eq!(
+            delivery_time_from_filename("1763065233.M12345P678.host"),
+            Some(1763065233)
+        );
     }
 }

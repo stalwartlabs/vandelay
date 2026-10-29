@@ -6,6 +6,7 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::exchange::address::{as_smtp_address, extract_smtp_address};
 use crate::exchange::jscalendar::{drop_calendar_address_dependents, synthetic_attendee_address};
 use crate::exchange::tz::resolve_to_iana;
 use crate::exchange_graph::error::GraphError;
@@ -319,9 +320,15 @@ pub fn convert_event(
         .and_then(Value::as_array)
         && !cancels.is_empty()
     {
+        let start_time = card
+            .get("start")
+            .and_then(Value::as_str)
+            .and_then(|s| s.split_once('T').map(|(_, time)| time.to_owned()));
         let mut overrides = Map::new();
         for entry in cancels.iter().filter_map(Value::as_str) {
-            overrides.insert(entry.to_owned(), json!({"excluded": true}));
+            if let Some(key) = cancelled_occurrence_key(entry, start_time.as_deref()) {
+                overrides.insert(key, json!({"excluded": true}));
+            }
         }
         if !overrides.is_empty() {
             card.insert("recurrenceOverrides".to_owned(), Value::Object(overrides));
@@ -337,6 +344,17 @@ pub fn convert_event(
         event_type,
         original_start,
     })
+}
+
+fn cancelled_occurrence_key(entry: &str, start_time: Option<&str>) -> Option<String> {
+    let date = entry.rsplit('.').next().filter(|d| d.len() == 10)?;
+    if !date.as_bytes().iter().enumerate().all(|(i, b)| match i {
+        4 | 7 => *b == b'-',
+        _ => b.is_ascii_digit(),
+    }) {
+        return None;
+    }
+    Some(format!("{date}T{}", start_time.unwrap_or("00:00:00")))
 }
 
 fn extract_local_datetime(slot: Option<&Value>) -> Option<String> {
@@ -356,8 +374,10 @@ fn non_empty(email: &Value, key: &str) -> Option<String> {
 
 fn resolve_calendar_address(email: &Value) -> Option<(String, Option<String>)> {
     if let Some(addr) = non_empty(email, "address") {
-        let cal_addr = format!("mailto:{addr}");
-        return Some((cal_addr, Some(addr)));
+        if let Some(smtp) = as_smtp_address(&addr).or_else(|| extract_smtp_address(&addr)) {
+            return Some((format!("mailto:{smtp}"), Some(smtp)));
+        }
+        return Some((synthetic_attendee_address(&addr), None));
     }
     non_empty(email, "name").map(|name| (synthetic_attendee_address(&name), None))
 }
@@ -661,6 +681,64 @@ mod tests {
         assert!(participants.contains_key("att-1"));
         assert_eq!(participants["att-1"]["email"], "bob@x.com");
         assert_eq!(participants["att-1"]["roles"]["required"], true);
+    }
+
+    #[test]
+    fn a_hybrid_x500_address_is_not_emitted_as_a_mailto() {
+        let mut v = sample();
+        v["attendees"] = json!([
+            {
+                "emailAddress": {
+                    "name": "Kristina Morgental",
+                    "address": "/o=ExchangeLabs/ou=Exchange Administrative Group \
+                        (FYDIBOHF23SPDLT)/cn=Recipients/cn=bdc77b18152647a29d28ce1188376dc9-kristina"
+                },
+                "type": "required",
+                "status": {"response": "none"}
+            }
+        ]);
+        let conv = convert_event(&v, None).unwrap();
+        let p = &conv.data["participants"]["att-1"];
+        let addr = p["calendarAddress"].as_str().unwrap();
+        assert!(
+            addr.starts_with("urn:x-vandelay:attendee:"),
+            "a hybrid X500 reference must not become a malformed mailto, got {addr}"
+        );
+        assert!(
+            p.get("email").is_none(),
+            "an X500 reference is not an email address"
+        );
+        assert_eq!(p["name"], "Kristina Morgental", "the display name is kept");
+    }
+
+    #[test]
+    fn a_prefixed_or_bracketed_address_is_normalised() {
+        let mut v = sample();
+        v["attendees"] = json!([
+            {
+                "emailAddress": {"name": "Bob", "address": "SMTP:bob@example.com"},
+                "type": "required",
+                "status": {"response": "none"}
+            },
+            {
+                "emailAddress": {"name": "Eve", "address": "Eve <eve@example.com>"},
+                "type": "required",
+                "status": {"response": "none"}
+            }
+        ]);
+        let conv = convert_event(&v, None).unwrap();
+        assert_eq!(
+            conv.data["participants"]["att-1"]["calendarAddress"],
+            "mailto:bob@example.com"
+        );
+        assert_eq!(
+            conv.data["participants"]["att-1"]["email"],
+            "bob@example.com"
+        );
+        assert_eq!(
+            conv.data["participants"]["att-2"]["calendarAddress"],
+            "mailto:eve@example.com"
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+use encodify::hex::decode_pair;
 use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -111,9 +112,9 @@ fn percent_decode(s: &str) -> String {
     while i < bytes.len() {
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
-            && let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+            && let Some(byte) = decode_pair(bytes[i + 1], bytes[i + 2])
         {
-            buf.push((h << 4) | l);
+            buf.push(byte);
             i += 3;
             continue;
         }
@@ -123,15 +124,6 @@ fn percent_decode(s: &str) -> String {
     match String::from_utf8(buf) {
         Ok(decoded) => decoded,
         Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    }
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
     }
 }
 

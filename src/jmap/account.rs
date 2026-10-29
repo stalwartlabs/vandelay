@@ -18,7 +18,6 @@ pub enum AccountSelector {
     Name(String),
 }
 
-const OWNER_URN: &str = "urn:ietf:params:jmap:principals:owner";
 const PRINCIPALS_URN: &str = "urn:ietf:params:jmap:principals";
 
 pub fn resolve(
@@ -139,21 +138,15 @@ fn unsupported_principals(name: &str, session: &Session) -> Error {
 
 fn extract_account_id(principal: &Value, name: &str) -> Result<String, Error> {
     if let Some(accounts) = principal.get("accounts").and_then(Value::as_object) {
-        for data in accounts.values() {
-            if let Some(owner) = data.get(OWNER_URN)
-                && let Some(id) = owner.get("accountIdForPrincipal").and_then(Value::as_str)
-            {
-                return Ok(id.to_owned());
-            }
+        let mut keys = accounts.keys();
+        if let (Some(only), None) = (keys.next(), keys.next()) {
+            return Ok(only.clone());
         }
-        for data in accounts.values() {
-            if let Some(cap) = data.as_object() {
-                for v in cap.values() {
-                    if let Some(id) = v.get("accountId").and_then(Value::as_str) {
-                        return Ok(id.to_owned());
-                    }
-                }
-            }
+        let named = accounts
+            .iter()
+            .find(|(_, account)| account.get("name").and_then(Value::as_str) == Some(name));
+        if let Some((id, _)) = named {
+            return Ok(id.clone());
         }
     }
     principal
@@ -254,12 +247,33 @@ mod tests {
         assert_eq!(extract_account_id(&p, "bob").unwrap(), "acc-7");
     }
 
+    // RFC 9670: the data account is the key of "accounts", not accountIdForPrincipal.
     #[test]
-    fn extract_uses_per_capability_account_id() {
+    fn extract_uses_accounts_key_not_account_id_for_principal() {
+        let p = json!({
+            "id": "px",
+            "name": "bob@example.org",
+            "accounts": { "data-9": {
+                "name": "bob@example.org",
+                "isPersonal": false,
+                "accountCapabilities": {
+                    "urn:ietf:params:jmap:principals:owner":
+                        { "accountIdForPrincipal": "admin-1", "principalId": "px" }
+                }
+            } }
+        });
+        assert_eq!(extract_account_id(&p, "bob@example.org").unwrap(), "data-9");
+    }
+
+    #[test]
+    fn extract_picks_the_named_account_among_several() {
         let p = json!({
             "id": "px",
             "name": "bob",
-            "accounts": { "z": { "urn:ietf:params:jmap:mail": { "accountId": "data-9" } } }
+            "accounts": {
+                "shared-1": { "name": "team" },
+                "data-9": { "name": "bob" }
+            }
         });
         assert_eq!(extract_account_id(&p, "bob").unwrap(), "data-9");
     }

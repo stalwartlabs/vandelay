@@ -6,6 +6,7 @@
 
 use serde_json::{Value, json};
 
+use crate::exchange::date::recurrence_until;
 use crate::exchange_graph::error::GraphError;
 
 pub fn convert_patterned_recurrence(pr: &Value) -> Result<Value, GraphError> {
@@ -68,7 +69,9 @@ pub fn convert_patterned_recurrence_rule(
         );
     }
 
-    if let Some(index) = pattern.get("index").and_then(Value::as_str)
+    let pattern_type = pattern.get("type").and_then(Value::as_str).unwrap_or("");
+    if matches!(pattern_type, "relativeMonthly" | "relativeYearly")
+        && let Some(index) = pattern.get("index").and_then(Value::as_str)
         && let Some(setpos) = set_position_for(index)
     {
         rule.insert(
@@ -80,12 +83,11 @@ pub fn convert_patterned_recurrence_rule(
     let range_type = range.get("type").and_then(Value::as_str).unwrap_or("noEnd");
     match range_type {
         "endDate" => {
-            if let Some(end) = range.get("endDate").and_then(Value::as_str) {
-                let local = if end.contains('T') {
-                    end.to_owned()
-                } else {
-                    format!("{end}T23:59:59")
-                };
+            if let Some(local) = range
+                .get("endDate")
+                .and_then(Value::as_str)
+                .and_then(recurrence_until)
+            {
                 rule.insert("until".to_owned(), Value::from(local));
             }
         }
@@ -203,6 +205,35 @@ mod tests {
         assert_eq!(rule["frequency"], "monthly");
         assert_eq!(rule["bySetPosition"][0], 3);
         assert_eq!(rule["byDay"][0]["day"], "th");
+    }
+
+    #[test]
+    fn index_is_ignored_unless_the_pattern_is_relative() {
+        for kind in ["daily", "weekly", "absoluteMonthly", "absoluteYearly"] {
+            let pr = json!({
+                "pattern": {"type": kind, "interval": 1, "index": "first",
+                            "daysOfWeek": ["monday"], "dayOfMonth": 1, "month": 1},
+                "range": {"type": "noEnd"}
+            });
+            let out = convert_patterned_recurrence(&pr).unwrap();
+            assert!(
+                out.get("bySetPosition").is_none(),
+                "{kind} carries Graph's default index=first, which must not become bySetPosition"
+            );
+        }
+    }
+
+    #[test]
+    fn index_survives_for_relative_patterns() {
+        for kind in ["relativeMonthly", "relativeYearly"] {
+            let pr = json!({
+                "pattern": {"type": kind, "interval": 1, "index": "third",
+                            "daysOfWeek": ["thursday"]},
+                "range": {"type": "noEnd"}
+            });
+            let out = convert_patterned_recurrence(&pr).unwrap();
+            assert_eq!(out["bySetPosition"][0], 3, "{kind} keeps its index");
+        }
     }
 
     #[test]

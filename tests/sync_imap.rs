@@ -7,11 +7,15 @@
 mod integration;
 mod seeder;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use integration::Account;
+use integration::dovecot::Dovecot;
 use integration::stalwart::shared as shared_stalwart;
+use integration::validate::{emails_in_mailbox, mailbox_id_by_path, mailbox_path, open_archive};
 use rusqlite::Connection;
+use serde_json::json;
 
 fn base_url() -> &'static str {
     shared_stalwart().base_url()
@@ -71,6 +75,28 @@ fn imap_basic_config(localpart: &str) -> ImapImportConfig {
         include_deleted: false,
         fetch_batch: 256,
         imap_connections: 4,
+        allow_source_change: false,
+    }
+}
+
+fn dovecot_config(account: &Account, imap: &integration::Endpoint) -> ImapImportConfig {
+    ImapImportConfig {
+        url: format!("imap://{}:{}", imap.host, imap.port),
+        auth: ImapAuth::Basic {
+            user: account.username.clone(),
+            password: account.password.clone(),
+        },
+        allow_cleartext: false,
+        compress: false,
+        include: Vec::new(),
+        exclude: Vec::new(),
+        exclude_special: Vec::new(),
+        folder: Vec::new(),
+        subscribed_only: false,
+        automap: true,
+        include_deleted: false,
+        fetch_batch: 64,
+        imap_connections: 2,
         allow_source_change: false,
     }
 }
@@ -392,4 +418,146 @@ fn imap_imported_archive_exports_via_jmap() {
 
     let _ = std::fs::remove_file(&archive);
     seeder::teardown(base_url()).expect("teardown");
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn dovecot_noselect_parents_keep_the_tree_through_export() {
+    let d = Dovecot::start().expect("dovecot start");
+    let account = d.accounts.first().expect("account").clone();
+    let message = b"From: tree@vandelay.test\r\n\
+         To: user1@vandelay.test\r\n\
+         Subject: Tree\r\n\
+         Message-ID: <tree-1@vandelay.test>\r\n\
+         Date: Wed, 01 Jan 2025 12:00:00 +0000\r\n\
+         \r\n\
+         Structural parent probe.\r\n";
+    let leaves = [
+        "Projects/Invoices",
+        "Clients/Acme/Invoices",
+        "Archive",
+        "Archive/2024",
+        "Archive /2024",
+    ];
+    let structural = ["Projects", "Clients", "Clients/Acme", "Archive "];
+    let listed = d
+        .create_leaves_without_parents(&account, &leaves, message)
+        .expect("create hierarchy");
+    for name in structural {
+        let quoted = format!("\"{name}\"");
+        let line = listed
+            .iter()
+            .find(|l| l.ends_with(&quoted) || l.ends_with(&format!(" {name}")))
+            .unwrap_or_else(|| panic!("{name:?} missing from LIST: {listed:?}"));
+        let lower = line.to_ascii_lowercase();
+        assert!(
+            lower.contains("\\noselect") || lower.contains("\\nonexistent"),
+            "{name:?} should be non-selectable: {line}"
+        );
+    }
+
+    let archive = tmp_archive("dovecot-noselect");
+    for pass in 0..2 {
+        let summary = sync::import_imap::run(common(&archive), dovecot_config(&account, &d.imap))
+            .expect("imap import");
+        assert!(!summary.any_failed(), "pass {pass}: {summary:?}");
+    }
+    let conn = open_archive(&archive);
+    for path in leaves.iter().chain(&structural) {
+        let id = mailbox_id_by_path(&conn, path, '/')
+            .unwrap_or_else(|| panic!("{path:?} not in the archive tree"));
+        assert_eq!(mailbox_path(&conn, id, '/'), *path);
+    }
+    for path in structural {
+        let id = mailbox_id_by_path(&conn, path, '/').expect("structural");
+        assert_eq!(emails_in_mailbox(&conn, id), 0, "{path:?}");
+    }
+    for path in leaves {
+        let id = mailbox_id_by_path(&conn, path, '/').expect("leaf");
+        assert_eq!(emails_in_mailbox(&conn, id), 1, "{path:?}");
+    }
+    drop(conn);
+
+    let fx = seeder::provision(base_url()).expect("provision");
+    let dst = fx.account(seeder::SYNC_OUT[0]).expect("sync-out target");
+    let export = sync::export::run(
+        CommonConfig {
+            archive: archive.clone(),
+            threads: 4,
+            dry_run: false,
+            max_retries: 5,
+            allow_invalid_certs: true,
+            logger: Logger::from_flags(false, 0),
+        },
+        ExportConfig {
+            connect: ConnectConfig {
+                url: fx.base_url.clone(),
+                auth: Auth::Basic {
+                    user: dst.email.clone(),
+                    password: dst.password.clone(),
+                },
+                account: AccountSelector::Id(dst.account_id.clone()),
+            },
+            objects: None,
+            prune: false,
+            yes: true,
+        },
+    )
+    .expect("export");
+    assert!(!export.any_failed(), "export reported failures: {export:?}");
+
+    let jmap =
+        seeder::jmap::Jmap::connect(&fx.base_url, &dst.email, &dst.password).expect("session");
+    let resp = jmap
+        .request(
+            &["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+            json!([["Mailbox/get", {"accountId": dst.account_id, "ids": null}, "g"]]),
+        )
+        .expect("Mailbox/get");
+    let list = resp["methodResponses"][0][1]["list"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let by_id: HashMap<&str, (&str, Option<&str>)> = list
+        .iter()
+        .filter_map(|m| {
+            Some((
+                m["id"].as_str()?,
+                (m["name"].as_str()?, m["parentId"].as_str()),
+            ))
+        })
+        .collect();
+    let paths: HashSet<String> = by_id
+        .keys()
+        .map(|id| {
+            let mut parts = Vec::new();
+            let mut cur = Some(*id);
+            while let Some(c) = cur {
+                let (name, parent) = by_id[c];
+                parts.push(name);
+                cur = parent;
+            }
+            parts.reverse();
+            parts.join("/")
+        })
+        .collect();
+    for path in leaves
+        .iter()
+        .chain(&structural)
+        .filter(|p| !p.contains(' '))
+    {
+        assert!(
+            paths.contains(*path),
+            "{path:?} missing on target: {paths:?}"
+        );
+    }
+    for orphan in ["Invoices", "Acme", "2024"] {
+        assert!(
+            !paths.contains(orphan),
+            "{orphan:?} leaked to the top level"
+        );
+    }
+
+    let _ = std::fs::remove_file(&archive);
+    seeder::teardown(&fx.base_url).expect("teardown");
 }

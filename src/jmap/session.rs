@@ -249,6 +249,13 @@ impl Session {
             .unwrap_or(false)
     }
 
+    pub fn may_support(&self, account_id: &str, capability_urn: &str) -> bool {
+        match self.account_capabilities(account_id) {
+            Some(caps) => caps.contains_key(capability_urn),
+            None => self.capabilities.contains_key(capability_urn),
+        }
+    }
+
     pub fn upload_url_for(&self, account_id: &str) -> String {
         self.upload_url
             .replace("{accountId}", &encode_segment(account_id))
@@ -330,6 +337,16 @@ mod tests {
         assert!(session.supports("w", "urn:ietf:params:jmap:mail"));
         assert!(!session.supports("w", "urn:ietf:params:jmap:filenode"));
         assert!(!session.supports("missing", "urn:ietf:params:jmap:mail"));
+    }
+
+    // Listed accounts use their own capabilities; unlisted ones fall back to the session's.
+    #[test]
+    fn may_support_falls_back_to_session_capabilities_for_unlisted_account() {
+        let session = parse_session(raw_session()).unwrap();
+        assert!(session.may_support("w", "urn:ietf:params:jmap:mail"));
+        assert!(!session.may_support("w", "urn:ietf:params:jmap:core"));
+        assert!(session.may_support("missing", "urn:ietf:params:jmap:core"));
+        assert!(!session.may_support("missing", "urn:ietf:params:jmap:mail"));
     }
 
     #[test]

@@ -17,6 +17,7 @@ use crate::sync::{CommonConfig, RunOutcome, Summary, TypeCounts};
 
 use super::collections;
 use super::items;
+use super::replace::{self, Removed};
 use super::tree;
 
 #[derive(Debug, Clone, Copy)]
@@ -71,6 +72,13 @@ impl DavAuth {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceChange {
+    Reject,
+    Allow,
+    Replace,
+}
+
 #[derive(Debug)]
 pub struct DavImportConfig {
     pub kind: DavKindArg,
@@ -79,7 +87,7 @@ pub struct DavImportConfig {
     pub allow_cleartext: bool,
     pub dav_connections: usize,
     pub multiget_batch: usize,
-    pub allow_source_change: bool,
+    pub source_change: SourceChange,
 }
 
 pub fn run(common: CommonConfig, config: DavImportConfig) -> Result<Summary, Error> {
@@ -126,6 +134,7 @@ fn run_into(
     };
 
     if !common.dry_run
+        && config.source_change == SourceChange::Reject
         && let Some((url, acc)) = db::sources::conflicting_source(
             &conn,
             config.kind.source_kind(),
@@ -133,11 +142,11 @@ fn run_into(
             &account_id,
         )
         .map_err(|e| Error::Partial(e.to_string()))?
-        && !config.allow_source_change
     {
         return Err(Error::SourceChange(format!(
             "archive already records {} source ({url}, account {acc}); \
-             pass --allow-source-change to import a different account",
+             pass --allow-source-change to import a different account, \
+             or --replace-source to drop the recorded one",
             config.kind.source_kind()
         )));
     }
@@ -152,11 +161,26 @@ fn run_into(
     }
 
     if common.dry_run {
+        if config.source_change == SourceChange::Replace && logger.enabled(LEVEL_DEFAULT) {
+            for (_, url, acc) in
+                db::sources::other_sources(&conn, &key.kind, &session_url, &account_id)?
+            {
+                eprintln!(
+                    "dry-run: would remove {} source {url} (account {acc})",
+                    key.kind
+                );
+            }
+        }
         let result = run_dry_diff(&conn, &client, &discovery, &config, logger, summary);
         summary.retries_observed = client.retries_observed();
         summary.retry_after_sleeps = client.retry_after_sleeps();
         return result;
     }
+
+    let removed = match config.source_change {
+        SourceChange::Replace => replace::remove_other_sources(&conn, &key, logger)?,
+        SourceChange::Reject | SourceChange::Allow => Removed::default(),
+    };
 
     let username = config.auth.username();
     let source_id = db::sources::upsert_source(&conn, &key, Some(&account_id), &username)
@@ -175,6 +199,7 @@ fn run_into(
     };
 
     *summary = phase.summary;
+    removed.add_to(summary);
     summary.retries_observed = client.retries_observed();
     summary.retry_after_sleeps = client.retry_after_sleeps();
     if let Some(e) = phase.error {

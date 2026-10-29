@@ -37,6 +37,27 @@ pub fn conflicting_source(
     .optional()
 }
 
+pub fn other_sources(
+    conn: &Connection,
+    kind: &str,
+    session_url: &str,
+    account_id: &str,
+) -> Result<Vec<(i64, String, String)>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, session_url, account_id FROM sources
+         WHERE kind = ?1 AND NOT (session_url = ?2 AND account_id = ?3) ORDER BY id",
+    )?;
+    stmt.query_map(params![kind, session_url, account_id], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })?
+    .collect()
+}
+
+pub fn delete_source(conn: &Connection, id: i64) -> Result<(), rusqlite::Error> {
+    conn.execute("DELETE FROM sources WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
 pub fn upsert_source(
     conn: &Connection,
     key: &SourceKey,
@@ -101,5 +122,21 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(conflict, ("https://a/jmap".to_owned(), "w".to_owned()));
+    }
+
+    #[test]
+    fn other_sources_lists_every_other_source_of_the_kind() {
+        let c = mem();
+        let a = upsert_source(&c, &key("https://a/jmap", "w"), None, "alice").unwrap();
+        let b = upsert_source(&c, &key("https://b/jmap", "w"), None, "alice").unwrap();
+        upsert_source(&c, &key("https://c/jmap", "w"), None, "alice").unwrap();
+        let others = other_sources(&c, "jmap", "https://c/jmap", "w").unwrap();
+        let ids: Vec<i64> = others.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids, [a, b]);
+        assert!(
+            other_sources(&c, "imap", "https://c/jmap", "w")
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -6,7 +6,7 @@
 
 use std::sync::Once;
 
-use base64::Engine;
+use encodify::base64::URL_SAFE_NO_PAD;
 use mockito::{Matcher, Server};
 use serde_json::json;
 use vandelay::exchange_graph::api::{Endpoints, collect_all_ids, paged_collect};
@@ -36,7 +36,6 @@ fn url_message_collection(server_url: &str, folder: &str, top: usize) -> String 
 }
 
 fn make_jwt(exp: u64, upn: &str) -> String {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"none\"}");
     let claims = format!(r#"{{"tid":"tenant-1","upn":"{upn}","exp":{exp}}}"#);
     let payload = URL_SAFE_NO_PAD.encode(claims.as_bytes());
@@ -186,7 +185,7 @@ fn pagination_collects_ids_across_three_pages_with_one_empty() {
     .to_string();
 
     let _m1 = server
-        .mock("GET", "/me/mailFolders/F1/messages?$top=100&$select=id")
+        .mock("GET", "/me/mailFolders/F1/messages?$top=100&$select=id,isRead,isDraft,isReadReceiptRequested,flag,categories")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(page1)
@@ -220,7 +219,7 @@ fn pagination_terminates_when_no_next_link_present() {
     let base = server.url();
     let body = json!({"value": [{"id": "A"}, {"id": "B"}]}).to_string();
     let _m = server
-        .mock("GET", "/me/mailFolders/F/messages?$top=100&$select=id")
+        .mock("GET", "/me/mailFolders/F/messages?$top=100&$select=id,isRead,isDraft,isReadReceiptRequested,flag,categories")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(body)
@@ -248,7 +247,7 @@ fn header_redelivery_is_asserted_via_mockito_match() {
     .to_string();
     let page2 = json!({"value": [{"id": "OnlyOnPageTwo"}]}).to_string();
     let _m1 = server
-        .mock("GET", "/me/mailFolders/F/messages?$top=100&$select=id")
+        .mock("GET", "/me/mailFolders/F/messages?$top=100&$select=id,isRead,isDraft,isReadReceiptRequested,flag,categories")
         .match_header("prefer", "IdType=\"ImmutableId\"")
         .match_header("authorization", "Bearer BEARER")
         .with_status(200)
@@ -275,7 +274,7 @@ fn case_sensitive_immutable_id_round_trip() {
     let id = "AAkAAGFsaWNlAAA=";
     let body = json!({"value": [{"id": id}]}).to_string();
     let _m = server
-        .mock("GET", "/me/mailFolders/F/messages?$top=100&$select=id")
+        .mock("GET", "/me/mailFolders/F/messages?$top=100&$select=id,isRead,isDraft,isReadReceiptRequested,flag,categories")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(body)
@@ -589,6 +588,9 @@ fn integration_dry_run_against_mock_server_lists_three_surfaces() {
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
+        exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     };
     let summary = vandelay::sync::import_exchange_graph::run(common, config).unwrap();
@@ -663,7 +665,7 @@ fn integration_full_run_mail_only_imports_mime_via_value() {
     })
     .collect();
     let _ids = server
-        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id")
+        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id,isRead,isDraft,isReadReceiptRequested,flag,categories")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"value":[{"id":"MSG-1"}]}"#)
@@ -698,6 +700,9 @@ fn integration_full_run_mail_only_imports_mime_via_value() {
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
+        exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     };
     drop(tmp);
@@ -759,7 +764,7 @@ fn integration_duplicate_message_id_does_not_abort_run() {
     })
     .collect();
     let _ids = server
-        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id")
+        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id,isRead,isDraft,isReadReceiptRequested,flag,categories")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"value":[{"id":"MSG-1"},{"id":"MSG-1"}]}"#)
@@ -794,6 +799,9 @@ fn integration_duplicate_message_id_does_not_abort_run() {
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
+        exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     };
     drop(tmp);
@@ -855,7 +863,7 @@ fn integration_full_run_is_convergent_on_second_invocation() {
             .create();
     }
     let _ids = server
-        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id")
+        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id,isRead,isDraft,isReadReceiptRequested,flag,categories")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"value":[{"id":"MSG-A"}]}"#)
@@ -883,6 +891,9 @@ fn integration_full_run_is_convergent_on_second_invocation() {
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
+        exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     };
     let make_common = |path: std::path::PathBuf| vandelay::sync::CommonConfig {
@@ -962,6 +973,9 @@ fn source_change_protection_refuses_a_different_account() {
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
+        exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     };
     let err = vandelay::sync::import_exchange_graph::run(common, config).unwrap_err();
@@ -1028,6 +1042,9 @@ fn make_config(
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
+        exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     }
 }
@@ -1144,10 +1161,30 @@ fn series_master_with_exception_merges_into_recurrence_overrides() {
         .with_header("content-type", "application/json")
         .with_body(
             r#"{"value":[
-                {"id":"MASTER","type":"seriesMaster","iCalUId":"uid-master"},
-                {"id":"EX","type":"exception","seriesMasterId":"MASTER","iCalUId":"uid-master"}
+                {"id":"MASTER","type":"seriesMaster","iCalUId":"uid-master"}
             ]}"#,
         )
+        .create();
+    server
+        .mock(
+            "GET",
+            Matcher::Regex(r"^/me/calendars/CAL1/calendarView\?startDateTime=".to_owned()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"value":[{
+                "id":"EX",
+                "iCalUId":"uid-master",
+                "type":"exception",
+                "seriesMasterId":"MASTER",
+                "originalStart":"2026-05-11T15:00:00Z",
+                "subject":"Moved sync",
+                "start":{"dateTime":"2026-05-11T16:00:00.0000000","timeZone":"UTC"},
+                "end":{"dateTime":"2026-05-11T17:00:00.0000000","timeZone":"UTC"}
+            }]}"#,
+        )
+        .expect_at_least(1)
         .create();
     server
         .mock("GET", "/me/events/MASTER")
@@ -1165,23 +1202,6 @@ fn series_master_with_exception_merges_into_recurrence_overrides() {
                     "pattern":{"type":"weekly","interval":1,"daysOfWeek":["monday"]},
                     "range":{"type":"noEnd"}
                 }
-            }"#,
-        )
-        .create();
-    server
-        .mock("GET", "/me/events/EX")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{
-                "id":"EX",
-                "iCalUId":"uid-master",
-                "type":"exception",
-                "seriesMasterId":"MASTER",
-                "originalStart":"2026-05-11T15:00:00Z",
-                "subject":"Moved sync",
-                "start":{"dateTime":"2026-05-11T16:00:00.0000000","timeZone":"UTC"},
-                "end":{"dateTime":"2026-05-11T17:00:00.0000000","timeZone":"UTC"}
             }"#,
         )
         .create();
@@ -1354,7 +1374,7 @@ fn hidden_mail_folder_has_is_subscribed_zero() {
     server
         .mock(
             "GET",
-            "/me/mailFolders/FVISIBLE/messages?$top=100&$select=id",
+            "/me/mailFolders/FVISIBLE/messages?$top=100&$select=id,isRead,isDraft,isReadReceiptRequested,flag,categories",
         )
         .with_status(200)
         .with_header("content-type", "application/json")
@@ -1363,7 +1383,7 @@ fn hidden_mail_folder_has_is_subscribed_zero() {
     server
         .mock(
             "GET",
-            "/me/mailFolders/FHIDDEN/messages?$top=100&$select=id",
+            "/me/mailFolders/FHIDDEN/messages?$top=100&$select=id,isRead,isDraft,isReadReceiptRequested,flag,categories",
         )
         .with_status(200)
         .with_header("content-type", "application/json")
@@ -1441,7 +1461,7 @@ fn well_known_folder_probes_assign_jmap_roles() {
         server
             .mock(
                 "GET",
-                format!("/me/mailFolders/{fid}/messages?$top=100&$select=id").as_str(),
+                format!("/me/mailFolders/{fid}/messages?$top=100&$select=id,isRead,isDraft,isReadReceiptRequested,flag,categories").as_str(),
             )
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -1515,7 +1535,7 @@ fn attachment_message_does_not_trigger_attachments_endpoint() {
         .create();
     stub_well_known_folders(&mut server, "FMAIL");
     server
-        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id")
+        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id,isRead,isDraft,isReadReceiptRequested,flag,categories")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"value":[{"id":"MSG-ATT"}]}"#)
@@ -1708,7 +1728,7 @@ fn full_run_records_graph_id_in_sync_id_exchange_graph_with_padding() {
     let _ids = server
         .mock(
             "GET",
-            "/me/mailFolders/AAkA-Padded%3D%3D/messages?$top=100&$select=id",
+            "/me/mailFolders/AAkA-Padded%3D%3D/messages?$top=100&$select=id,isRead,isDraft,isReadReceiptRequested,flag,categories",
         )
         .with_status(200)
         .with_header("content-type", "application/json")
@@ -1736,6 +1756,9 @@ fn full_run_records_graph_id_in_sync_id_exchange_graph_with_padding() {
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
+        exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     };
     drop(tmp);
@@ -1806,6 +1829,9 @@ fn archive_mailbox_kind_encodes_synthetic_suffix_in_account_id() {
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
+        exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     };
     drop(tmp);
@@ -1871,6 +1897,9 @@ fn allow_source_change_permits_overwriting_a_different_account() {
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
+        exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: true,
     };
     let result = vandelay::sync::import_exchange_graph::run(common, config);
@@ -1952,6 +1981,9 @@ fn dry_run_makes_no_per_item_get_and_no_sqlite_writes() {
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
+        exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: false,
     };
     drop(tmp);
@@ -2096,7 +2128,7 @@ fn folder_enumeration_failure_skips_vanished_deletion() {
             .create();
     }
     let _enum_fail = server
-        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id")
+        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id,isRead,isDraft,isReadReceiptRequested,flag,categories")
         .with_status(503)
         .with_body("transient outage")
         .create();
@@ -2120,6 +2152,9 @@ fn folder_enumeration_failure_skips_vanished_deletion() {
         event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
+        exception_window_years: 5,
+        contact_photos: false,
+        event_attachments: true,
         allow_source_change: true,
     };
     let _ = vandelay::sync::import_exchange_graph::run(common, config).unwrap();
@@ -2147,7 +2182,14 @@ fn stub_contacts_surface(server: &mut Server) {
         .mock("GET", "/me/contactFolders?$top=100")
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(r#"{"value":[{"id":"CON1","displayName":"Contacts"}]}"#)
+        .with_body(r#"{"value":[]}"#)
+        .expect_at_least(0)
+        .create();
+    server
+        .mock("GET", "/me/contactFolders/contacts")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"CON1","displayName":"Contacts","wellKnownName":"contacts"}"#)
         .expect_at_least(0)
         .create();
     server
@@ -2199,7 +2241,7 @@ fn stub_mail_surface(server: &mut Server) {
         .create();
     stub_well_known_folders(server, "FMAIL");
     server
-        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id")
+        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id,isRead,isDraft,isReadReceiptRequested,flag,categories")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"value":[{"id":"MSG-S"}]}"#)
@@ -2341,4 +2383,628 @@ fn mail_surface_imports_only_mailboxes_and_emails() {
     assert_eq!(row_count(&conn, "contact_cards"), 0);
     assert_eq!(row_count(&conn, "calendars"), 0);
     assert_eq!(row_count(&conn, "calendar_events"), 0);
+}
+
+fn stub_principal(server: &mut Server) {
+    server
+        .mock("GET", Matcher::Regex(r"^/me\?\$select=id".to_owned()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"uid","userPrincipalName":"alice@x.com"}"#)
+        .expect_at_least(0)
+        .create();
+}
+
+fn json_mock(server: &mut Server, path: &str, body: &str) {
+    server
+        .mock("GET", path)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(body)
+        .expect_at_least(0)
+        .create();
+}
+
+#[test]
+fn default_contact_folder_is_imported_although_contactfolders_omits_it() {
+    let mut server = Server::new();
+    stub_principal(&mut server);
+    json_mock(
+        &mut server,
+        "/me/contactFolders?$top=100",
+        r#"{"value":[]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contactFolders/contacts",
+        r#"{"id":"DEFAULT","displayName":"Contacts","wellKnownName":"contacts"}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contactFolders/DEFAULT/childFolders?$top=100",
+        r#"{"value":[]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contactFolders/DEFAULT/contacts?$top=100&$select=id",
+        r#"{"value":[{"id":"C1"},{"id":"C2"}]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contacts/C1",
+        r#"{"id":"C1","displayName":"Alice"}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contacts/C2",
+        r#"{"id":"C2","displayName":"Bob"}"#,
+    );
+
+    let base = server.url();
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    let summary = vandelay::sync::import_exchange_graph::run(
+        make_common(archive.clone()),
+        make_config(base, None, surfaces("contacts")),
+    )
+    .unwrap();
+
+    let count = |name: &str| {
+        summary
+            .per_type
+            .iter()
+            .find(|(t, _)| *t == name)
+            .map(|(_, c)| c.created)
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        count("addressbook"),
+        1,
+        "the default Contacts folder must become an address book even though \
+         /me/contactFolders never lists it"
+    );
+    assert_eq!(
+        count("contactcard"),
+        2,
+        "both default-folder contacts import"
+    );
+
+    let conn = vandelay::db::init::open(&archive).unwrap();
+    let is_default: i64 = conn
+        .query_row("SELECT is_default FROM address_books", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(is_default, 1, "the well-known folder is the default book");
+}
+
+#[test]
+fn default_contact_folder_falls_back_to_parent_of_an_existing_contact() {
+    let mut server = Server::new();
+    stub_principal(&mut server);
+    json_mock(
+        &mut server,
+        "/me/contactFolders?$top=100",
+        r#"{"value":[]}"#,
+    );
+    server
+        .mock("GET", "/me/contactFolders/contacts")
+        .with_status(404)
+        .with_body(r#"{"error":{"code":"ErrorItemNotFound"}}"#)
+        .expect_at_least(1)
+        .create();
+    json_mock(
+        &mut server,
+        "/me/contacts?$top=1&$select=id,parentFolderId",
+        r#"{"value":[{"id":"C1","parentFolderId":"DERIVED"}]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contactFolders/DERIVED",
+        r#"{"id":"DERIVED","displayName":"Kontakte"}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contactFolders/DERIVED/childFolders?$top=100",
+        r#"{"value":[]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contactFolders/DERIVED/contacts?$top=100&$select=id",
+        r#"{"value":[{"id":"C1"}]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contacts/C1",
+        r#"{"id":"C1","displayName":"Alice"}"#,
+    );
+
+    let base = server.url();
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    vandelay::sync::import_exchange_graph::run(
+        make_common(archive.clone()),
+        make_config(base, None, surfaces("contacts")),
+    )
+    .unwrap();
+
+    let conn = vandelay::db::init::open(&archive).unwrap();
+    let name: String = conn
+        .query_row("SELECT name FROM address_books", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        name, "Kontakte",
+        "when the well-known name is unavailable the folder is derived from a contact's parent"
+    );
+}
+
+#[test]
+fn contact_folder_reachable_by_two_paths_is_inserted_once() {
+    let mut server = Server::new();
+    stub_principal(&mut server);
+    json_mock(
+        &mut server,
+        "/me/contactFolders?$top=100",
+        r#"{"value":[{"id":"CHILD","displayName":"Work","parentFolderId":"DEFAULT"}]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contactFolders/contacts",
+        r#"{"id":"DEFAULT","displayName":"Contacts","wellKnownName":"contacts"}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contactFolders/DEFAULT/childFolders?$top=100",
+        r#"{"value":[{"id":"CHILD","displayName":"Work","parentFolderId":"DEFAULT"}]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contactFolders/CHILD/childFolders?$top=100",
+        r#"{"value":[]}"#,
+    );
+    for folder in ["DEFAULT", "CHILD"] {
+        json_mock(
+            &mut server,
+            &format!("/me/contactFolders/{folder}/contacts?$top=100&$select=id"),
+            r#"{"value":[]}"#,
+        );
+    }
+
+    let base = server.url();
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    let summary = vandelay::sync::import_exchange_graph::run(
+        make_common(archive.clone()),
+        make_config(base, None, surfaces("contacts")),
+    )
+    .expect("a folder reachable by two paths must not violate the id-mapping uniqueness");
+
+    let created = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "addressbook")
+        .map(|(_, c)| c.created)
+        .unwrap_or(0);
+    assert_eq!(
+        created, 2,
+        "the default folder and its one child, each once"
+    );
+}
+
+#[test]
+fn message_state_becomes_jmap_keywords() {
+    let mut server = Server::new();
+    stub_principal(&mut server);
+    json_mock(
+        &mut server,
+        "/me/mailFolders?$top=100&includeHiddenFolders=true",
+        r#"{"value":[{"id":"F1","displayName":"Inbox","isHidden":false}]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/mailFolders/F1/childFolders?$top=100&includeHiddenFolders=true",
+        r#"{"value":[]}"#,
+    );
+    for name in [
+        "inbox",
+        "drafts",
+        "sentitems",
+        "deleteditems",
+        "junkemail",
+        "archive",
+    ] {
+        server
+            .mock("GET", format!("/me/mailFolders/{name}?$select=id").as_str())
+            .with_status(404)
+            .expect_at_least(0)
+            .create();
+    }
+    json_mock(
+        &mut server,
+        "/me/mailFolders/F1/messages?$top=100&$select=id,isRead,isDraft,isReadReceiptRequested,flag,categories",
+        r#"{"value":[
+            {"id":"M1","isRead":true,"isDraft":false,"isReadReceiptRequested":true,
+             "flag":{"flagStatus":"flagged"},"categories":["Red Category","VIP"]},
+            {"id":"M2","isRead":false,"isDraft":true,
+             "flag":{"flagStatus":"notFlagged"},"categories":[]}
+        ]}"#,
+    );
+    for id in ["M1", "M2"] {
+        server
+            .mock("GET", format!("/me/messages/{id}/$value").as_str())
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body(format!(
+                "From: a@x.com\r\nTo: b@x.com\r\nSubject: {id}\r\nMessage-ID: <{id}@x>\r\n\r\nbody\r\n"
+            ))
+            .expect_at_least(0)
+            .create();
+    }
+
+    let base = server.url();
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    vandelay::sync::import_exchange_graph::run(
+        make_common(archive.clone()),
+        make_config(base, None, surfaces("mail")),
+    )
+    .unwrap();
+
+    let conn = vandelay::db::init::open(&archive).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT keywords FROM emails ORDER BY id")
+        .unwrap();
+    let rows: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    let all = rows.join(" ");
+    for expected in [
+        "$seen",
+        "$notified",
+        "$flagged",
+        "red category",
+        "vip",
+        "$draft",
+    ] {
+        assert!(all.contains(expected), "missing {expected} in {all}");
+    }
+}
+
+#[test]
+fn drive_items_import_as_file_nodes_and_skip_facetless_items() {
+    let mut server = Server::new();
+    stub_principal(&mut server);
+    json_mock(
+        &mut server,
+        "/me/drive/root?$select=id,name",
+        r#"{"id":"ROOT","name":"root"}"#,
+    );
+    let select = "id,name,size,folder,file,package,remoteItem,createdDateTime,lastModifiedDateTime";
+    json_mock(
+        &mut server,
+        &format!("/me/drive/items/ROOT/children?$top=100&$select={select}"),
+        r#"{"value":[
+            {"id":"D1","name":"Docs","folder":{"childCount":1},
+             "createdDateTime":"2026-01-01T00:00:00Z","lastModifiedDateTime":"2026-01-02T00:00:00Z"},
+            {"id":"V1","name":"Personal Vault","remoteItem":{},
+             "createdDateTime":"2026-01-01T00:00:00Z"},
+            {"id":"F1","name":"top.txt","size":5,"file":{"mimeType":"text/plain"},
+             "createdDateTime":"2026-01-01T00:00:00Z","lastModifiedDateTime":"2026-01-02T00:00:00Z"}
+        ]}"#,
+    );
+    json_mock(
+        &mut server,
+        &format!("/me/drive/items/D1/children?$top=100&$select={select}"),
+        r#"{"value":[
+            {"id":"F2","name":"inner.bin","size":3,"file":{"mimeType":"application/octet-stream"},
+             "createdDateTime":"2026-01-01T00:00:00Z"}
+        ]}"#,
+    );
+    for (id, body) in [("F1", "hello"), ("F2", "abc")] {
+        server
+            .mock("GET", format!("/me/drive/items/{id}/content").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body(body)
+            .expect_at_least(0)
+            .create();
+    }
+
+    let base = server.url();
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    let summary = vandelay::sync::import_exchange_graph::run(
+        make_common(archive.clone()),
+        make_config(base, None, surfaces("files")),
+    )
+    .unwrap();
+
+    let created = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "filenode")
+        .map(|(_, c)| c.created)
+        .unwrap_or(0);
+    assert_eq!(
+        created, 3,
+        "one directory and two files; the remoteItem has no file or folder facet and is skipped"
+    );
+
+    let conn = vandelay::db::init::open(&archive).unwrap();
+    let vault: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM file_nodes WHERE name = 'Personal Vault'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(vault, 0, "a facetless drive item must never become a node");
+
+    let nested: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM file_nodes child JOIN file_nodes parent
+               ON child.parent_id = parent.id
+             WHERE child.name = 'inner.bin' AND parent.name = 'Docs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(nested, 1, "child files hang off their directory");
+
+    let body: Vec<u8> = conn
+        .query_row(
+            "SELECT b.data FROM file_nodes f JOIN blobs b ON b.id = f.blob_id
+             WHERE f.name = 'top.txt'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(body, b"hello", "file content is stored verbatim");
+}
+
+fn stub_empty_calendar_scaffold(server: &mut Server) {
+    stub_principal(server);
+    json_mock(
+        server,
+        "/me/mailFolders?$top=100&includeHiddenFolders=true",
+        r#"{"value":[]}"#,
+    );
+    json_mock(
+        server,
+        "/me/mailboxSettings?$select=timeZone",
+        r#"{"timeZone":"UTC"}"#,
+    );
+    json_mock(server, "/me/contactFolders?$top=100", r#"{"value":[]}"#);
+}
+
+#[test]
+fn a_deleted_occurrence_becomes_an_excluded_override() {
+    let mut server = Server::new();
+    stub_empty_calendar_scaffold(&mut server);
+    json_mock(
+        &mut server,
+        "/me/calendars?$top=100",
+        r#"{"value":[{"id":"CAL1","name":"Calendar","isDefaultCalendar":true}]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/calendars/CAL1/events?$top=100&$select=id,type,seriesMasterId",
+        r#"{"value":[{"id":"MASTER","type":"seriesMaster","iCalUId":"uid-master"}]}"#,
+    );
+    let today = chrono::Utc::now().date_naive();
+    let start = today + chrono::Duration::days(10);
+    json_mock(
+        &mut server,
+        "/me/events/MASTER",
+        &format!(
+            r#"{{
+                "id":"MASTER","iCalUId":"uid-master","type":"seriesMaster",
+                "subject":"Daily standup",
+                "start":{{"dateTime":"{start}T09:00:00.0000000","timeZone":"UTC"}},
+                "end":{{"dateTime":"{start}T09:30:00.0000000","timeZone":"UTC"}},
+                "recurrence":{{
+                    "pattern":{{"type":"daily","interval":1}},
+                    "range":{{"type":"numbered","startDate":"{start}",
+                              "numberOfOccurrences":4}}
+                }}
+            }}"#,
+            start = start.format("%Y-%m-%d")
+        ),
+    );
+    server
+        .mock(
+            "GET",
+            Matcher::Regex(r"calendarView.*type%20eq%20%27exception%27".to_owned()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[]}"#)
+        .expect_at_least(1)
+        .create();
+    // Graph returns three of the four occurrences: the third was deleted, and a
+    // deleted occurrence is simply absent rather than reported as cancelled.
+    let occurrences = format!(
+        r#"{{"value":[
+            {{"id":"O1","type":"occurrence","seriesMasterId":"MASTER",
+              "start":{{"dateTime":"{d0}T09:00:00.0000000","timeZone":"UTC"}}}},
+            {{"id":"O2","type":"occurrence","seriesMasterId":"MASTER",
+              "start":{{"dateTime":"{d1}T09:00:00.0000000","timeZone":"UTC"}}}},
+            {{"id":"O4","type":"occurrence","seriesMasterId":"MASTER",
+              "start":{{"dateTime":"{d3}T09:00:00.0000000","timeZone":"UTC"}}}}
+        ]}}"#,
+        d0 = start.format("%Y-%m-%d"),
+        d1 = (start + chrono::Duration::days(1)).format("%Y-%m-%d"),
+        d3 = (start + chrono::Duration::days(3)).format("%Y-%m-%d"),
+    );
+    server
+        .mock(
+            "GET",
+            Matcher::Regex(r"calendarView.*type%20eq%20%27occurrence%27".to_owned()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(occurrences)
+        .expect_at_least(1)
+        .create();
+
+    let base = server.url();
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    vandelay::sync::import_exchange_graph::run(
+        make_common(archive.clone()),
+        make_config(base, None, surfaces("calendar")),
+    )
+    .unwrap();
+
+    let conn = vandelay::db::init::open(&archive).unwrap();
+    let row: String = conn
+        .query_row("SELECT data FROM calendar_events", [], |row| row.get(0))
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&row).unwrap();
+    let overrides = v["recurrenceOverrides"]
+        .as_object()
+        .expect("the missing occurrence produces an override");
+    let missing = format!(
+        "{}T09:00:00",
+        (start + chrono::Duration::days(2)).format("%Y-%m-%d")
+    );
+    assert_eq!(
+        overrides.len(),
+        1,
+        "only the absent occurrence is excluded; got {:?}",
+        overrides.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        overrides[&missing]["excluded"], true,
+        "v1.0 cannot report a cancelled occurrence, so it is inferred from the gap \
+         between the expanded rule and the occurrences Graph returned"
+    );
+}
+
+#[test]
+fn event_file_attachments_become_enclosure_links() {
+    let mut server = Server::new();
+    stub_empty_calendar_scaffold(&mut server);
+    json_mock(
+        &mut server,
+        "/me/calendars?$top=100",
+        r#"{"value":[{"id":"CAL1","name":"Calendar","isDefaultCalendar":true}]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/calendars/CAL1/events?$top=100&$select=id,type,seriesMasterId",
+        r#"{"value":[{"id":"EV","type":"singleInstance","iCalUId":"uid-ev"}]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/events/EV",
+        r#"{"id":"EV","iCalUId":"uid-ev","type":"singleInstance","subject":"With a file",
+            "hasAttachments":true,
+            "start":{"dateTime":"2026-05-04T15:00:00.0000000","timeZone":"UTC"},
+            "end":{"dateTime":"2026-05-04T16:00:00.0000000","timeZone":"UTC"}}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/events/EV/attachments",
+        r##"{"value":[
+            {"@odata.type":"#microsoft.graph.fileAttachment","id":"A1","name":"agenda.txt",
+             "contentType":"text/plain","size":5,"contentBytes":"aGVsbG8="},
+            {"@odata.type":"#microsoft.graph.itemAttachment","id":"A2","name":"nested.msg"},
+            {"@odata.type":"#microsoft.graph.referenceAttachment","id":"A3","name":"link"}
+        ]}"##,
+    );
+
+    let base = server.url();
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    vandelay::sync::import_exchange_graph::run(
+        make_common(archive.clone()),
+        make_config(base, None, surfaces("calendar")),
+    )
+    .unwrap();
+
+    let conn = vandelay::db::init::open(&archive).unwrap();
+    let row: String = conn
+        .query_row("SELECT data FROM calendar_events", [], |row| row.get(0))
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&row).unwrap();
+    let links = v["links"].as_object().expect("links present");
+    assert_eq!(
+        links.len(),
+        1,
+        "only fileAttachment carries bytes; item and reference attachments are skipped"
+    );
+    let link = &links["1"];
+    assert_eq!(link["rel"], "enclosure");
+    assert_eq!(link["title"], "agenda.txt");
+    assert_eq!(link["contentType"], "text/plain");
+    let blob: Vec<u8> = conn
+        .query_row(
+            "SELECT b.data FROM blobs b WHERE b.id = ?1",
+            [link["@blob"].as_i64().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(blob, b"hello");
+}
+
+#[test]
+fn contact_photo_categories_and_im_addresses_are_imported() {
+    let mut server = Server::new();
+    stub_principal(&mut server);
+    json_mock(
+        &mut server,
+        "/me/contactFolders?$top=100",
+        r#"{"value":[]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contactFolders/contacts",
+        r#"{"id":"DEFAULT","displayName":"Contacts","wellKnownName":"contacts"}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contactFolders/DEFAULT/childFolders?$top=100",
+        r#"{"value":[]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contactFolders/DEFAULT/contacts?$top=100&$select=id",
+        r#"{"value":[{"id":"C1"}]}"#,
+    );
+    json_mock(
+        &mut server,
+        "/me/contacts/C1",
+        r#"{"id":"C1","displayName":"Alice","categories":["Red Category","VIP"],
+            "imAddresses":["sip:alice@x.com",""]}"#,
+    );
+    // Graph reports image/jpeg for every contact photo regardless of the real bytes,
+    // so the stored mediaType has to come from the content itself.
+    server
+        .mock("GET", "/me/contacts/C1/photo/$value")
+        .with_status(200)
+        .with_header("content-type", "image/jpeg")
+        .with_body(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".as_slice())
+        .expect_at_least(1)
+        .create();
+
+    let base = server.url();
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    let mut config = make_config(base, None, surfaces("contacts"));
+    config.contact_photos = true;
+    vandelay::sync::import_exchange_graph::run(make_common(archive.clone()), config).unwrap();
+
+    let conn = vandelay::db::init::open(&archive).unwrap();
+    let row: String = conn
+        .query_row("SELECT data FROM contact_cards", [], |row| row.get(0))
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&row).unwrap();
+    assert_eq!(v["keywords"]["red category"], true);
+    assert_eq!(v["keywords"]["vip"], true);
+    assert_eq!(
+        v["onlineServices"]["1"]["uri"], "sip:alice@x.com",
+        "RFC 9553 2.3.2: a URI-shaped IM address belongs in uri, not user"
+    );
+    assert!(
+        v["onlineServices"].as_object().unwrap().len() == 1,
+        "the empty IM entry is dropped"
+    );
+    assert_eq!(v["media"]["photo"]["kind"], "photo");
+    assert_eq!(
+        v["media"]["photo"]["mediaType"], "image/png",
+        "the type is sniffed from the bytes, not taken from Graph's jpeg header"
+    );
 }

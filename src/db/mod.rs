@@ -6,6 +6,7 @@
 
 pub mod blobs;
 pub mod dav_ids;
+pub mod defaults;
 pub mod exchange_ews_ids;
 pub mod exchange_graph_ids;
 pub mod ids;
@@ -18,3 +19,4 @@ pub mod roles;
 pub mod sources;
 pub mod sync_state_jmap;
 pub mod takeout_ids;
+pub mod vacation_response;

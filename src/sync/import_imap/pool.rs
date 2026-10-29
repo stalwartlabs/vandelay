@@ -13,7 +13,6 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use crate::imap::client::{ConnectMode, ImapClient};
 use crate::imap::command;
 use crate::imap::error::ImapError;
-use crate::imap::name::encode_mailbox_name_with;
 use crate::imap::response::Untagged;
 use crate::imap::retry::{BackoffState, Disposition, RetryPolicy, classify};
 use crate::imap::transport::Connector;
@@ -26,6 +25,7 @@ pub const HARD_CAP: usize = 8;
 
 pub struct FetchJob {
     pub folder: String,
+    pub wire_name: String,
     pub uidvalidity: u32,
     pub uids: Vec<u32>,
 }
@@ -231,8 +231,7 @@ fn run_one_job(
     event_tx: &Sender<FetchEvent>,
 ) -> Result<(), ImapError> {
     if current_folder.as_deref() != Some(job.folder.as_str()) {
-        let wire = encode_mailbox_name_with(&job.folder, client.utf8_accept());
-        client.run_collect(&command::select(&wire))?;
+        client.run_collect(&command::select(&job.wire_name))?;
         *current_folder = Some(job.folder.clone());
     }
     let set = command::format_uid_set(&job.uids, true);

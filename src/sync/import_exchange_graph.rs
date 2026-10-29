@@ -7,6 +7,7 @@
 pub mod calendar;
 pub mod contacts;
 pub mod coordinator;
+pub mod files;
 pub mod folders;
 pub mod messages;
 

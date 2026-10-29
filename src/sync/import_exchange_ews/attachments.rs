@@ -4,8 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use encodify::base64::LENIENT;
 
 use crate::db::blobs;
 use crate::error::Error;
@@ -56,13 +55,12 @@ pub fn fetch_attachments(
         let resp = ctx.client.call(ctx.url, "GetAttachment", &body)?;
         let inline = parse_get_attachment_inline(&resp.body)?;
         for att in inline {
-            let cleaned = strip_ascii_whitespace(att.content_base64.as_bytes());
-            if cleaned.is_empty() {
-                continue;
-            }
-            let bytes = STANDARD.decode(&cleaned).map_err(|e| {
+            let bytes = LENIENT.decode(&att.content_base64).map_err(|e| {
                 EwsError::Malformed(format!("attachment {}: base64: {e}", att.attachment_id))
             })?;
+            if bytes.is_empty() {
+                continue;
+            }
             let media_type = att
                 .content_type
                 .unwrap_or_else(|| "application/octet-stream".to_owned());
@@ -78,26 +76,4 @@ pub fn fetch_attachments(
 
 pub fn intern_attachment(conn: &rusqlite::Connection, bytes: &[u8]) -> Result<i64, Error> {
     blobs::intern_blob(conn, bytes).map_err(|e| Error::Partial(e.to_string()))
-}
-
-fn strip_ascii_whitespace(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    for b in input {
-        if !matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
-            out.push(*b);
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::strip_ascii_whitespace;
-
-    #[test]
-    fn strips_whitespace_efficiently() {
-        let input = b"AB CD\nEF\tGH\r\nIJ";
-        let cleaned = strip_ascii_whitespace(input);
-        assert_eq!(cleaned, b"ABCDEFGHIJ");
-    }
 }

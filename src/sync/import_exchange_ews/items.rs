@@ -294,7 +294,7 @@ pub fn get_items(
         for chunk in ids.chunks(batch) {
             let body = get_item_body(shape, chunk, version);
             match ctx.client.call(ctx.url, "GetItem", &body) {
-                Ok(resp) => match parse_response_messages(&resp.body, b"GetItemResponseMessage") {
+                Ok(resp) => match parse_response_messages(&resp.body, "GetItemResponseMessage") {
                     Ok(mut msgs) => all.append(&mut msgs),
                     Err(e) if is_per_batch_fault(&e) => {
                         ctx.logger.warn(&format!(
@@ -331,7 +331,7 @@ pub fn get_items(
             let body = get_item_body(shape, &chunk, version);
             let n = chunk.len();
             let result = match client.call(&url, "GetItem", &body) {
-                Ok(resp) => parse_response_messages(&resp.body, b"GetItemResponseMessage"),
+                Ok(resp) => parse_response_messages(&resp.body, "GetItemResponseMessage"),
                 Err(e) => Err(e),
             };
             (n, result)

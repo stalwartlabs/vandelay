@@ -4,8 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use encodify::base64::LENIENT;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
@@ -164,18 +163,15 @@ fn apply_message(
     existing_local_id: Option<i64>,
     counts: &mut TypeCounts,
 ) -> Result<(), Error> {
-    let mime_b64 = match item.mime_content.as_ref() {
-        Some(s) => s.replace(['\n', '\r', ' ', '\t'], ""),
-        None => {
-            counts.skipped += 1;
-            ctx.logger.warn(&format!(
-                "message {} has no MimeContent; skipping",
-                item.id.id
-            ));
-            return Ok(());
-        }
+    let Some(mime_b64) = item.mime_content.as_ref() else {
+        counts.skipped += 1;
+        ctx.logger.warn(&format!(
+            "message {} has no MimeContent; skipping",
+            item.id.id
+        ));
+        return Ok(());
     };
-    let bytes = match STANDARD.decode(mime_b64.as_bytes()) {
+    let bytes = match LENIENT.decode(mime_b64) {
         Ok(b) => b,
         Err(e) => {
             counts.failed += 1;

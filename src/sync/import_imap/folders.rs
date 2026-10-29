@@ -22,6 +22,7 @@ pub struct FolderStatus {
 #[derive(Debug, Clone)]
 pub struct DiscoveredFolder {
     pub name: String,
+    pub wire_name: String,
     pub delimiter: Option<char>,
     pub attributes: Vec<String>,
     pub subscribed: bool,
@@ -32,11 +33,13 @@ pub struct DiscoveredFolder {
 #[derive(Debug, Clone)]
 pub struct ResolvedFolder {
     pub name: String,
+    pub wire_name: String,
     pub leaf: String,
     pub parent_path: Option<String>,
     pub delimiter: Option<char>,
     pub role: Option<&'static str>,
     pub subscribed: bool,
+    pub selectable: bool,
     pub status: Option<FolderStatus>,
 }
 
@@ -85,6 +88,7 @@ pub fn collect_from_list(
                     canonical.clone(),
                     DiscoveredFolder {
                         name: canonical,
+                        wire_name: name.clone(),
                         delimiter: *delimiter,
                         attributes: attributes.clone(),
                         subscribed: false,
@@ -128,16 +132,16 @@ pub fn apply_filters(
     folders: Vec<DiscoveredFolder>,
     filters: &FolderFilters,
 ) -> Vec<ResolvedFolder> {
-    let mut keep: Vec<DiscoveredFolder> = folders
-        .into_iter()
-        .filter(|f| f.selectable)
-        .filter(|f| match_filters(&f.name, filters))
-        .collect();
-    if filters.subscribed_only {
-        keep.retain(|f| f.subscribed);
-    }
-    let mut resolved: Vec<ResolvedFolder> = Vec::with_capacity(keep.len());
-    for f in keep {
+    let mut resolved: Vec<ResolvedFolder> = Vec::with_capacity(folders.len());
+    let mut others: HashMap<String, DiscoveredFolder> = HashMap::new();
+    for f in folders {
+        if !f.selectable
+            || !match_filters(&f.name, filters)
+            || (filters.subscribed_only && !f.subscribed)
+        {
+            others.insert(f.name.clone(), f);
+            continue;
+        }
         let role = automap::role_for_folder(
             &f.name,
             &f.attributes,
@@ -150,20 +154,77 @@ pub fn apply_filters(
                 .iter()
                 .any(|s| s.eq_ignore_ascii_case(r))
         {
+            others.insert(f.name.clone(), f);
             continue;
         }
-        let delim = f.delimiter;
-        let (leaf, parent_path) = split_parent(&f.name, delim);
+        let (leaf, parent_path) = split_parent(&f.name, f.delimiter);
         resolved.push(ResolvedFolder {
             name: f.name,
+            wire_name: f.wire_name,
             leaf,
             parent_path,
-            delimiter: delim,
+            delimiter: f.delimiter,
             role,
             subscribed: f.subscribed,
+            selectable: true,
             status: f.status,
         });
     }
+    let mut present: HashSet<String> = resolved.iter().map(|f| f.name.clone()).collect();
+    let mut structural: Vec<ResolvedFolder> = Vec::new();
+    for child in &resolved {
+        let mut parent = child.parent_path.clone();
+        let mut child_wire = child.wire_name.clone();
+        let mut delim = child.delimiter;
+        while let Some(name) = parent {
+            if present.contains(&name) {
+                break;
+            }
+            let ancestor = match others.remove(&name) {
+                Some(d) => {
+                    let delimiter = d.delimiter.or(delim);
+                    let (leaf, parent_path) = split_parent(&d.name, delimiter);
+                    ResolvedFolder {
+                        name: d.name,
+                        wire_name: d.wire_name,
+                        leaf,
+                        parent_path,
+                        delimiter,
+                        role: None,
+                        subscribed: d.subscribed,
+                        selectable: false,
+                        status: None,
+                    }
+                }
+                None => {
+                    let wire_name = match delim {
+                        Some(d) => child_wire
+                            .rsplit_once(d)
+                            .map_or_else(|| name.clone(), |(p, _)| p.to_owned()),
+                        None => name.clone(),
+                    };
+                    let (leaf, parent_path) = split_parent(&name, delim);
+                    ResolvedFolder {
+                        name,
+                        wire_name,
+                        leaf,
+                        parent_path,
+                        delimiter: delim,
+                        role: None,
+                        subscribed: false,
+                        selectable: false,
+                        status: None,
+                    }
+                }
+            };
+            present.insert(ancestor.name.clone());
+            parent = ancestor.parent_path.clone();
+            child_wire.clone_from(&ancestor.wire_name);
+            delim = ancestor.delimiter;
+            structural.push(ancestor);
+        }
+    }
+    resolved.extend(structural);
     resolved
 }
 
@@ -437,29 +498,35 @@ mod tests {
         let mut r = vec![
             ResolvedFolder {
                 name: "Projects/Alpha".into(),
+                wire_name: "Projects/Alpha".into(),
                 leaf: "Alpha".into(),
                 parent_path: Some("Projects".into()),
                 delimiter: Some('/'),
                 role: None,
                 subscribed: false,
+                selectable: true,
                 status: None,
             },
             ResolvedFolder {
                 name: "INBOX".into(),
+                wire_name: "INBOX".into(),
                 leaf: "INBOX".into(),
                 parent_path: None,
                 delimiter: Some('/'),
                 role: Some("inbox"),
                 subscribed: true,
+                selectable: true,
                 status: None,
             },
             ResolvedFolder {
                 name: "Projects".into(),
+                wire_name: "Projects".into(),
                 leaf: "Projects".into(),
                 parent_path: None,
                 delimiter: Some('/'),
                 role: None,
                 subscribed: false,
+                selectable: true,
                 status: None,
             },
         ];
@@ -500,5 +567,132 @@ mod tests {
         ];
         let folders = collect_from_list(&resps, false).unwrap();
         assert_eq!(folders.len(), 1);
+    }
+
+    fn find<'a>(res: &'a [ResolvedFolder], name: &str) -> &'a ResolvedFolder {
+        res.iter().find(|f| f.name == name).unwrap()
+    }
+
+    #[test]
+    fn noselect_parent_is_kept_as_structural() {
+        let folders = collect_from_list(
+            &[
+                lst("INBOX", "/", &["\\HasChildren"]),
+                lst("INBOX/Projects", "/", &["\\Noselect", "\\HasChildren"]),
+                lst("INBOX/Projects/Invoices", "/", &["\\HasNoChildren"]),
+            ],
+            false,
+        )
+        .unwrap();
+        let mut res = apply_filters(folders, &filters_default());
+        sort_by_depth(&mut res);
+        let names: Vec<&str> = res.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["INBOX", "INBOX/Projects", "INBOX/Projects/Invoices"]
+        );
+        let projects = find(&res, "INBOX/Projects");
+        assert!(!projects.selectable);
+        assert_eq!(projects.role, None);
+        assert_eq!(projects.leaf, "Projects");
+        assert_eq!(projects.parent_path.as_deref(), Some("INBOX"));
+        assert!(find(&res, "INBOX/Projects/Invoices").selectable);
+    }
+
+    #[test]
+    fn noselect_without_kept_children_is_dropped() {
+        let folders = collect_from_list(
+            &[lst("INBOX", "/", &[]), lst("Empty", "/", &["\\Noselect"])],
+            false,
+        )
+        .unwrap();
+        let res = apply_filters(folders, &filters_default());
+        assert_eq!(res.len(), 1);
+    }
+
+    #[test]
+    fn consecutive_structural_ancestors_and_synthesised_ones() {
+        let folders = collect_from_list(
+            &[lst("A", "/", &["\\NonExistent"]), lst("A/B/C/D", "/", &[])],
+            false,
+        )
+        .unwrap();
+        let mut res = apply_filters(folders, &filters_default());
+        sort_by_depth(&mut res);
+        let names: Vec<&str> = res.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["A", "A/B", "A/B/C", "A/B/C/D"]);
+        assert!(
+            res.iter()
+                .take(3)
+                .all(|f| !f.selectable && f.role.is_none())
+        );
+        assert_eq!(find(&res, "A/B/C").wire_name, "A/B/C");
+        assert_eq!(find(&res, "A/B").leaf, "B");
+    }
+
+    #[test]
+    fn trailing_space_and_same_leaf_under_different_parents() {
+        let folders = collect_from_list(
+            &[
+                lst("Work ", ".", &["\\Noselect"]),
+                lst("Work", ".", &[]),
+                lst("Work .Archive", ".", &[]),
+                lst("Work.Archive", ".", &[]),
+            ],
+            false,
+        )
+        .unwrap();
+        let res = apply_filters(folders, &filters_default());
+        assert_eq!(res.len(), 4);
+        let spaced = find(&res, "Work ");
+        assert!(!spaced.selectable);
+        assert_eq!(spaced.leaf, "Work ");
+        assert_eq!(
+            find(&res, "Work .Archive").parent_path.as_deref(),
+            Some("Work ")
+        );
+        assert_eq!(
+            find(&res, "Work.Archive").parent_path.as_deref(),
+            Some("Work")
+        );
+        assert!(find(&res, "Work").selectable);
+    }
+
+    #[test]
+    fn synthesised_ancestor_derives_wire_name_from_child() {
+        let folders = collect_from_list(&[lst("&ZeVnLIqe-/Sub", "/", &[])], false).unwrap();
+        let res = apply_filters(folders, &filters_default());
+        let parent = find(&res, "日本語");
+        assert_eq!(parent.wire_name, "&ZeVnLIqe-");
+        assert!(!parent.selectable);
+    }
+
+    #[test]
+    fn filters_keep_needed_ancestors_as_structural() {
+        let list = [
+            lst("INBOX", "/", &[]),
+            lst("Projects", "/", &[]),
+            lst("Projects/Alpha", "/", &["\\Noselect"]),
+            lst("Projects/Alpha/Docs", "/", &["\\Subscribed"]),
+            lst("Other", "/", &[]),
+        ];
+        let check = |res: Vec<ResolvedFolder>| {
+            assert_eq!(res.len(), 3, "{res:?}");
+            assert!(!find(&res, "Projects").selectable);
+            assert!(!find(&res, "Projects/Alpha").selectable);
+            assert!(find(&res, "Projects/Alpha/Docs").selectable);
+        };
+        let mut f = filters_default();
+        f.include = vec![Regex::new("Docs$").unwrap()];
+        check(apply_filters(collect_from_list(&list, false).unwrap(), &f));
+        let mut f = filters_default();
+        f.exclude = vec![Regex::new("^(INBOX|Other|Projects)$").unwrap()];
+        check(apply_filters(collect_from_list(&list, false).unwrap(), &f));
+        let mut f = filters_default();
+        f.explicit = vec!["Projects/Alpha/Docs".to_owned()];
+        check(apply_filters(collect_from_list(&list, false).unwrap(), &f));
+        let mut f = filters_default();
+        f.subscribed_only = true;
+        check(apply_filters(collect_from_list(&list, false).unwrap(), &f));
     }
 }

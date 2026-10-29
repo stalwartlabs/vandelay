@@ -12,10 +12,8 @@ use super::common::{create_batch, target_get_all};
 use super::{Maps, Net, Plan};
 use crate::error::Error;
 use crate::logging::Logger;
-use crate::sync::import_jmap::mapping::{
-    IDENTITY_SELECT, PARTICIPANT_IDENTITY_SELECT, row_to_identity, row_to_participant_identity,
-};
-use crate::sync::keys::{identity_key, participant_identity_key};
+use crate::sync::import_jmap::mapping::{IDENTITY_SELECT, row_to_identity};
+use crate::sync::keys::identity_key;
 use crate::sync::{Context, TypeCounts};
 use crate::types::ObjectType;
 
@@ -94,50 +92,6 @@ pub fn reconcile_identity(
             Some(identity_key(
                 t.get("name").and_then(Value::as_str).unwrap_or(""),
                 t.get("email").and_then(Value::as_str).unwrap_or(""),
-            ))
-        },
-        rows,
-    )
-}
-
-pub fn reconcile_participant(
-    ctx: &Context,
-    net: &Net,
-    _maps: &mut Maps,
-    counts: &mut TypeCounts,
-    logger: &Logger,
-) -> Result<Plan, Error> {
-    let mut stmt = ctx
-        .conn
-        .prepare(PARTICIPANT_IDENTITY_SELECT)
-        .map_err(|e| Error::Partial(e.to_string()))?;
-    let rows: Vec<(i64, [u8; 32], Value)> = stmt
-        .query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            Ok((id, row_to_participant_identity(row)))
-        })
-        .and_then(|m| m.collect::<Result<Vec<_>, _>>())
-        .map_err(|e| Error::Partial(e.to_string()))?
-        .into_iter()
-        .map(|(id, w)| {
-            let w = w.map_err(Error::from)?;
-            let key = participant_identity_key(&w.calendar_address, &w.name);
-            let v = serde_json::to_value(&w).map_err(|e| Error::Partial(e.to_string()))?;
-            Ok((id, key, v))
-        })
-        .collect::<Result<_, Error>>()?;
-    drop(stmt);
-    run(
-        net,
-        ObjectType::ParticipantIdentity,
-        counts,
-        logger,
-        |t| {
-            Some(participant_identity_key(
-                t.get("calendarAddress")
-                    .and_then(Value::as_str)
-                    .unwrap_or(""),
-                t.get("name").and_then(Value::as_str).unwrap_or(""),
             ))
         },
         rows,

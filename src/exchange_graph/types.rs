@@ -64,6 +64,7 @@ pub struct Surfaces {
     pub mail: bool,
     pub calendar: bool,
     pub contacts: bool,
+    pub files: bool,
 }
 
 impl Default for Surfaces {
@@ -77,12 +78,14 @@ impl Surfaces {
         mail: true,
         calendar: true,
         contacts: true,
+        files: true,
     };
 
     pub const NONE: Surfaces = Surfaces {
         mail: false,
         calendar: false,
         contacts: false,
+        files: false,
     };
 
     pub fn parse_list(list: &str) -> Result<Surfaces, Error> {
@@ -96,9 +99,10 @@ impl Surfaces {
                 "mail" => selected.mail = true,
                 "calendar" => selected.calendar = true,
                 "contacts" => selected.contacts = true,
+                "files" => selected.files = true,
                 _ => {
                     return Err(Error::Usage(format!(
-                        "unknown surface: {token} (valid: mail, calendar, contacts)"
+                        "unknown surface: {token} (valid: mail, calendar, contacts, files)"
                     )));
                 }
             }
@@ -158,7 +162,7 @@ mod tests {
     #[test]
     fn surfaces_default_is_all_three() {
         let all = Surfaces::default();
-        assert!(all.mail && all.calendar && all.contacts);
+        assert!(all.mail && all.calendar && all.contacts && all.files);
     }
 
     #[test]
@@ -168,7 +172,8 @@ mod tests {
             Surfaces {
                 mail: true,
                 calendar: false,
-                contacts: false
+                contacts: false,
+                files: false
             }
         );
         assert_eq!(
@@ -176,7 +181,8 @@ mod tests {
             Surfaces {
                 mail: false,
                 calendar: true,
-                contacts: false
+                contacts: false,
+                files: false
             }
         );
         assert_eq!(
@@ -184,7 +190,8 @@ mod tests {
             Surfaces {
                 mail: false,
                 calendar: false,
-                contacts: true
+                contacts: true,
+                files: false
             }
         );
     }
@@ -192,7 +199,7 @@ mod tests {
     #[test]
     fn surfaces_parse_is_case_insensitive() {
         assert_eq!(
-            Surfaces::parse_list("Mail,CALENDAR,Contacts").unwrap(),
+            Surfaces::parse_list("Mail,CALENDAR,Contacts,Files").unwrap(),
             Surfaces::ALL
         );
     }
@@ -204,7 +211,8 @@ mod tests {
             Surfaces {
                 mail: true,
                 calendar: false,
-                contacts: true
+                contacts: true,
+                files: false
             }
         );
     }

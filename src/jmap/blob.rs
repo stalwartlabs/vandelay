@@ -4,8 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use encodify::base64::STANDARD;
 use serde_json::{Map, Value};
 
 use crate::jmap::error::JmapError;
@@ -14,6 +13,7 @@ pub const SENTINEL_KEY: &str = "@blob";
 
 const DEFAULT_MEDIA_TYPE: &str = "application/octet-stream";
 const MEDIA_TYPE_KEYS: [&str; 2] = ["mediaType", "contentType"];
+const DATA_URI_OVERHEAD: usize = "data:;base64,".len();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InlineShape {
@@ -103,11 +103,13 @@ fn data_uri(map: &Map<String, Value>, bytes: &[u8]) -> String {
         .iter()
         .find_map(|k| map.get(*k).and_then(Value::as_str).and_then(uri_media_type))
         .unwrap_or_else(|| DEFAULT_MEDIA_TYPE.to_owned());
-    let mut uri = String::with_capacity(13 + media_type.len() + bytes.len().div_ceil(3) * 4);
+    let mut uri = String::with_capacity(
+        DATA_URI_OVERHEAD + media_type.len() + STANDARD.encoded_len(bytes.len()),
+    );
     uri.push_str("data:");
     uri.push_str(&media_type);
     uri.push_str(";base64,");
-    STANDARD.encode_string(bytes, &mut uri);
+    STANDARD.encode_append(bytes, &mut uri);
     uri
 }
 

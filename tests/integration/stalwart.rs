@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use base64::Engine;
+use encodify::base64::STANDARD;
 use serde_json::Value;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::SyncRunner;
@@ -74,7 +74,7 @@ impl Stalwart {
             .with_mapped_port(sieve_port, SIEVE_PORT.tcp())
             .with_startup_timeout(Duration::from_secs(180));
 
-        let container = request.start()?;
+        let container = request.pull_image()?.start()?;
 
         let me = Self {
             _container: container,
@@ -183,8 +183,7 @@ fn basic(user: &str, password: &str) -> String {
     raw.push_str(user);
     raw.push(':');
     raw.push_str(password);
-    format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(raw.as_bytes())
-    )
+    let mut header = String::from("Basic ");
+    STANDARD.encode_append(raw, &mut header);
+    header
 }

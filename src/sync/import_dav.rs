@@ -8,9 +8,10 @@ pub mod calcard;
 pub mod collections;
 pub mod coordinator;
 pub mod items;
+pub mod replace;
 pub mod tree;
 
-pub use coordinator::{DavAuth, DavImportConfig, DavKindArg, run, run_reporting};
+pub use coordinator::{DavAuth, DavImportConfig, DavKindArg, SourceChange, run, run_reporting};
 
 use crate::error::Error;
 use crate::jmap::error::JmapError;

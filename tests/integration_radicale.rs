@@ -20,7 +20,7 @@ use rusqlite::Connection;
 use serde_json::Value;
 use vandelay::error::Error;
 use vandelay::sync::import_dav;
-use vandelay::sync::import_dav::{DavAuth, DavImportConfig, DavKindArg};
+use vandelay::sync::import_dav::{DavAuth, DavImportConfig, DavKindArg, SourceChange};
 
 fn dav_config(kind: DavKindArg, account: &Account, http: &Endpoint) -> DavImportConfig {
     DavImportConfig {
@@ -33,7 +33,7 @@ fn dav_config(kind: DavKindArg, account: &Account, http: &Endpoint) -> DavImport
         allow_cleartext: true,
         dav_connections: 2,
         multiget_batch: 25,
-        allow_source_change: false,
+        source_change: SourceChange::Reject,
     }
 }
 

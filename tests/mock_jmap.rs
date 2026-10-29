@@ -331,8 +331,9 @@ fn principal_substring_prefilter_rejects_near_matches() {
                 ["Principal/get", { "list": [
                     { "id": "p1", "name": "alice2", "accounts": {} },
                     { "id": "p2", "name": "alice", "accounts": {
-                        "w": { "urn:ietf:params:jmap:principals:owner":
-                               { "accountIdForPrincipal": "w" } } } }
+                        "w": { "name": "alice", "accountCapabilities": {
+                            "urn:ietf:params:jmap:principals:owner":
+                                { "accountIdForPrincipal": "admin", "principalId": "p2" } } } } }
                 ] }, "g"]
             ] })
             .to_string(),

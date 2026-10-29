@@ -26,9 +26,9 @@ fn classify(ns: &ResolveResult<'_>) -> Ns {
     match ns {
         ResolveResult::Bound(prefix) => {
             let p = prefix.as_ref();
-            if p == NS_MESSAGES.as_bytes() {
+            if p == NS_MESSAGES {
                 Ns::Messages
-            } else if p == NS_TYPES.as_bytes() {
+            } else if p == NS_TYPES {
                 Ns::Types
             } else {
                 Ns::Other
@@ -38,18 +38,18 @@ fn classify(ns: &ResolveResult<'_>) -> Ns {
     }
 }
 
-fn is(ns: Ns, local: &[u8], expected_ns: Ns, target: &[u8]) -> bool {
+fn is(ns: Ns, local: &str, expected_ns: Ns, target: &str) -> bool {
     ns == expected_ns && local.eq_ignore_ascii_case(target)
 }
 
-fn attr_value(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
+fn attr_value(e: &BytesStart<'_>, name: &str) -> Option<String> {
     for a in e.attributes().flatten() {
         let key = a.key.local_name();
         if key.as_ref().eq_ignore_ascii_case(name) {
             return Some(
                 a.normalized_value(XmlVersion::Implicit1_0)
                     .map(|c| c.into_owned())
-                    .unwrap_or_else(|_| String::from_utf8_lossy(a.value.as_ref()).into_owned()),
+                    .unwrap_or_else(|_| a.value.into_owned()),
             );
         }
     }
@@ -63,10 +63,10 @@ fn capture_id_attrs(e: &BytesStart<'_>, id_out: &mut String, ck_out: &mut String
         let v = a
             .normalized_value(XmlVersion::Implicit1_0)
             .map(|c| c.into_owned())
-            .unwrap_or_else(|_| String::from_utf8_lossy(a.value.as_ref()).into_owned());
-        if kb.eq_ignore_ascii_case(b"Id") {
+            .unwrap_or_else(|_| a.value.into_owned());
+        if kb.eq_ignore_ascii_case("Id") {
             *id_out = v;
-        } else if kb.eq_ignore_ascii_case(b"ChangeKey") {
+        } else if kb.eq_ignore_ascii_case("ChangeKey") {
             *ck_out = v;
         }
     }
@@ -94,16 +94,16 @@ fn read_version_attrs(e: &BytesStart<'_>, out: &mut ServerVersionInfo) {
     for a in e.attributes().flatten() {
         let key = a.key.local_name();
         let kb = key.as_ref();
-        let v = String::from_utf8_lossy(a.value.as_ref()).into_owned();
-        if kb.eq_ignore_ascii_case(b"MajorVersion") {
+        let v = a.value.into_owned();
+        if kb.eq_ignore_ascii_case("MajorVersion") {
             out.major_version = v.parse().ok();
-        } else if kb.eq_ignore_ascii_case(b"MinorVersion") {
+        } else if kb.eq_ignore_ascii_case("MinorVersion") {
             out.minor_version = v.parse().ok();
-        } else if kb.eq_ignore_ascii_case(b"MajorBuildNumber") {
+        } else if kb.eq_ignore_ascii_case("MajorBuildNumber") {
             out.major_build = v.parse().ok();
-        } else if kb.eq_ignore_ascii_case(b"MinorBuildNumber") {
+        } else if kb.eq_ignore_ascii_case("MinorBuildNumber") {
             out.minor_build = v.parse().ok();
-        } else if kb.eq_ignore_ascii_case(b"Version") {
+        } else if kb.eq_ignore_ascii_case("Version") {
             out.version = Some(v);
         }
     }
@@ -140,13 +140,13 @@ pub fn read_envelope_summary(bytes: &[u8]) -> Result<EnvelopeKind, EwsError> {
         let ns_kind = classify(&ns);
         match ev {
             Event::Start(ref e) | Event::Empty(ref e) => {
-                let local = e.local_name().as_ref().to_vec();
-                if is(ns_kind, &local, Ns::Types, b"ServerVersionInfo") {
+                let local = e.local_name().as_ref().to_owned();
+                if is(ns_kind, &local, Ns::Types, "ServerVersionInfo") {
                     read_version_attrs(e, &mut version);
-                } else if local.eq_ignore_ascii_case(b"Fault") {
+                } else if local.eq_ignore_ascii_case("Fault") {
                     let fault = parse_fault(&mut xml)?;
                     return Ok(EnvelopeKind::Fault { version, fault });
-                } else if local.eq_ignore_ascii_case(b"Body") {
+                } else if local.eq_ignore_ascii_case("Body") {
                     seen_body = true;
                 }
             }
@@ -177,24 +177,24 @@ fn parse_fault<R: BufRead>(xml: &mut NsReader<R>) -> Result<SoapFault, EwsError>
         match ev {
             Event::Start(e) => {
                 depth += 1;
-                let local = e.local_name().as_ref().to_vec();
-                if local.eq_ignore_ascii_case(b"faultcode") {
+                let local = e.local_name().as_ref().to_owned();
+                if local.eq_ignore_ascii_case("faultcode") {
                     text_target = Some("faultcode");
-                } else if local.eq_ignore_ascii_case(b"faultstring") {
+                } else if local.eq_ignore_ascii_case("faultstring") {
                     text_target = Some("faultstring");
-                } else if local.eq_ignore_ascii_case(b"ResponseCode") {
+                } else if local.eq_ignore_ascii_case("ResponseCode") {
                     text_target = Some("responseCode");
-                } else if local.eq_ignore_ascii_case(b"Value") && ns_kind == Ns::Types {
-                    last_value_name = attr_value(&e, b"Name");
+                } else if local.eq_ignore_ascii_case("Value") && ns_kind == Ns::Types {
+                    last_value_name = attr_value(&e, "Name");
                     text_target = Some("messageXmlValue");
                 } else {
                     text_target = None;
                 }
             }
             Event::Empty(e) => {
-                let local = e.local_name().as_ref().to_vec();
-                if is(ns_kind, &local, Ns::Types, b"Value") {
-                    last_value_name = attr_value(&e, b"Name");
+                let local = e.local_name().as_ref().to_owned();
+                if is(ns_kind, &local, Ns::Types, "Value") {
+                    last_value_name = attr_value(&e, "Name");
                 }
             }
             Event::End(_) => {
@@ -208,7 +208,7 @@ fn parse_fault<R: BufRead>(xml: &mut NsReader<R>) -> Result<SoapFault, EwsError>
                 }
             }
             Event::Text(t) => {
-                let text = t.decode().map(|c| c.into_owned()).unwrap_or_default();
+                let text = t.into_inner().into_owned();
                 match text_target {
                     Some("faultcode") => fault_code = text,
                     Some("faultstring") => fault_string.push_str(&text),
@@ -222,7 +222,7 @@ fn parse_fault<R: BufRead>(xml: &mut NsReader<R>) -> Result<SoapFault, EwsError>
                 }
             }
             Event::CData(c) if text_target == Some("faultstring") => {
-                fault_string.push_str(&String::from_utf8_lossy(c.as_ref()));
+                fault_string.push_str(&c);
             }
             Event::GeneralRef(ref g) if text_target == Some("faultstring") => {
                 if let Some(c) = entity_to_char(g) {
@@ -291,16 +291,16 @@ pub enum FolderElement {
 }
 
 impl FolderElement {
-    fn from_local(local: &[u8]) -> Option<FolderElement> {
-        if local.eq_ignore_ascii_case(b"Folder") {
+    fn from_local(local: &str) -> Option<FolderElement> {
+        if local.eq_ignore_ascii_case("Folder") {
             Some(FolderElement::Folder)
-        } else if local.eq_ignore_ascii_case(b"CalendarFolder") {
+        } else if local.eq_ignore_ascii_case("CalendarFolder") {
             Some(FolderElement::CalendarFolder)
-        } else if local.eq_ignore_ascii_case(b"ContactsFolder") {
+        } else if local.eq_ignore_ascii_case("ContactsFolder") {
             Some(FolderElement::ContactsFolder)
-        } else if local.eq_ignore_ascii_case(b"TasksFolder") {
+        } else if local.eq_ignore_ascii_case("TasksFolder") {
             Some(FolderElement::TasksFolder)
-        } else if local.eq_ignore_ascii_case(b"SearchFolder") {
+        } else if local.eq_ignore_ascii_case("SearchFolder") {
             Some(FolderElement::SearchFolder)
         } else {
             None
@@ -319,12 +319,12 @@ pub fn parse_find_folder_response(body: &[u8]) -> Result<FindFolderResponse, Ews
         let ns_kind = classify(&ns);
         match ev {
             Event::Start(ref e) | Event::Empty(ref e) => {
-                let local = e.local_name().as_ref().to_vec();
-                if is(ns_kind, &local, Ns::Messages, b"RootFolder") {
-                    if let Some(v) = attr_value(e, b"TotalItemsInView") {
+                let local = e.local_name().as_ref().to_owned();
+                if is(ns_kind, &local, Ns::Messages, "RootFolder") {
+                    if let Some(v) = attr_value(e, "TotalItemsInView") {
                         out.total_in_view = v.trim().parse().ok();
                     }
-                    if let Some(v) = attr_value(e, b"IncludesLastItemInRange") {
+                    if let Some(v) = attr_value(e, "IncludesLastItemInRange") {
                         out.more = !matches!(v.trim(), "true" | "1");
                     }
                 } else if ns_kind == Ns::Types
@@ -352,7 +352,7 @@ pub fn parse_folder_inner(inner_xml: &str) -> Result<Option<FolderEntry>, EwsErr
         match ev {
             Event::Start(_) | Event::Empty(_) => {
                 let local = match &ev {
-                    Event::Start(e) | Event::Empty(e) => e.local_name().as_ref().to_vec(),
+                    Event::Start(e) | Event::Empty(e) => e.local_name().as_ref().to_owned(),
                     _ => continue,
                 };
                 if ns_kind == Ns::Types
@@ -379,7 +379,7 @@ pub fn parse_get_folder_response(body: &[u8]) -> Result<Vec<FolderEntry>, EwsErr
         match ev {
             Event::Start(_) | Event::Empty(_) => {
                 let local = match &ev {
-                    Event::Start(e) | Event::Empty(e) => e.local_name().as_ref().to_vec(),
+                    Event::Start(e) | Event::Empty(e) => e.local_name().as_ref().to_owned(),
                     _ => continue,
                 };
                 if ns_kind == Ns::Types
@@ -419,31 +419,31 @@ fn parse_folder_element<R: BufRead>(
                 if !is_empty {
                     depth += 1;
                 }
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().to_owned();
                 if ns_kind == Ns::Types {
-                    if local.eq_ignore_ascii_case(b"FolderId") {
+                    if local.eq_ignore_ascii_case("FolderId") {
                         capture_id_attrs(
                             e,
                             &mut entry.folder_id.id,
                             &mut entry.folder_id.change_key,
                         );
-                    } else if local.eq_ignore_ascii_case(b"ParentFolderId") {
+                    } else if local.eq_ignore_ascii_case("ParentFolderId") {
                         let mut pid = String::new();
                         let mut ck = String::new();
                         capture_id_attrs(e, &mut pid, &mut ck);
                         if !pid.is_empty() {
                             entry.parent_id = Some(pid);
                         }
-                    } else if local.eq_ignore_ascii_case(b"DisplayName") {
+                    } else if local.eq_ignore_ascii_case("DisplayName") {
                         current = Some("displayName");
                         cur.clear();
-                    } else if local.eq_ignore_ascii_case(b"FolderClass") {
+                    } else if local.eq_ignore_ascii_case("FolderClass") {
                         current = Some("folderClass");
                         cur.clear();
-                    } else if local.eq_ignore_ascii_case(b"TotalCount") {
+                    } else if local.eq_ignore_ascii_case("TotalCount") {
                         current = Some("totalCount");
                         cur.clear();
-                    } else if local.eq_ignore_ascii_case(b"ChildFolderCount") {
+                    } else if local.eq_ignore_ascii_case("ChildFolderCount") {
                         current = Some("childCount");
                         cur.clear();
                     } else {
@@ -474,10 +474,10 @@ fn parse_folder_element<R: BufRead>(
                 }
             }
             Event::Text(t) => {
-                cur.push_str(&t.decode().map(|c| c.into_owned()).unwrap_or_default());
+                cur.push_str(&t);
             }
             Event::CData(c) => {
-                cur.push_str(&String::from_utf8_lossy(c.as_ref()));
+                cur.push_str(&c);
             }
             Event::GeneralRef(ref g) => {
                 if let Some(c) = entity_to_char(g) {
@@ -516,22 +516,22 @@ pub fn parse_find_item_response(body: &[u8]) -> Result<FindItemResponse, EwsErro
         let ns_kind = classify(&ns);
         match ev {
             Event::Start(ref e) | Event::Empty(ref e) => {
-                let local = e.local_name().as_ref().to_vec();
-                if is(ns_kind, &local, Ns::Messages, b"RootFolder") {
+                let local = e.local_name().as_ref().to_owned();
+                if is(ns_kind, &local, Ns::Messages, "RootFolder") {
                     in_root = true;
-                    if let Some(v) = attr_value(e, b"TotalItemsInView") {
+                    if let Some(v) = attr_value(e, "TotalItemsInView") {
                         out.total_in_view = v.trim().parse().ok();
                     }
-                    if let Some(v) = attr_value(e, b"IncludesLastItemInRange") {
+                    if let Some(v) = attr_value(e, "IncludesLastItemInRange") {
                         out.more = !matches!(v.trim(), "true" | "1");
                     }
                 } else if in_root && ns_kind == Ns::Types {
                     if is_item_element(&local) {
                         out.items.push(ItemEntry {
-                            element: String::from_utf8_lossy(&local).into_owned(),
+                            element: local.clone(),
                             id: ItemId::default(),
                         });
-                    } else if local.eq_ignore_ascii_case(b"ItemId")
+                    } else if local.eq_ignore_ascii_case("ItemId")
                         && let Some(last) = out.items.last_mut()
                     {
                         capture_id_attrs(e, &mut last.id.id, &mut last.id.change_key);
@@ -539,8 +539,8 @@ pub fn parse_find_item_response(body: &[u8]) -> Result<FindItemResponse, EwsErro
                 }
             }
             Event::End(e) => {
-                let local = e.local_name().as_ref().to_vec();
-                if local.eq_ignore_ascii_case(b"RootFolder") {
+                let local = e.local_name().as_ref().to_owned();
+                if local.eq_ignore_ascii_case("RootFolder") {
                     in_root = false;
                 }
             }
@@ -555,7 +555,7 @@ pub(crate) fn entity_to_char(g: &BytesRef) -> Option<char> {
     if let Ok(Some(c)) = g.resolve_char_ref() {
         return Some(c);
     }
-    match g.decode().ok()?.as_ref() {
+    match g.as_ref() {
         "amp" => Some('&'),
         "lt" => Some('<'),
         "gt" => Some('>'),
@@ -565,18 +565,18 @@ pub(crate) fn entity_to_char(g: &BytesRef) -> Option<char> {
     }
 }
 
-fn is_item_element(local: &[u8]) -> bool {
+fn is_item_element(local: &str) -> bool {
     matches!(
-        local.to_ascii_lowercase().as_slice(),
-        b"message"
-            | b"calendaritem"
-            | b"contact"
-            | b"distributionlist"
-            | b"meetingrequest"
-            | b"meetingresponse"
-            | b"meetingmessage"
-            | b"meetingcancellation"
-            | b"item"
+        local.to_ascii_lowercase().as_str(),
+        "message"
+            | "calendaritem"
+            | "contact"
+            | "distributionlist"
+            | "meetingrequest"
+            | "meetingresponse"
+            | "meetingmessage"
+            | "meetingcancellation"
+            | "item"
     )
 }
 
@@ -590,7 +590,7 @@ pub struct ResponseMessage {
 
 pub fn parse_response_messages(
     body: &[u8],
-    response_message_local: &[u8],
+    response_message_local: &str,
 ) -> Result<Vec<ResponseMessage>, EwsError> {
     let mut xml = NsReader::from_reader(body);
     xml.config_mut().trim_text(false);
@@ -602,10 +602,10 @@ pub fn parse_response_messages(
         let ns_kind = classify(&ns);
         match ev {
             Event::Start(e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().to_owned();
                 if is(ns_kind, &local, Ns::Messages, response_message_local) {
                     let response_class =
-                        attr_value(&e, b"ResponseClass").unwrap_or_else(|| "Success".to_owned());
+                        attr_value(&e, "ResponseClass").unwrap_or_else(|| "Success".to_owned());
                     let msg = parse_one_response_message(&mut xml, response_class)?;
                     out.push(msg);
                 }
@@ -636,15 +636,15 @@ fn parse_one_response_message<R: BufRead>(
         match ev {
             Event::Start(e) => {
                 depth += 1;
-                let local = e.local_name().as_ref().to_vec();
-                if !in_capture && is(ns_kind, &local, Ns::Messages, b"ResponseCode") {
+                let local = e.local_name().as_ref().to_owned();
+                if !in_capture && is(ns_kind, &local, Ns::Messages, "ResponseCode") {
                     current = Some("responseCode");
-                } else if !in_capture && is(ns_kind, &local, Ns::Messages, b"MessageText") {
+                } else if !in_capture && is(ns_kind, &local, Ns::Messages, "MessageText") {
                     current = Some("messageText");
                 } else if !in_capture
-                    && (is(ns_kind, &local, Ns::Messages, b"Items")
-                        || is(ns_kind, &local, Ns::Messages, b"Attachments")
-                        || is(ns_kind, &local, Ns::Messages, b"Folders"))
+                    && (is(ns_kind, &local, Ns::Messages, "Items")
+                        || is(ns_kind, &local, Ns::Messages, "Attachments")
+                        || is(ns_kind, &local, Ns::Messages, "Folders"))
                 {
                     capture_depth = 1;
                     current = None;
@@ -656,11 +656,11 @@ fn parse_one_response_message<R: BufRead>(
                 }
             }
             Event::Empty(e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().to_owned();
                 if in_capture {
                     write_empty_xml(&mut inner, &e);
-                } else if is(ns_kind, &local, Ns::Messages, b"ResponseCode")
-                    || is(ns_kind, &local, Ns::Messages, b"MessageText")
+                } else if is(ns_kind, &local, Ns::Messages, "ResponseCode")
+                    || is(ns_kind, &local, Ns::Messages, "MessageText")
                 {
                 }
             }
@@ -683,7 +683,7 @@ fn parse_one_response_message<R: BufRead>(
                 }
             }
             Event::Text(t) => {
-                let text = t.decode().map(|c| c.into_owned()).unwrap_or_default();
+                let text = t.into_inner().into_owned();
                 if in_capture {
                     write_text_xml(&mut inner, &text);
                 } else {
@@ -695,7 +695,7 @@ fn parse_one_response_message<R: BufRead>(
                 }
             }
             Event::CData(c) => {
-                let text = String::from_utf8_lossy(c.as_ref()).into_owned();
+                let text = c.into_inner().into_owned();
                 if in_capture {
                     write_text_xml(&mut inner, &text);
                 }
@@ -703,9 +703,7 @@ fn parse_one_response_message<R: BufRead>(
             Event::GeneralRef(ref g) => {
                 if in_capture {
                     inner.push('&');
-                    if let Ok(name) = g.decode() {
-                        inner.push_str(&name);
-                    }
+                    inner.push_str(g.as_ref());
                     inner.push(';');
                 }
             }
@@ -732,12 +730,12 @@ fn wrap_inner_with_namespaces(inner: &str) -> String {
 
 fn write_start_xml(out: &mut String, e: &BytesStart<'_>) {
     out.push('<');
-    out.push_str(&String::from_utf8_lossy(e.name().as_ref()));
+    out.push_str(e.name().as_ref());
     for a in e.attributes().flatten() {
         out.push(' ');
-        out.push_str(&String::from_utf8_lossy(a.key.as_ref()));
+        out.push_str(a.key.as_ref());
         out.push_str("=\"");
-        let val = String::from_utf8_lossy(a.value.as_ref());
+        let val = a.value;
         for ch in val.chars() {
             match ch {
                 '&' => out.push_str("&amp;"),
@@ -754,12 +752,12 @@ fn write_start_xml(out: &mut String, e: &BytesStart<'_>) {
 
 fn write_empty_xml(out: &mut String, e: &BytesStart<'_>) {
     out.push('<');
-    out.push_str(&String::from_utf8_lossy(e.name().as_ref()));
+    out.push_str(e.name().as_ref());
     for a in e.attributes().flatten() {
         out.push(' ');
-        out.push_str(&String::from_utf8_lossy(a.key.as_ref()));
+        out.push_str(a.key.as_ref());
         out.push_str("=\"");
-        let val = String::from_utf8_lossy(a.value.as_ref());
+        let val = a.value;
         for ch in val.chars() {
             match ch {
                 '&' => out.push_str("&amp;"),
@@ -776,7 +774,7 @@ fn write_empty_xml(out: &mut String, e: &BytesStart<'_>) {
 
 fn write_end_xml_event(out: &mut String, e: &quick_xml::events::BytesEnd<'_>) {
     out.push_str("</");
-    out.push_str(&String::from_utf8_lossy(e.name().as_ref()));
+    out.push_str(e.name().as_ref());
     out.push('>');
 }
 
@@ -824,47 +822,47 @@ pub fn parse_sync_folder_items_response(body: &[u8]) -> Result<SyncFolderItemsRe
         let ns_kind = classify(&ns);
         match ev {
             Event::Start(ref e) | Event::Empty(ref e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().to_owned();
                 let is_empty = matches!(ev, Event::Empty(_));
-                if is(ns_kind, &local, Ns::Messages, b"SyncState") {
+                if is(ns_kind, &local, Ns::Messages, "SyncState") {
                     current_text = Some("syncState");
-                } else if is(ns_kind, &local, Ns::Messages, b"IncludesLastItemInRange") {
+                } else if is(ns_kind, &local, Ns::Messages, "IncludesLastItemInRange") {
                     current_text = Some("includesLast");
-                } else if is(ns_kind, &local, Ns::Messages, b"Changes") {
+                } else if is(ns_kind, &local, Ns::Messages, "Changes") {
                     in_changes = true;
                 } else if in_changes && ns_kind == Ns::Types {
-                    if local.eq_ignore_ascii_case(b"Create") {
+                    if local.eq_ignore_ascii_case("Create") {
                         current_change = Some(SyncChange::Create {
                             id: ItemId::default(),
                             element: String::new(),
                         });
-                    } else if local.eq_ignore_ascii_case(b"Update") {
+                    } else if local.eq_ignore_ascii_case("Update") {
                         current_change = Some(SyncChange::Update {
                             id: ItemId::default(),
                             element: String::new(),
                         });
-                    } else if local.eq_ignore_ascii_case(b"Delete") {
+                    } else if local.eq_ignore_ascii_case("Delete") {
                         current_change = Some(SyncChange::Delete {
                             id: ItemId::default(),
                         });
-                    } else if local.eq_ignore_ascii_case(b"ReadFlagChange") {
+                    } else if local.eq_ignore_ascii_case("ReadFlagChange") {
                         current_change = Some(SyncChange::ReadFlagChange {
                             id: ItemId::default(),
                             is_read: false,
                         });
                         pending_is_read = None;
-                    } else if local.eq_ignore_ascii_case(b"ItemId") {
+                    } else if local.eq_ignore_ascii_case("ItemId") {
                         if let Some(change) = current_change.as_mut() {
                             let (id, ck) = item_id_mut(change);
                             capture_id_attrs(e, id, ck);
                         }
-                    } else if local.eq_ignore_ascii_case(b"IsRead") {
+                    } else if local.eq_ignore_ascii_case("IsRead") {
                         reading_is_read = true;
                     } else if is_item_element(&local) {
                         match current_change.as_mut() {
                             Some(SyncChange::Create { element, .. })
                             | Some(SyncChange::Update { element, .. }) => {
-                                *element = String::from_utf8_lossy(&local).into_owned();
+                                *element = local.clone();
                             }
                             _ => {}
                         }
@@ -875,10 +873,10 @@ pub fn parse_sync_folder_items_response(body: &[u8]) -> Result<SyncFolderItemsRe
                 }
             }
             Event::End(e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().to_owned();
                 let lower = local.to_ascii_lowercase();
-                match lower.as_slice() {
-                    b"create" | b"update" | b"delete" | b"readflagchange" => {
+                match lower.as_str() {
+                    "create" | "update" | "delete" | "readflagchange" => {
                         if let Some(mut change) = current_change.take() {
                             if let SyncChange::ReadFlagChange { is_read, .. } = &mut change
                                 && let Some(v) = pending_is_read.take()
@@ -888,14 +886,14 @@ pub fn parse_sync_folder_items_response(body: &[u8]) -> Result<SyncFolderItemsRe
                             changes.push(change);
                         }
                     }
-                    b"isread" => reading_is_read = false,
-                    b"changes" => in_changes = false,
+                    "isread" => reading_is_read = false,
+                    "changes" => in_changes = false,
                     _ => {}
                 }
                 current_text = None;
             }
             Event::Text(t) => {
-                let text = t.decode().map(|c| c.into_owned()).unwrap_or_default();
+                let text = t.into_inner().into_owned();
                 if reading_is_read {
                     pending_is_read = Some(matches!(text.trim(), "true" | "1"));
                 }
@@ -906,7 +904,7 @@ pub fn parse_sync_folder_items_response(body: &[u8]) -> Result<SyncFolderItemsRe
                 }
             }
             Event::CData(c) => {
-                let text = String::from_utf8_lossy(c.as_ref()).into_owned();
+                let text = c.into_inner().into_owned();
                 if current_text == Some("syncState") {
                     sync_state = text;
                 }
@@ -964,48 +962,48 @@ pub fn parse_message_item(inner_xml: &str) -> Result<MessageItem, EwsError> {
         let ns_kind = classify(&ns);
         match ev {
             Event::Start(ref e) | Event::Empty(ref e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().to_owned();
                 let is_empty = matches!(ev, Event::Empty(_));
                 if item.element.is_empty() && is_item_element(&local) {
-                    item.element = String::from_utf8_lossy(&local).into_owned();
+                    item.element = local.clone();
                 } else if ns_kind == Ns::Types {
                     cur.clear();
-                    if local.eq_ignore_ascii_case(b"ItemId") {
+                    if local.eq_ignore_ascii_case("ItemId") {
                         capture_id_attrs(e, &mut item.id.id, &mut item.id.change_key);
-                    } else if local.eq_ignore_ascii_case(b"ParentFolderId") {
+                    } else if local.eq_ignore_ascii_case("ParentFolderId") {
                         let mut pid = String::new();
                         let mut ck = String::new();
                         capture_id_attrs(e, &mut pid, &mut ck);
                         if !pid.is_empty() {
                             item.parent_folder_id = Some(pid);
                         }
-                    } else if local.eq_ignore_ascii_case(b"MimeContent") {
-                        mime_charset = attr_value(e, b"CharacterSet");
+                    } else if local.eq_ignore_ascii_case("MimeContent") {
+                        mime_charset = attr_value(e, "CharacterSet");
                         current = Some("mimeContent");
-                    } else if local.eq_ignore_ascii_case(b"Subject") {
+                    } else if local.eq_ignore_ascii_case("Subject") {
                         current = Some("subject");
-                    } else if local.eq_ignore_ascii_case(b"DateTimeReceived") {
+                    } else if local.eq_ignore_ascii_case("DateTimeReceived") {
                         current = Some("received");
-                    } else if local.eq_ignore_ascii_case(b"IsRead") {
+                    } else if local.eq_ignore_ascii_case("IsRead") {
                         current = Some("isRead");
-                    } else if local.eq_ignore_ascii_case(b"IsDraft") {
+                    } else if local.eq_ignore_ascii_case("IsDraft") {
                         current = Some("isDraft");
-                    } else if local.eq_ignore_ascii_case(b"IsReadReceiptRequested") {
+                    } else if local.eq_ignore_ascii_case("IsReadReceiptRequested") {
                         current = Some("readReceipt");
-                    } else if local.eq_ignore_ascii_case(b"Categories") {
+                    } else if local.eq_ignore_ascii_case("Categories") {
                         category_collecting = true;
-                    } else if category_collecting && local.eq_ignore_ascii_case(b"String") {
+                    } else if category_collecting && local.eq_ignore_ascii_case("String") {
                         current = Some("category");
-                    } else if local.eq_ignore_ascii_case(b"Flag") {
+                    } else if local.eq_ignore_ascii_case("Flag") {
                         in_flag = true;
-                    } else if in_flag && local.eq_ignore_ascii_case(b"FlagStatus") {
+                    } else if in_flag && local.eq_ignore_ascii_case("FlagStatus") {
                         current = Some("flagStatus");
-                    } else if local.eq_ignore_ascii_case(b"ExtendedFieldURI") {
-                        if let Some(tag) = attr_value(e, b"PropertyTag") {
+                    } else if local.eq_ignore_ascii_case("ExtendedFieldURI") {
+                        if let Some(tag) = attr_value(e, "PropertyTag") {
                             let t = tag.trim().to_ascii_lowercase();
                             in_flagstatus_ext = t == "0x1090" || t == "4240";
                         }
-                    } else if in_flagstatus_ext && local.eq_ignore_ascii_case(b"Value") {
+                    } else if in_flagstatus_ext && local.eq_ignore_ascii_case("Value") {
                         current = Some("flagStatusExt");
                     } else {
                         current = None;
@@ -1016,7 +1014,7 @@ pub fn parse_message_item(inner_xml: &str) -> Result<MessageItem, EwsError> {
                 }
             }
             Event::End(e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().to_owned();
                 let lower = local.to_ascii_lowercase();
                 if let Some(field) = current.take() {
                     let text = std::mem::take(&mut cur);
@@ -1042,19 +1040,19 @@ pub fn parse_message_item(inner_xml: &str) -> Result<MessageItem, EwsError> {
                     }
                 }
                 cur.clear();
-                if lower == b"categories" {
+                if lower == "categories" {
                     category_collecting = false;
-                } else if lower == b"flag" {
+                } else if lower == "flag" {
                     in_flag = false;
-                } else if lower == b"extendedproperty" {
+                } else if lower == "extendedproperty" {
                     in_flagstatus_ext = false;
                 }
             }
             Event::Text(ref t) => {
-                cur.push_str(&t.decode().map(|c| c.into_owned()).unwrap_or_default());
+                cur.push_str(t);
             }
             Event::CData(ref c) => {
-                cur.push_str(&String::from_utf8_lossy(c.as_ref()));
+                cur.push_str(c);
             }
             Event::GeneralRef(ref g) => {
                 if let Some(c) = entity_to_char(g) {
@@ -1198,7 +1196,7 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
     let mut deleted_stack: Vec<RawOccurrence> = Vec::new();
     let mut in_modified = false;
     let mut in_deleted = false;
-    let mut recurrence_path: Vec<Vec<u8>> = Vec::new();
+    let mut recurrence_path: Vec<String> = Vec::new();
     let mut recurrence_text: Option<&'static str> = None;
     let mut recurrence = RawRecurrence::default();
     let mut pending = PendingRecurrence::default();
@@ -1210,10 +1208,10 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
         let ns_kind = classify(&ns);
         match ev {
             Event::Start(ref e) | Event::Empty(ref e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().to_owned();
                 let is_empty = matches!(ev, Event::Empty(_));
                 if item.element.is_empty() && is_item_element(&local) {
-                    item.element = String::from_utf8_lossy(&local).into_owned();
+                    item.element = local.clone();
                     continue;
                 }
                 if ns_kind != Ns::Types {
@@ -1221,39 +1219,39 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                 }
                 if !recurrence_path.is_empty() {
                     recurrence_path.push(local.clone());
-                    if local.eq_ignore_ascii_case(b"Interval") {
+                    if local.eq_ignore_ascii_case("Interval") {
                         recurrence_text = Some("interval");
-                    } else if local.eq_ignore_ascii_case(b"DaysOfWeek") {
+                    } else if local.eq_ignore_ascii_case("DaysOfWeek") {
                         recurrence_text = Some("daysOfWeek");
-                    } else if local.eq_ignore_ascii_case(b"DayOfMonth") {
+                    } else if local.eq_ignore_ascii_case("DayOfMonth") {
                         recurrence_text = Some("dayOfMonth");
-                    } else if local.eq_ignore_ascii_case(b"DayOfWeekIndex") {
+                    } else if local.eq_ignore_ascii_case("DayOfWeekIndex") {
                         recurrence_text = Some("dayOfWeekIndex");
-                    } else if local.eq_ignore_ascii_case(b"Month") {
+                    } else if local.eq_ignore_ascii_case("Month") {
                         recurrence_text = Some("month");
-                    } else if local.eq_ignore_ascii_case(b"StartDate") {
+                    } else if local.eq_ignore_ascii_case("StartDate") {
                         recurrence_text = Some("startDate");
-                    } else if local.eq_ignore_ascii_case(b"EndDate") {
+                    } else if local.eq_ignore_ascii_case("EndDate") {
                         recurrence_text = Some("endDate");
-                    } else if local.eq_ignore_ascii_case(b"NumberOfOccurrences") {
+                    } else if local.eq_ignore_ascii_case("NumberOfOccurrences") {
                         recurrence_text = Some("numberOfOccurrences");
-                    } else if local.eq_ignore_ascii_case(b"DailyRecurrence") {
+                    } else if local.eq_ignore_ascii_case("DailyRecurrence") {
                         pending.pattern_choice = Some("Daily");
-                    } else if local.eq_ignore_ascii_case(b"WeeklyRecurrence") {
+                    } else if local.eq_ignore_ascii_case("WeeklyRecurrence") {
                         pending.pattern_choice = Some("Weekly");
-                    } else if local.eq_ignore_ascii_case(b"AbsoluteMonthlyRecurrence") {
+                    } else if local.eq_ignore_ascii_case("AbsoluteMonthlyRecurrence") {
                         pending.pattern_choice = Some("AbsoluteMonthly");
-                    } else if local.eq_ignore_ascii_case(b"RelativeMonthlyRecurrence") {
+                    } else if local.eq_ignore_ascii_case("RelativeMonthlyRecurrence") {
                         pending.pattern_choice = Some("RelativeMonthly");
-                    } else if local.eq_ignore_ascii_case(b"AbsoluteYearlyRecurrence") {
+                    } else if local.eq_ignore_ascii_case("AbsoluteYearlyRecurrence") {
                         pending.pattern_choice = Some("AbsoluteYearly");
-                    } else if local.eq_ignore_ascii_case(b"RelativeYearlyRecurrence") {
+                    } else if local.eq_ignore_ascii_case("RelativeYearlyRecurrence") {
                         pending.pattern_choice = Some("RelativeYearly");
-                    } else if local.eq_ignore_ascii_case(b"NoEndRecurrence") {
+                    } else if local.eq_ignore_ascii_case("NoEndRecurrence") {
                         pending.range_choice = Some("NoEnd");
-                    } else if local.eq_ignore_ascii_case(b"EndDateRecurrence") {
+                    } else if local.eq_ignore_ascii_case("EndDateRecurrence") {
                         pending.range_choice = Some("EndDate");
-                    } else if local.eq_ignore_ascii_case(b"NumberedRecurrence") {
+                    } else if local.eq_ignore_ascii_case("NumberedRecurrence") {
                         pending.range_choice = Some("Numbered");
                     } else {
                         recurrence_text = None;
@@ -1265,7 +1263,7 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                     continue;
                 }
                 cur.clear();
-                if local.eq_ignore_ascii_case(b"ItemId") {
+                if local.eq_ignore_ascii_case("ItemId") {
                     if in_modified {
                         if let Some(occ) = occurrence_stack.last_mut() {
                             capture_id_attrs(e, &mut occ.item_id.id, &mut occ.item_id.change_key);
@@ -1277,127 +1275,126 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                     } else {
                         capture_id_attrs(e, &mut item.id.id, &mut item.id.change_key);
                     }
-                } else if local.eq_ignore_ascii_case(b"ParentFolderId") {
+                } else if local.eq_ignore_ascii_case("ParentFolderId") {
                     let mut pid = String::new();
                     let mut ck = String::new();
                     capture_id_attrs(e, &mut pid, &mut ck);
                     if !pid.is_empty() {
                         item.parent_folder_id = Some(pid);
                     }
-                } else if local.eq_ignore_ascii_case(b"UID") {
+                } else if local.eq_ignore_ascii_case("UID") {
                     text_target = Some("uid");
-                } else if local.eq_ignore_ascii_case(b"Subject") {
+                } else if local.eq_ignore_ascii_case("Subject") {
                     text_target = Some("subject");
-                } else if local.eq_ignore_ascii_case(b"Start") {
+                } else if local.eq_ignore_ascii_case("Start") {
                     if in_modified || in_deleted {
                         text_target = Some("occStart");
                     } else {
                         text_target = Some("start");
                     }
-                } else if local.eq_ignore_ascii_case(b"End") {
+                } else if local.eq_ignore_ascii_case("End") {
                     if in_modified || in_deleted {
                         text_target = Some("occEnd");
                     } else {
                         text_target = Some("end");
                     }
-                } else if local.eq_ignore_ascii_case(b"OriginalStart") {
+                } else if local.eq_ignore_ascii_case("OriginalStart") {
                     if in_modified || in_deleted {
                         text_target = Some("occOrig");
                     } else {
                         text_target = Some("originalStart");
                     }
-                } else if local.eq_ignore_ascii_case(b"IsAllDayEvent") {
+                } else if local.eq_ignore_ascii_case("IsAllDayEvent") {
                     text_target = Some("isAllDay");
-                } else if local.eq_ignore_ascii_case(b"LegacyFreeBusyStatus") {
+                } else if local.eq_ignore_ascii_case("LegacyFreeBusyStatus") {
                     text_target = Some("freeBusy");
-                } else if local.eq_ignore_ascii_case(b"Location") {
+                } else if local.eq_ignore_ascii_case("Location") {
                     text_target = Some("location");
-                } else if local.eq_ignore_ascii_case(b"CalendarItemType") {
+                } else if local.eq_ignore_ascii_case("CalendarItemType") {
                     text_target = Some("calendarItemType");
-                } else if local.eq_ignore_ascii_case(b"RecurrenceId") {
+                } else if local.eq_ignore_ascii_case("RecurrenceId") {
                     text_target = Some("recurrenceId");
-                } else if local.eq_ignore_ascii_case(b"StartTimeZone") {
-                    if let Some(v) = attr_value(e, b"Id") {
+                } else if local.eq_ignore_ascii_case("StartTimeZone") {
+                    if let Some(v) = attr_value(e, "Id") {
                         item.start_tz = Some(v);
                     }
-                } else if local.eq_ignore_ascii_case(b"EndTimeZone") {
-                    if let Some(v) = attr_value(e, b"Id") {
+                } else if local.eq_ignore_ascii_case("EndTimeZone") {
+                    if let Some(v) = attr_value(e, "Id") {
                         item.end_tz = Some(v);
                     }
-                } else if local.eq_ignore_ascii_case(b"Recurrence") {
+                } else if local.eq_ignore_ascii_case("Recurrence") {
                     recurrence_path.push(local.clone());
-                } else if local.eq_ignore_ascii_case(b"ModifiedOccurrences") {
+                } else if local.eq_ignore_ascii_case("ModifiedOccurrences") {
                     in_modified = true;
-                } else if local.eq_ignore_ascii_case(b"DeletedOccurrences") {
+                } else if local.eq_ignore_ascii_case("DeletedOccurrences") {
                     in_deleted = true;
-                } else if local.eq_ignore_ascii_case(b"Occurrence") {
+                } else if local.eq_ignore_ascii_case("Occurrence") {
                     let mut occ = RawOccurrence::default();
                     capture_id_attrs(e, &mut occ.item_id.id, &mut occ.item_id.change_key);
                     occurrence_stack.push(occ);
-                } else if local.eq_ignore_ascii_case(b"DeletedOccurrence") {
+                } else if local.eq_ignore_ascii_case("DeletedOccurrence") {
                     deleted_stack.push(RawOccurrence::default());
-                } else if local.eq_ignore_ascii_case(b"Organizer") {
+                } else if local.eq_ignore_ascii_case("Organizer") {
                     in_organizer = true;
-                } else if local.eq_ignore_ascii_case(b"RequiredAttendees") {
+                } else if local.eq_ignore_ascii_case("RequiredAttendees") {
                     attendee_kind = Some("required");
-                } else if local.eq_ignore_ascii_case(b"OptionalAttendees") {
+                } else if local.eq_ignore_ascii_case("OptionalAttendees") {
                     attendee_kind = Some("optional");
-                } else if local.eq_ignore_ascii_case(b"Resources") {
+                } else if local.eq_ignore_ascii_case("Resources") {
                     attendee_kind = Some("resource");
-                } else if local.eq_ignore_ascii_case(b"ReminderIsSet") {
+                } else if local.eq_ignore_ascii_case("ReminderIsSet") {
                     text_target = Some("reminderIsSet");
-                } else if local.eq_ignore_ascii_case(b"ReminderMinutesBeforeStart") {
+                } else if local.eq_ignore_ascii_case("ReminderMinutesBeforeStart") {
                     text_target = Some("reminderMinutes");
-                } else if local.eq_ignore_ascii_case(b"IsOnlineMeeting") {
+                } else if local.eq_ignore_ascii_case("IsOnlineMeeting") {
                     text_target = Some("isOnlineMeeting");
-                } else if local.eq_ignore_ascii_case(b"JoinOnlineMeetingUrl") {
+                } else if local.eq_ignore_ascii_case("JoinOnlineMeetingUrl") {
                     text_target = Some("joinUrl");
-                } else if local.eq_ignore_ascii_case(b"NetShowUrl") {
+                } else if local.eq_ignore_ascii_case("NetShowUrl") {
                     text_target = Some("netShowUrl");
-                } else if local.eq_ignore_ascii_case(b"MeetingWorkspaceUrl") {
+                } else if local.eq_ignore_ascii_case("MeetingWorkspaceUrl") {
                     text_target = Some("workspaceUrl");
-                } else if local.eq_ignore_ascii_case(b"Attendee") && attendee_kind.is_some() {
+                } else if local.eq_ignore_ascii_case("Attendee") && attendee_kind.is_some() {
                     current_attendee = Some(RawAttendee::default());
-                } else if local.eq_ignore_ascii_case(b"Mailbox") {
+                } else if local.eq_ignore_ascii_case("Mailbox") {
                     in_mailbox = true;
-                } else if local.eq_ignore_ascii_case(b"Name") && in_mailbox {
+                } else if local.eq_ignore_ascii_case("Name") && in_mailbox {
                     text_target = Some(if in_organizer {
                         "organizerName"
                     } else {
                         "attendeeName"
                     });
-                } else if local.eq_ignore_ascii_case(b"EmailAddress") && in_mailbox {
+                } else if local.eq_ignore_ascii_case("EmailAddress") && in_mailbox {
                     text_target = Some(if in_organizer {
                         "organizerEmail"
                     } else {
                         "attendeeEmail"
                     });
-                } else if local.eq_ignore_ascii_case(b"RoutingType") && in_mailbox {
+                } else if local.eq_ignore_ascii_case("RoutingType") && in_mailbox {
                     text_target = Some(if in_organizer {
                         "organizerRouting"
                     } else {
                         "attendeeRouting"
                     });
-                } else if local.eq_ignore_ascii_case(b"ResponseType") && current_attendee.is_some()
-                {
+                } else if local.eq_ignore_ascii_case("ResponseType") && current_attendee.is_some() {
                     text_target = Some("attendeeResponse");
-                } else if local.eq_ignore_ascii_case(b"Categories") {
+                } else if local.eq_ignore_ascii_case("Categories") {
                     category_collecting = true;
-                } else if category_collecting && local.eq_ignore_ascii_case(b"String") {
+                } else if category_collecting && local.eq_ignore_ascii_case("String") {
                     text_target = Some("category");
-                } else if local.eq_ignore_ascii_case(b"DateTimeCreated") {
+                } else if local.eq_ignore_ascii_case("DateTimeCreated") {
                     text_target = Some("created");
-                } else if local.eq_ignore_ascii_case(b"LastModifiedTime") {
+                } else if local.eq_ignore_ascii_case("LastModifiedTime") {
                     text_target = Some("lastModified");
-                } else if local.eq_ignore_ascii_case(b"Body") {
-                    let body_type = attr_value(e, b"BodyType").unwrap_or_default();
+                } else if local.eq_ignore_ascii_case("Body") {
+                    let body_type = attr_value(e, "BodyType").unwrap_or_default();
                     text_target = Some(if body_type.eq_ignore_ascii_case("HTML") {
                         "bodyHtml"
                     } else {
                         "bodyText"
                     });
-                } else if local.eq_ignore_ascii_case(b"FileAttachment")
-                    || local.eq_ignore_ascii_case(b"ItemAttachment")
+                } else if local.eq_ignore_ascii_case("FileAttachment")
+                    || local.eq_ignore_ascii_case("ItemAttachment")
                 {
                     let att = parse_attachment_ref(&mut xml, &local)?;
                     item.attachments.push(att);
@@ -1409,7 +1406,7 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                 }
             }
             Event::End(e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().to_owned();
                 let lower = local.to_ascii_lowercase();
                 if !recurrence_path.is_empty() {
                     recurrence_path.pop();
@@ -1501,20 +1498,20 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                 }
                 cur.clear();
                 text_target = None;
-                match lower.as_slice() {
-                    b"modifiedoccurrences" => in_modified = false,
-                    b"deletedoccurrences" => in_deleted = false,
-                    b"occurrence" => {
+                match lower.as_str() {
+                    "modifiedoccurrences" => in_modified = false,
+                    "deletedoccurrences" => in_deleted = false,
+                    "occurrence" => {
                         if let Some(occ) = occurrence_stack.pop() {
                             item.modified_occurrences.push(occ);
                         }
                     }
-                    b"deletedoccurrence" => {
+                    "deletedoccurrence" => {
                         if let Some(occ) = deleted_stack.pop() {
                             item.deleted_occurrences.push(occ);
                         }
                     }
-                    b"attendee" => {
+                    "attendee" => {
                         if let Some(att) = current_attendee.take() {
                             match attendee_kind {
                                 Some("required") => item.required_attendees.push(att),
@@ -1524,17 +1521,15 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                             }
                         }
                     }
-                    b"requiredattendees" | b"optionalattendees" | b"resources" => {
-                        attendee_kind = None
-                    }
-                    b"organizer" => in_organizer = false,
-                    b"mailbox" => in_mailbox = false,
-                    b"categories" => category_collecting = false,
+                    "requiredattendees" | "optionalattendees" | "resources" => attendee_kind = None,
+                    "organizer" => in_organizer = false,
+                    "mailbox" => in_mailbox = false,
+                    "categories" => category_collecting = false,
                     _ => {}
                 }
             }
             Event::Text(ref t) => {
-                let text = t.decode().map(|c| c.into_owned()).unwrap_or_default();
+                let text = t.as_ref().to_owned();
                 if !recurrence_path.is_empty() {
                     match recurrence_text {
                         Some("interval") => pending.interval = text.trim().parse().unwrap_or(1),
@@ -1563,7 +1558,7 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
             }
             Event::CData(ref c) => {
                 if recurrence_path.is_empty() {
-                    cur.push_str(&String::from_utf8_lossy(c.as_ref()));
+                    cur.push_str(c);
                 }
             }
             Event::GeneralRef(ref g) => {
@@ -1718,14 +1713,14 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
         let ns_kind = classify(&ns);
         match ev {
             Event::Start(ref e) | Event::Empty(ref e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().to_owned();
                 let is_empty = matches!(ev, Event::Empty(_));
                 if !seen_root_contact
-                    && (local.eq_ignore_ascii_case(b"Contact")
-                        || local.eq_ignore_ascii_case(b"DistributionList"))
+                    && (local.eq_ignore_ascii_case("Contact")
+                        || local.eq_ignore_ascii_case("DistributionList"))
                 {
                     seen_root_contact = true;
-                    if local.eq_ignore_ascii_case(b"DistributionList") {
+                    if local.eq_ignore_ascii_case("DistributionList") {
                         item.is_group = true;
                     }
                     continue;
@@ -1734,91 +1729,91 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
                     continue;
                 }
                 cur.clear();
-                if local.eq_ignore_ascii_case(b"ItemId") {
+                if local.eq_ignore_ascii_case("ItemId") {
                     capture_id_attrs(e, &mut item.id.id, &mut item.id.change_key);
-                } else if local.eq_ignore_ascii_case(b"ParentFolderId") {
+                } else if local.eq_ignore_ascii_case("ParentFolderId") {
                     let mut pid = String::new();
                     let mut ck = String::new();
                     capture_id_attrs(e, &mut pid, &mut ck);
                     if !pid.is_empty() {
                         item.parent_folder_id = Some(pid);
                     }
-                } else if local.eq_ignore_ascii_case(b"DisplayName") {
+                } else if local.eq_ignore_ascii_case("DisplayName") {
                     text_target = Some("displayName");
-                } else if local.eq_ignore_ascii_case(b"GivenName") {
+                } else if local.eq_ignore_ascii_case("GivenName") {
                     text_target = Some("givenName");
-                } else if local.eq_ignore_ascii_case(b"MiddleName") {
+                } else if local.eq_ignore_ascii_case("MiddleName") {
                     text_target = Some("middleName");
-                } else if local.eq_ignore_ascii_case(b"Surname") {
+                } else if local.eq_ignore_ascii_case("Surname") {
                     text_target = Some("surname");
-                } else if local.eq_ignore_ascii_case(b"Initials") {
+                } else if local.eq_ignore_ascii_case("Initials") {
                     text_target = Some("initials");
-                } else if local.eq_ignore_ascii_case(b"Nickname") {
+                } else if local.eq_ignore_ascii_case("Nickname") {
                     text_target = Some("nickname");
-                } else if local.eq_ignore_ascii_case(b"CompanyName") {
+                } else if local.eq_ignore_ascii_case("CompanyName") {
                     text_target = Some("companyName");
-                } else if local.eq_ignore_ascii_case(b"Department") {
+                } else if local.eq_ignore_ascii_case("Department") {
                     text_target = Some("department");
-                } else if local.eq_ignore_ascii_case(b"JobTitle") {
+                } else if local.eq_ignore_ascii_case("JobTitle") {
                     text_target = Some("jobTitle");
-                } else if local.eq_ignore_ascii_case(b"Generation") {
+                } else if local.eq_ignore_ascii_case("Generation") {
                     text_target = Some("generation");
-                } else if local.eq_ignore_ascii_case(b"OfficeLocation") {
+                } else if local.eq_ignore_ascii_case("OfficeLocation") {
                     text_target = Some("officeLocation");
-                } else if local.eq_ignore_ascii_case(b"BusinessHomePage") {
+                } else if local.eq_ignore_ascii_case("BusinessHomePage") {
                     text_target = Some("url");
-                } else if local.eq_ignore_ascii_case(b"Birthday") {
+                } else if local.eq_ignore_ascii_case("Birthday") {
                     text_target = Some("birthday");
-                } else if local.eq_ignore_ascii_case(b"WeddingAnniversary") {
+                } else if local.eq_ignore_ascii_case("WeddingAnniversary") {
                     text_target = Some("weddingAnniversary");
-                } else if local.eq_ignore_ascii_case(b"Manager") {
+                } else if local.eq_ignore_ascii_case("Manager") {
                     text_target = Some("manager");
-                } else if local.eq_ignore_ascii_case(b"SpouseName") {
+                } else if local.eq_ignore_ascii_case("SpouseName") {
                     text_target = Some("spouse");
-                } else if local.eq_ignore_ascii_case(b"AssistantName") {
+                } else if local.eq_ignore_ascii_case("AssistantName") {
                     text_target = Some("assistant");
-                } else if local.eq_ignore_ascii_case(b"Profession") {
+                } else if local.eq_ignore_ascii_case("Profession") {
                     text_target = Some("profession");
-                } else if local.eq_ignore_ascii_case(b"PostalAddressIndex") {
+                } else if local.eq_ignore_ascii_case("PostalAddressIndex") {
                     text_target = Some("postalAddressIndex");
-                } else if local.eq_ignore_ascii_case(b"Members") {
+                } else if local.eq_ignore_ascii_case("Members") {
                     in_members = true;
-                } else if in_members && local.eq_ignore_ascii_case(b"Member") {
+                } else if in_members && local.eq_ignore_ascii_case("Member") {
                     current_member = Some(RawGroupMember::default());
-                } else if in_members && local.eq_ignore_ascii_case(b"Mailbox") {
+                } else if in_members && local.eq_ignore_ascii_case("Mailbox") {
                     member_mailbox = true;
-                } else if member_mailbox && local.eq_ignore_ascii_case(b"Name") {
+                } else if member_mailbox && local.eq_ignore_ascii_case("Name") {
                     text_target = Some("memberName");
-                } else if member_mailbox && local.eq_ignore_ascii_case(b"EmailAddress") {
+                } else if member_mailbox && local.eq_ignore_ascii_case("EmailAddress") {
                     text_target = Some("memberEmail");
-                } else if local.eq_ignore_ascii_case(b"Body") {
+                } else if local.eq_ignore_ascii_case("Body") {
                     text_target = Some("notes");
-                } else if local.eq_ignore_ascii_case(b"DateTimeCreated") {
+                } else if local.eq_ignore_ascii_case("DateTimeCreated") {
                     text_target = Some("created");
-                } else if local.eq_ignore_ascii_case(b"LastModifiedTime") {
+                } else if local.eq_ignore_ascii_case("LastModifiedTime") {
                     text_target = Some("lastModified");
-                } else if local.eq_ignore_ascii_case(b"Categories") {
+                } else if local.eq_ignore_ascii_case("Categories") {
                     category_collecting = true;
-                } else if category_collecting && local.eq_ignore_ascii_case(b"String") {
+                } else if category_collecting && local.eq_ignore_ascii_case("String") {
                     text_target = Some("category");
-                } else if local.eq_ignore_ascii_case(b"Children") {
+                } else if local.eq_ignore_ascii_case("Children") {
                     children_collecting = true;
-                } else if children_collecting && local.eq_ignore_ascii_case(b"String") {
+                } else if children_collecting && local.eq_ignore_ascii_case("String") {
                     text_target = Some("child");
-                } else if local.eq_ignore_ascii_case(b"Companies") {
+                } else if local.eq_ignore_ascii_case("Companies") {
                     companies_collecting = true;
-                } else if companies_collecting && local.eq_ignore_ascii_case(b"String") {
+                } else if companies_collecting && local.eq_ignore_ascii_case("String") {
                     text_target = Some("company");
-                } else if local.eq_ignore_ascii_case(b"EmailAddresses") {
+                } else if local.eq_ignore_ascii_case("EmailAddresses") {
                     entry_container = Some("email");
-                } else if local.eq_ignore_ascii_case(b"PhoneNumbers") {
+                } else if local.eq_ignore_ascii_case("PhoneNumbers") {
                     entry_container = Some("phone");
-                } else if local.eq_ignore_ascii_case(b"ImAddresses") {
+                } else if local.eq_ignore_ascii_case("ImAddresses") {
                     entry_container = Some("im");
-                } else if local.eq_ignore_ascii_case(b"PhysicalAddresses") {
+                } else if local.eq_ignore_ascii_case("PhysicalAddresses") {
                     entry_container = Some("address");
-                } else if local.eq_ignore_ascii_case(b"Entry") {
-                    entry_key = attr_value(e, b"Key");
+                } else if local.eq_ignore_ascii_case("Entry") {
+                    entry_key = attr_value(e, "Key");
                     if entry_container == Some("address") {
                         current_address = Some(RawContactAddress {
                             key: entry_key.clone().unwrap_or_default(),
@@ -1828,21 +1823,21 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
                         text_target = Some("entryValue");
                     }
                 } else if current_address.is_some() {
-                    if local.eq_ignore_ascii_case(b"Street") {
+                    if local.eq_ignore_ascii_case("Street") {
                         address_text = Some("street");
-                    } else if local.eq_ignore_ascii_case(b"City") {
+                    } else if local.eq_ignore_ascii_case("City") {
                         address_text = Some("city");
-                    } else if local.eq_ignore_ascii_case(b"State") {
+                    } else if local.eq_ignore_ascii_case("State") {
                         address_text = Some("state");
-                    } else if local.eq_ignore_ascii_case(b"CountryOrRegion") {
+                    } else if local.eq_ignore_ascii_case("CountryOrRegion") {
                         address_text = Some("country");
-                    } else if local.eq_ignore_ascii_case(b"PostalCode") {
+                    } else if local.eq_ignore_ascii_case("PostalCode") {
                         address_text = Some("postal");
                     } else {
                         address_text = None;
                     }
-                } else if local.eq_ignore_ascii_case(b"FileAttachment")
-                    || local.eq_ignore_ascii_case(b"ItemAttachment")
+                } else if local.eq_ignore_ascii_case("FileAttachment")
+                    || local.eq_ignore_ascii_case("ItemAttachment")
                 {
                     let att = parse_attachment_ref(&mut xml, &local)?;
                     item.attachments.push(att);
@@ -1855,7 +1850,7 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
                 }
             }
             Event::End(e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().to_owned();
                 let lower = local.to_ascii_lowercase();
                 if let Some(at) = address_text {
                     if let Some(addr) = current_address.as_mut() {
@@ -1922,22 +1917,22 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
                 cur.clear();
                 text_target = None;
                 address_text = None;
-                match lower.as_slice() {
-                    b"categories" => category_collecting = false,
-                    b"children" => children_collecting = false,
-                    b"companies" => companies_collecting = false,
-                    b"emailaddresses" | b"phonenumbers" | b"imaddresses" | b"physicaladdresses" => {
+                match lower.as_str() {
+                    "categories" => category_collecting = false,
+                    "children" => children_collecting = false,
+                    "companies" => companies_collecting = false,
+                    "emailaddresses" | "phonenumbers" | "imaddresses" | "physicaladdresses" => {
                         entry_container = None
                     }
-                    b"entry" => {
+                    "entry" => {
                         if let Some(addr) = current_address.take() {
                             item.addresses.push(addr);
                         }
                         entry_key = None;
                     }
-                    b"members" => in_members = false,
-                    b"mailbox" => member_mailbox = false,
-                    b"member" => {
+                    "members" => in_members = false,
+                    "mailbox" => member_mailbox = false,
+                    "member" => {
                         if let Some(m) = current_member.take()
                             && (m.email.is_some() || m.name.is_some())
                         {
@@ -1948,10 +1943,10 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
                 }
             }
             Event::Text(ref t) => {
-                cur.push_str(&t.decode().map(|c| c.into_owned()).unwrap_or_default());
+                cur.push_str(t);
             }
             Event::CData(ref c) => {
-                cur.push_str(&String::from_utf8_lossy(c.as_ref()));
+                cur.push_str(c);
             }
             Event::GeneralRef(ref g) => {
                 if let Some(c) = entity_to_char(g) {
@@ -1967,10 +1962,10 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
 
 fn parse_attachment_ref<R: BufRead>(
     xml: &mut NsReader<R>,
-    element_local: &[u8],
+    element_local: &str,
 ) -> Result<RawAttachmentRef, EwsError> {
     let mut att = RawAttachmentRef {
-        is_item_attachment: element_local.eq_ignore_ascii_case(b"itemattachment"),
+        is_item_attachment: element_local.eq_ignore_ascii_case("itemattachment"),
         ..RawAttachmentRef::default()
     };
     let mut buf = Vec::new();
@@ -1987,18 +1982,18 @@ fn parse_attachment_ref<R: BufRead>(
                 if !is_empty {
                     depth += 1;
                 }
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().to_owned();
                 if ns_kind == Ns::Types {
                     cur.clear();
-                    if local.eq_ignore_ascii_case(b"AttachmentId") {
-                        if let Some(v) = attr_value(e, b"Id") {
+                    if local.eq_ignore_ascii_case("AttachmentId") {
+                        if let Some(v) = attr_value(e, "Id") {
                             att.attachment_id = v;
                         }
-                    } else if local.eq_ignore_ascii_case(b"Name") {
+                    } else if local.eq_ignore_ascii_case("Name") {
                         current = Some("name");
-                    } else if local.eq_ignore_ascii_case(b"ContentType") {
+                    } else if local.eq_ignore_ascii_case("ContentType") {
                         current = Some("contentType");
-                    } else if local.eq_ignore_ascii_case(b"IsContactPhoto") {
+                    } else if local.eq_ignore_ascii_case("IsContactPhoto") {
                         current = Some("isContactPhoto");
                     } else {
                         current = None;
@@ -2030,10 +2025,10 @@ fn parse_attachment_ref<R: BufRead>(
                 }
             }
             Event::Text(ref t) => {
-                cur.push_str(&t.decode().map(|c| c.into_owned()).unwrap_or_default());
+                cur.push_str(t);
             }
             Event::CData(ref c) => {
-                cur.push_str(&String::from_utf8_lossy(c.as_ref()));
+                cur.push_str(c);
             }
             Event::GeneralRef(ref g) => {
                 if let Some(c) = entity_to_char(g) {
@@ -2069,27 +2064,27 @@ pub fn parse_get_attachment_inline(body: &[u8]) -> Result<Vec<GetAttachmentInlin
         let ns_kind = classify(&ns);
         match ev {
             Event::Start(ref e) | Event::Empty(ref e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().to_owned();
                 let is_empty = matches!(ev, Event::Empty(_));
                 if ns_kind == Ns::Types
-                    && (local.eq_ignore_ascii_case(b"FileAttachment")
-                        || local.eq_ignore_ascii_case(b"ItemAttachment"))
+                    && (local.eq_ignore_ascii_case("FileAttachment")
+                        || local.eq_ignore_ascii_case("ItemAttachment"))
                 {
                     current = Some(GetAttachmentInline::default());
                 } else if let Some(cur) = current.as_mut()
                     && ns_kind == Ns::Types
                 {
-                    if local.eq_ignore_ascii_case(b"AttachmentId") {
-                        if let Some(v) = attr_value(e, b"Id") {
+                    if local.eq_ignore_ascii_case("AttachmentId") {
+                        if let Some(v) = attr_value(e, "Id") {
                             cur.attachment_id = v;
                         }
-                    } else if local.eq_ignore_ascii_case(b"Name") {
+                    } else if local.eq_ignore_ascii_case("Name") {
                         text_target = Some("name");
-                    } else if local.eq_ignore_ascii_case(b"ContentType") {
+                    } else if local.eq_ignore_ascii_case("ContentType") {
                         text_target = Some("contentType");
-                    } else if local.eq_ignore_ascii_case(b"IsContactPhoto") {
+                    } else if local.eq_ignore_ascii_case("IsContactPhoto") {
                         text_target = Some("isContactPhoto");
-                    } else if local.eq_ignore_ascii_case(b"Content") {
+                    } else if local.eq_ignore_ascii_case("Content") {
                         text_target = Some("content");
                     } else {
                         text_target = None;
@@ -2100,9 +2095,9 @@ pub fn parse_get_attachment_inline(body: &[u8]) -> Result<Vec<GetAttachmentInlin
                 }
             }
             Event::End(e) => {
-                let local = e.local_name().as_ref().to_vec();
-                if (local.eq_ignore_ascii_case(b"FileAttachment")
-                    || local.eq_ignore_ascii_case(b"ItemAttachment"))
+                let local = e.local_name().as_ref().to_owned();
+                if (local.eq_ignore_ascii_case("FileAttachment")
+                    || local.eq_ignore_ascii_case("ItemAttachment"))
                     && let Some(att) = current.take()
                 {
                     out.push(att);
@@ -2111,8 +2106,8 @@ pub fn parse_get_attachment_inline(body: &[u8]) -> Result<Vec<GetAttachmentInlin
             }
             Event::Text(_) | Event::CData(_) => {
                 let text = match ev {
-                    Event::Text(ref t) => t.decode().map(|c| c.into_owned()).unwrap_or_default(),
-                    Event::CData(ref c) => String::from_utf8_lossy(c.as_ref()).into_owned(),
+                    Event::Text(ref t) => t.as_ref().to_owned(),
+                    Event::CData(ref c) => c.as_ref().to_owned(),
                     _ => unreachable!(),
                 };
 
@@ -2261,7 +2256,7 @@ mod tests {
                </m:GetItemResponseMessage>\
              </m:ResponseMessages></m:GetItemResponse>"
         );
-        let r = parse_response_messages(body.as_bytes(), b"GetItemResponseMessage").unwrap();
+        let r = parse_response_messages(body.as_bytes(), "GetItemResponseMessage").unwrap();
         assert_eq!(r.len(), 2);
         assert!(r[0].success);
         assert!(r[0].inner_xml.contains("<t:ItemId"));
@@ -2285,7 +2280,7 @@ mod tests {
                    <m:Items>{message_xml}</m:Items>\
                  </m:GetItemResponseMessage></m:ResponseMessages></m:GetItemResponse>"
             );
-            let r = parse_response_messages(body.as_bytes(), b"GetItemResponseMessage").unwrap();
+            let r = parse_response_messages(body.as_bytes(), "GetItemResponseMessage").unwrap();
             parse_message_item(&r[0].inner_xml).unwrap()
         }
 
@@ -2323,7 +2318,7 @@ mod tests {
                  <t:IsRead>false</t:IsRead></t:Message></m:Items>\
              </m:GetItemResponseMessage></m:ResponseMessages></m:GetItemResponse>"
         );
-        let r = parse_response_messages(body.as_bytes(), b"GetItemResponseMessage").unwrap();
+        let r = parse_response_messages(body.as_bytes(), "GetItemResponseMessage").unwrap();
         let p = parse_message_item(&r[0].inner_xml).unwrap();
         assert_eq!(
             p.flag_status.as_deref(),
@@ -2628,7 +2623,7 @@ mod tests {
              <t:Contact><t:ItemId Id=\"C1\" ChangeKey=\"K\"/><t:CompanyName>AT&amp;T</t:CompanyName></t:Contact>\
              </m:Items></m:GetItemResponseMessage></m:ResponseMessages></m:GetItemResponse>"
         );
-        let msgs = parse_response_messages(body.as_bytes(), b"GetItemResponseMessage").unwrap();
+        let msgs = parse_response_messages(body.as_bytes(), "GetItemResponseMessage").unwrap();
         assert!(
             msgs[0].inner_xml.contains("AT&amp;T") || msgs[0].inner_xml.contains("AT&T"),
             "capture must preserve the entity for the per-item parser: {}",
@@ -2684,7 +2679,7 @@ mod tests {
              </Message></m:Items></m:GetItemResponseMessage>\
              </m:ResponseMessages></m:GetItemResponse>"
         );
-        let msgs = parse_response_messages(body.as_bytes(), b"GetItemResponseMessage").unwrap();
+        let msgs = parse_response_messages(body.as_bytes(), "GetItemResponseMessage").unwrap();
         assert_eq!(msgs.len(), 1);
         let item = parse_message_item(&msgs[0].inner_xml).unwrap();
         assert_eq!(item.id.id, "NP1");
@@ -2758,7 +2753,7 @@ mod tests {
              <m:Items><t:Message><t:ItemId Id=\"W1\" ChangeKey=\"K\"/></t:Message></m:Items>\
              </m:GetItemResponseMessage></m:ResponseMessages></m:GetItemResponse>"
         );
-        let r = parse_response_messages(body.as_bytes(), b"GetItemResponseMessage").unwrap();
+        let r = parse_response_messages(body.as_bytes(), "GetItemResponseMessage").unwrap();
         assert_eq!(r.len(), 1);
         assert!(r[0].success, "Warning should be success-equivalent");
     }
@@ -2776,7 +2771,7 @@ mod tests {
              <m:ResponseCode>ErrorAccessDenied</m:ResponseCode></m:GetFolderResponseMessage>\
              </m:ResponseMessages></m:GetFolderResponse>"
         );
-        let msgs = parse_response_messages(body.as_bytes(), b"GetFolderResponseMessage").unwrap();
+        let msgs = parse_response_messages(body.as_bytes(), "GetFolderResponseMessage").unwrap();
         assert_eq!(msgs.len(), 2);
         assert!(msgs[0].success);
         let f = parse_folder_inner(&msgs[0].inner_xml).unwrap().unwrap();

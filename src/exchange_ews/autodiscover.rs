@@ -435,31 +435,31 @@ fn parse_pox_response(body: &[u8]) -> Result<PoxOutcome, EwsError> {
         let (_, ev) = xml.read_resolved_event_into(&mut buf)?;
         match ev {
             Event::Start(e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().to_owned();
                 cur.clear();
-                if local.eq_ignore_ascii_case(b"Protocol") {
+                if local.eq_ignore_ascii_case("Protocol") {
                     current_type = None;
                 }
-                if local.eq_ignore_ascii_case(b"Type") {
+                if local.eq_ignore_ascii_case("Type") {
                     current = Some("type");
-                } else if local.eq_ignore_ascii_case(b"EwsUrl") {
+                } else if local.eq_ignore_ascii_case("EwsUrl") {
                     if matches!(current_type.as_deref(), Some("EXPR") | Some("EXCH")) {
                         current = Some("ewsUrl");
                     } else {
                         current = None;
                     }
-                } else if local.eq_ignore_ascii_case(b"Action") {
+                } else if local.eq_ignore_ascii_case("Action") {
                     current = Some("action");
-                } else if local.eq_ignore_ascii_case(b"RedirectAddr") {
+                } else if local.eq_ignore_ascii_case("RedirectAddr") {
                     current = Some("redirectAddr");
-                } else if local.eq_ignore_ascii_case(b"RedirectUrl") {
+                } else if local.eq_ignore_ascii_case("RedirectUrl") {
                     current = Some("redirectUrl");
                 } else {
                     current = None;
                 }
             }
             Event::End(e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().to_owned();
                 if let Some(field) = current.take() {
                     let text = std::mem::take(&mut cur);
                     match field {
@@ -472,15 +472,15 @@ fn parse_pox_response(body: &[u8]) -> Result<PoxOutcome, EwsError> {
                     }
                 }
                 cur.clear();
-                if local.eq_ignore_ascii_case(b"Protocol") {
+                if local.eq_ignore_ascii_case("Protocol") {
                     current_type = None;
                 }
             }
             Event::Text(t) => {
-                cur.push_str(&t.decode().map(|c| c.into_owned()).unwrap_or_default());
+                cur.push_str(&t);
             }
             Event::CData(c) => {
-                cur.push_str(&String::from_utf8_lossy(c.as_ref()));
+                cur.push_str(&c);
             }
             Event::GeneralRef(g) => {
                 if let Some(c) = entity_to_char(&g) {

@@ -8,6 +8,7 @@ use indexmap::IndexMap;
 use rusqlite::{Connection, Row, params};
 use serde_json::{Map, Value};
 
+use crate::db::defaults::unique_default;
 use crate::jmap::blob::{BlobWalkError, InlineShape, import_blob_ids, inline_blob_data_uris};
 use crate::jmap::error::JmapError;
 use crate::jmap::wire::JmapId;
@@ -16,7 +17,7 @@ use crate::jmap::wire::calendar::Calendar;
 use crate::jmap::wire::calendar_event::CalendarEvent;
 use crate::jmap::wire::contact_card::ContactCard;
 use crate::jmap::wire::email::Email;
-use crate::jmap::wire::file_node::FileNode;
+use crate::jmap::wire::file_node::{DirectoryProps, FileNode, FileProps, NodeKind, SymLinkProps};
 use crate::jmap::wire::identity::Identity;
 use crate::jmap::wire::mailbox::Mailbox;
 use crate::jmap::wire::participant_identity::ParticipantIdentity;
@@ -168,7 +169,7 @@ pub fn insert_email(
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             blob_local_id,
-            format_utc(&wire.received_at)?,
+            format_utc(&wire.received_at.unwrap_or(time::OffsetDateTime::UNIX_EPOCH))?,
             id_array_json(&mailbox_locals),
             Value::Array(keywords.iter().map(|k| Value::from(k.as_str())).collect()).to_string(),
             message_match
@@ -248,6 +249,7 @@ pub fn insert_sieve_script(
 pub const SIEVE_SELECT: &str = "SELECT id, name, is_active, blob_id FROM sieve_scripts";
 
 pub fn insert_address_book(conn: &Connection, wire: &AddressBook) -> Result<i64, JmapError> {
+    let is_default = unique_default(conn, ObjectType::AddressBook, wire.is_default, None)?;
     conn.execute(
         "INSERT INTO address_books (name, description, sort_order, is_default, is_subscribed)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -255,7 +257,7 @@ pub fn insert_address_book(conn: &Connection, wire: &AddressBook) -> Result<i64,
             wire.name,
             wire.description,
             wire.sort_order,
-            wire.is_default as i64,
+            is_default as i64,
             wire.is_subscribed as i64
         ],
     )?;
@@ -266,6 +268,7 @@ pub const ADDRESS_BOOK_SELECT: &str =
     "SELECT id, name, description, sort_order, is_default, is_subscribed FROM address_books";
 
 pub fn insert_calendar(conn: &Connection, wire: &Calendar) -> Result<i64, JmapError> {
+    let is_default = unique_default(conn, ObjectType::Calendar, wire.is_default, None)?;
     conn.execute(
         "INSERT INTO calendars (name, description, color, sort_order, is_subscribed, is_visible,
             is_default, include_in_availability, default_alerts_with_time,
@@ -278,7 +281,7 @@ pub fn insert_calendar(conn: &Connection, wire: &Calendar) -> Result<i64, JmapEr
             wire.sort_order,
             wire.is_subscribed as i64,
             wire.is_visible as i64,
-            wire.is_default as i64,
+            is_default as i64,
             wire.include_in_availability,
             opt_json(&wire.default_alerts_with_time)?,
             opt_json(&wire.default_alerts_without_time)?,
@@ -296,10 +299,11 @@ pub fn insert_participant_identity(
     conn: &Connection,
     wire: &ParticipantIdentity,
 ) -> Result<i64, JmapError> {
+    let is_default = unique_default(conn, ObjectType::ParticipantIdentity, wire.is_default, None)?;
     conn.execute(
         "INSERT INTO participant_identities (name, calendar_address, is_default)
          VALUES (?1, ?2, ?3)",
-        params![wire.name, wire.calendar_address, wire.is_default as i64],
+        params![wire.name, wire.calendar_address, is_default as i64],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -314,36 +318,62 @@ pub fn insert_file_node(
     resolver: &impl LocalResolver,
 ) -> Result<i64, JmapError> {
     let parent = opt_parent(resolver, ObjectType::FileNode, &wire.parent_id);
-    let node_type = serde_json::to_value(wire.node_type)?
-        .as_str()
-        .unwrap_or("file")
-        .to_owned();
-    let target = match &wire.target {
-        Some(t) => Some(serde_json::to_string(t)?),
-        None => None,
-    };
+    let cols = FileNodeColumns::new(&wire.kind)?;
     conn.execute(
         "INSERT INTO file_nodes (parent_id, node_type, blob_id, target, name, media_type,
-            created, modified, is_subscribed, role)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            created, modified, is_subscribed, role, executable)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             parent,
-            node_type,
+            wire.kind.db_name(),
             blob_local_id,
-            target,
+            cols.target,
             wire.name,
-            wire.media_type,
+            cols.media_type,
             format_utc(&wire.created)?,
             opt_format_utc(&wire.modified)?,
-            wire.is_subscribed as i64,
-            wire.role
+            cols.is_subscribed as i64,
+            cols.role,
+            cols.executable as i64
         ],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
+struct FileNodeColumns<'a> {
+    target: Option<String>,
+    media_type: Option<&'a str>,
+    is_subscribed: bool,
+    role: Option<&'a str>,
+    executable: bool,
+}
+
+impl<'a> FileNodeColumns<'a> {
+    fn new(kind: &'a NodeKind) -> Result<Self, JmapError> {
+        let mut cols = FileNodeColumns {
+            target: None,
+            media_type: None,
+            is_subscribed: true,
+            role: None,
+            executable: false,
+        };
+        match kind {
+            NodeKind::File(f) => {
+                cols.media_type = f.media_type.as_deref();
+                cols.executable = f.executable;
+            }
+            NodeKind::Directory(d) => {
+                cols.role = d.role.as_deref();
+                cols.is_subscribed = d.is_subscribed;
+            }
+            NodeKind::SymLink(l) => cols.target = Some(serde_json::to_string(&l.target)?),
+        }
+        Ok(cols)
+    }
+}
+
 pub const FILE_NODE_SELECT: &str = "SELECT id, parent_id, node_type, blob_id, target, name, \
-     media_type, created, modified, is_subscribed, role FROM file_nodes";
+     media_type, created, modified, is_subscribed, role, executable FROM file_nodes";
 
 pub fn insert_contact_card(
     conn: &Connection,
@@ -495,6 +525,12 @@ pub fn update_address_book(
     local_id: i64,
     wire: &AddressBook,
 ) -> Result<bool, JmapError> {
+    let is_default = unique_default(
+        conn,
+        ObjectType::AddressBook,
+        wire.is_default,
+        Some(local_id),
+    )?;
     let n = conn.execute(
         "UPDATE address_books SET name = ?1, description = ?2, sort_order = ?3, is_default = ?4,
             is_subscribed = ?5
@@ -504,7 +540,7 @@ pub fn update_address_book(
             wire.name,
             wire.description,
             wire.sort_order,
-            wire.is_default as i64,
+            is_default as i64,
             wire.is_subscribed as i64,
             local_id
         ],
@@ -517,6 +553,7 @@ pub fn update_calendar(
     local_id: i64,
     wire: &Calendar,
 ) -> Result<bool, JmapError> {
+    let is_default = unique_default(conn, ObjectType::Calendar, wire.is_default, Some(local_id))?;
     let n = conn.execute(
         "UPDATE calendars SET name = ?1, description = ?2, color = ?3, sort_order = ?4,
             is_subscribed = ?5, is_visible = ?6, is_default = ?7, include_in_availability = ?8,
@@ -533,7 +570,7 @@ pub fn update_calendar(
             wire.sort_order,
             wire.is_subscribed as i64,
             wire.is_visible as i64,
-            wire.is_default as i64,
+            is_default as i64,
             wire.include_in_availability,
             opt_json(&wire.default_alerts_with_time)?,
             opt_json(&wire.default_alerts_without_time)?,
@@ -549,13 +586,19 @@ pub fn update_participant_identity(
     local_id: i64,
     wire: &ParticipantIdentity,
 ) -> Result<bool, JmapError> {
+    let is_default = unique_default(
+        conn,
+        ObjectType::ParticipantIdentity,
+        wire.is_default,
+        Some(local_id),
+    )?;
     let n = conn.execute(
         "UPDATE participant_identities SET name = ?1, calendar_address = ?2, is_default = ?3
          WHERE id = ?4 AND (name IS NOT ?1 OR calendar_address IS NOT ?2 OR is_default IS NOT ?3)",
         params![
             wire.name,
             wire.calendar_address,
-            wire.is_default as i64,
+            is_default as i64,
             local_id
         ],
     )?;
@@ -570,31 +613,27 @@ pub fn update_file_node(
     resolver: &impl LocalResolver,
 ) -> Result<bool, JmapError> {
     let parent = opt_parent(resolver, ObjectType::FileNode, &wire.parent_id);
-    let node_type = serde_json::to_value(wire.node_type)?
-        .as_str()
-        .unwrap_or("file")
-        .to_owned();
-    let target = match &wire.target {
-        Some(t) => Some(serde_json::to_string(t)?),
-        None => None,
-    };
+    let cols = FileNodeColumns::new(&wire.kind)?;
     let n = conn.execute(
         "UPDATE file_nodes SET parent_id = ?1, node_type = ?2, blob_id = ?3, target = ?4,
-            name = ?5, media_type = ?6, created = ?7, modified = ?8, is_subscribed = ?9, role = ?10
-         WHERE id = ?11 AND (parent_id IS NOT ?1 OR node_type IS NOT ?2 OR blob_id IS NOT ?3
+            name = ?5, media_type = ?6, created = ?7, modified = ?8, is_subscribed = ?9,
+            role = ?10, executable = ?11
+         WHERE id = ?12 AND (parent_id IS NOT ?1 OR node_type IS NOT ?2 OR blob_id IS NOT ?3
             OR target IS NOT ?4 OR name IS NOT ?5 OR media_type IS NOT ?6 OR created IS NOT ?7
-            OR modified IS NOT ?8 OR is_subscribed IS NOT ?9 OR role IS NOT ?10)",
+            OR modified IS NOT ?8 OR is_subscribed IS NOT ?9 OR role IS NOT ?10
+            OR executable IS NOT ?11)",
         params![
             parent,
-            node_type,
+            wire.kind.db_name(),
             blob_local_id,
-            target,
+            cols.target,
             wire.name,
-            wire.media_type,
+            cols.media_type,
             format_utc(&wire.created)?,
             opt_format_utc(&wire.modified)?,
-            wire.is_subscribed as i64,
-            wire.role,
+            cols.is_subscribed as i64,
+            cols.role,
+            cols.executable as i64,
             local_id
         ],
     )?;
@@ -828,24 +867,36 @@ pub fn row_to_file_node(
         ),
         None => None,
     };
-    let node_type = serde_json::from_value(Value::from(row.get::<_, String>(2)?))?;
-    let target: Option<Vec<String>> = from_opt_json(row.get::<_, Option<String>>(4)?)?;
-    let blob_local_id: Option<i64> = row.get(3)?;
+    let node_type: String = row.get(2)?;
+    let kind = match node_type.as_str() {
+        "file" => NodeKind::File(FileProps {
+            blob_id: None,
+            media_type: row.get(6)?,
+            executable: row.get::<_, i64>(11)? != 0,
+        }),
+        "directory" => NodeKind::Directory(DirectoryProps {
+            role: row.get(10)?,
+            is_subscribed: row.get::<_, i64>(9)? != 0,
+        }),
+        "symlink" => NodeKind::SymLink(SymLinkProps {
+            target: from_opt_json(row.get::<_, Option<String>>(4)?)?.unwrap_or_default(),
+        }),
+        other => {
+            return Err(JmapError::malformed(format!(
+                "unknown file_node type {other}"
+            )));
+        }
+    };
     Ok(FileNodeRow {
         wire: FileNode {
             id: None,
             parent_id,
-            node_type,
-            blob_id: None,
-            target,
             name: row.get(5)?,
-            media_type: row.get(6)?,
             created: parse_utc(&row.get::<_, String>(7)?)?,
             modified: opt_parse_utc(row.get::<_, Option<String>>(8)?)?,
-            is_subscribed: row.get::<_, i64>(9)? != 0,
-            role: row.get(10)?,
+            kind,
         },
-        blob_local_id,
+        blob_local_id: row.get(3)?,
     })
 }
 
@@ -878,6 +929,7 @@ fn opt_format_utc(value: &Option<time::OffsetDateTime>) -> Result<Option<String>
 mod tests {
     use super::*;
     use crate::db::init;
+    use encodify::base64::STANDARD;
     use std::collections::HashMap;
 
     struct MapResolver {
@@ -910,15 +962,12 @@ mod tests {
     }
 
     fn decode_data_uri(value: &Value, media_type: &str) -> Vec<u8> {
-        use base64::Engine;
         let uri = value.as_str().unwrap_or_else(|| panic!("{value} is a URI"));
         let prefix = format!("data:{media_type};base64,");
         let payload = uri
             .strip_prefix(&prefix)
             .unwrap_or_else(|| panic!("{uri} does not start with {prefix}"));
-        base64::engine::general_purpose::STANDARD
-            .decode(payload)
-            .expect("base64 payload")
+        STANDARD.decode(payload).expect("base64 payload")
     }
 
     fn assert_no_blob_id(value: &Value) {
@@ -1284,7 +1333,7 @@ mod tests {
         };
         let node: FileNode = serde_json::from_value(serde_json::json!({
             "id": "F1",
-            "nodeType": "symlink",
+            "@type": "SymLink",
             "target": ["..", "etc", "hosts"],
             "name": "link",
             "created": "2022-02-02T02:02:02Z"
@@ -1393,7 +1442,7 @@ mod tests {
             to_target: HashMap::new(),
         };
         let dir: FileNode = serde_json::from_value(serde_json::json!({
-            "id": "D1", "nodeType": "directory", "name": "Docs",
+            "id": "D1", "@type": "Directory", "name": "Docs",
             "created": "2022-02-02T02:02:02Z"
         }))
         .unwrap();
@@ -1401,8 +1450,8 @@ mod tests {
         res.to_local
             .insert((ObjectType::FileNode, "D1".to_owned()), dirl);
         let file: FileNode = serde_json::from_value(serde_json::json!({
-            "id": "F1", "nodeType": "file", "parentId": "D1", "name": "a.bin",
-            "type": "application/octet-stream", "created": "2022-02-02T02:02:02Z"
+            "id": "F1", "@type": "File", "parentId": "D1", "name": "a.bin",
+            "mediaType": "application/octet-stream", "created": "2022-02-02T02:02:02Z"
         }))
         .unwrap();
         let blob = crate::db::blobs::intern_blob(&c, b"bytes").unwrap();
@@ -1420,6 +1469,72 @@ mod tests {
         assert_eq!(got.wire.name, "a.bin");
         assert_eq!(got.wire.parent_id, Some(JmapId("TGTD".to_owned())));
         assert_eq!(got.blob_local_id, Some(blob));
+    }
+
+    // Each @type serializes only the properties the draft defines for it.
+    #[test]
+    fn file_node_row_to_wire_emits_only_type_specific_properties() {
+        let c = mem();
+        let mut res = MapResolver {
+            to_local: HashMap::new(),
+            to_target: HashMap::new(),
+        };
+        let nodes = [
+            serde_json::json!({"id": "D1", "@type": "Directory", "name": "Docs",
+                "role": "documents", "isSubscribed": false,
+                "created": "2022-02-02T02:02:02Z"}),
+            serde_json::json!({"id": "F1", "@type": "File", "name": "run.sh",
+                "blobId": "B1", "mediaType": "text/x-sh", "executable": true, "size": 3,
+                "created": "2022-02-02T02:02:02Z"}),
+            serde_json::json!({"id": "L1", "@type": "SymLink", "name": "latest",
+                "target": ["", "Docs"], "created": "2022-02-02T02:02:02Z"}),
+        ];
+        let blob = crate::db::blobs::intern_blob(&c, b"#!\n").unwrap();
+        let mut out = Vec::new();
+        for (i, n) in nodes.into_iter().enumerate() {
+            let w: FileNode = serde_json::from_value(n).unwrap();
+            let blob_local = matches!(w.kind, NodeKind::File(_)).then_some(blob);
+            let l = insert_file_node(&c, &w, blob_local, &res).unwrap();
+            res.to_target
+                .insert((ObjectType::FileNode, l), format!("T{i}"));
+            let row = c
+                .query_row(
+                    &format!("{FILE_NODE_SELECT} WHERE id = ?1"),
+                    params![l],
+                    |r| Ok(row_to_file_node(r, &res)),
+                )
+                .unwrap()
+                .unwrap();
+            out.push(serde_json::to_value(&row.wire).unwrap());
+        }
+        let keys = |v: &Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort_unstable();
+            k
+        };
+        assert_eq!(
+            keys(&out[0]),
+            ["@type", "created", "isSubscribed", "name", "role"]
+        );
+        assert_eq!(out[0]["@type"], "Directory");
+        assert_eq!(out[0]["isSubscribed"], false);
+        assert_eq!(
+            keys(&out[1]),
+            ["@type", "created", "executable", "mediaType", "name"]
+        );
+        assert_eq!(out[1]["executable"], true);
+        assert_eq!(out[1]["mediaType"], "text/x-sh");
+        assert_eq!(keys(&out[2]), ["@type", "created", "name", "target"]);
+        assert_eq!(out[2]["@type"], "SymLink");
+        assert_eq!(out[2]["target"], serde_json::json!(["", "Docs"]));
+    }
+
+    #[test]
+    fn file_node_rejects_unknown_type() {
+        let r: Result<FileNode, _> = serde_json::from_value(serde_json::json!({
+            "id": "X1", "@type": "Socket", "name": "s", "created": "2022-02-02T02:02:02Z"
+        }));
+        assert!(r.is_err());
     }
 
     fn one_row(c: &Connection, table: &str) -> i64 {
@@ -1636,30 +1751,31 @@ mod tests {
             to_target: HashMap::new(),
         };
         let file: FileNode = serde_json::from_value(serde_json::json!({
-            "id":"F1","nodeType":"file","name":"a.bin",
-            "type":"application/octet-stream","created":"2022-02-02T02:02:02Z"
+            "id":"F1","@type":"File","name":"a.bin",
+            "mediaType":"application/octet-stream","created":"2022-02-02T02:02:02Z"
         }))
         .unwrap();
         let blob1 = crate::db::blobs::intern_blob(&c, b"v1").unwrap();
         let local = insert_file_node(&c, &file, Some(blob1), &res).unwrap();
         let blob2 = crate::db::blobs::intern_blob(&c, b"v2").unwrap();
         let changed: FileNode = serde_json::from_value(serde_json::json!({
-            "id":"F1","nodeType":"file","name":"renamed.bin",
-            "type":"text/plain","created":"2022-02-02T02:02:02Z"
+            "id":"F1","@type":"File","name":"renamed.bin",
+            "mediaType":"text/plain","executable":true,"created":"2022-02-02T02:02:02Z"
         }))
         .unwrap();
         update_file_node(&c, local, &changed, Some(blob2), &res).unwrap();
         assert_eq!(one_row(&c, "file_nodes"), 1);
-        let (name, mt, b): (String, Option<String>, Option<i64>) = c
+        let (name, mt, b, x): (String, Option<String>, Option<i64>, i64) = c
             .query_row(
-                "SELECT name, media_type, blob_id FROM file_nodes WHERE id=?1",
+                "SELECT name, media_type, blob_id, executable FROM file_nodes WHERE id=?1",
                 params![local],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
         assert_eq!(name, "renamed.bin");
         assert_eq!(mt.as_deref(), Some("text/plain"));
         assert_eq!(b, Some(blob2));
+        assert_eq!(x, 1);
     }
 
     #[test]
