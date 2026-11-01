@@ -14,3 +14,6 @@ publish-jobs = ["homebrew", "npm"]
 install-updater = false
 github-attestations = true
 allow-dirty = ["ci", "msi"]
+
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-latest"
