@@ -168,6 +168,18 @@ vandelay import jmap \
 
 Imports a single JMAP account. `--objects` accepts a comma-separated list of object tokens (`mailbox,email,calendar,calendarevent,addressbook,contactcard,identity,sievescript,participantidentity,filenode`); default is everything the server advertises.
 
+`--changeset-out PATH` optionally writes a standard SQLite changeset covering this
+invocation's writes, including synchronization metadata and blob garbage collection.
+The destination must not exist; on Unix it is created with mode `0600`. An unchanged
+import writes an empty file. Partial or failed imports do not provide a usable
+export, and export errors fail the command. `--dry-run` cannot be combined with
+this option. If an application table has no declared primary key, the import
+continues without creating the file, so callers can fall back to a full diff.
+
+The recorder starts after archive schema initialization and records only this
+process. Callers must compare schemas separately and use a full base-to-final
+diff after any retry or resumed import to include earlier committed writes.
+
 #### IMAP
 
 ```
@@ -314,6 +326,9 @@ Read-only dump of a local archive. This command never opens a network connection
 ## Testing
 
 The default suite is hermetic (unit tests plus `mockito`-scripted JMAP/DAV/EWS/Graph behaviours) and needs no network or Docker:
+
+Building requires clang and libclang (for example, `clang libclang-dev` on Debian or `clang-dev`
+on Alpine), because SQLite Session bindings are generated at build time.
 
 ```sh
 cargo build

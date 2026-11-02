@@ -10,6 +10,9 @@ pub mod pool;
 pub mod tree;
 
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 
 use rusqlite::Connection;
@@ -174,8 +177,38 @@ pub fn run(common: CommonConfig, config: ImportConfig) -> Result<Summary, Error>
 }
 
 pub fn run_reporting(common: CommonConfig, config: ImportConfig) -> RunOutcome {
+    run_reporting_with_changeset(common, config, None)
+}
+
+/// Optionally export changes made by this invocation, not earlier partial imports.
+pub fn run_reporting_with_changeset(
+    common: CommonConfig,
+    config: ImportConfig,
+    changeset_out: Option<&Path>,
+) -> RunOutcome {
     let mut summary = Summary::default();
-    let error = run_into(common, config, &mut summary).err();
+    let error = (|| {
+        if let Some(path) = changeset_out {
+            if common.dry_run {
+                return Err(Error::Usage(
+                    "changeset export is unavailable in dry-run mode".into(),
+                ));
+            }
+            match path.symlink_metadata() {
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "changeset destination already exists",
+                    )
+                    .into());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        run_into(common, config, &mut summary, changeset_out)
+    })()
+    .err();
     RunOutcome { summary, error }
 }
 
@@ -183,9 +216,15 @@ fn run_into(
     common: CommonConfig,
     config: ImportConfig,
     summary: &mut Summary,
+    changeset_out: Option<&Path>,
 ) -> Result<(), Error> {
     let logger = common.logger;
     let ctx = Context::open(common, &config.connect)?;
+    let session = if changeset_out.is_some() {
+        recording_session(&ctx.conn)?
+    } else {
+        None
+    };
     let connected = connect::prepare(&ctx, &config.connect)?;
 
     let work = work_list(&config, &connected);
@@ -306,7 +345,51 @@ fn run_into(
 
     summary.retries_observed = ctx.client.retries_observed();
     summary.retry_after_sleeps = ctx.client.retry_after_sleeps();
+    if !summary.any_failed()
+        && let (Some(mut session), Some(path)) = (session, changeset_out)
+    {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut output = options.open(path)?;
+        let result = (|| -> Result<(), Error> {
+            session.changeset_strm(&mut output)?;
+            output.flush()?;
+            Ok(())
+        })();
+        drop(output);
+        if result.is_err() {
+            let _ = std::fs::remove_file(path);
+        }
+        result?;
+    }
     Ok(())
+}
+
+fn recording_session(conn: &Connection) -> Result<Option<rusqlite::session::Session<'_>>, Error> {
+    let tables = conn.prepare(
+        "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*' ORDER BY name"
+    )?.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    for table in &tables {
+        let has_key: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE pk > 0)",
+            [table],
+            |r| r.get(0),
+        )?;
+        if !has_key {
+            // Do not emit a changeset that silently omits an application table.
+            return Ok(None);
+        }
+    }
+    let mut session = rusqlite::session::Session::new(conn)?;
+    for table in tables {
+        session.attach(Some(table.as_str()))?;
+    }
+    Ok(Some(session))
 }
 
 fn import_vacation_response(conn: &Connection, net: &Net, source_id: i64) -> Result<u64, Error> {
@@ -1209,6 +1292,47 @@ mod tests {
     use crate::db::sources::{SourceKey, upsert_source};
     use crate::jmap::wire::JmapId;
     use crate::logging::Logger;
+
+    #[test]
+    fn native_recording_replays_net_changes_and_rollbacks() {
+        let schema = "CREATE TABLE items(a INTEGER, b TEXT, data BLOB, PRIMARY KEY(a,b));
+                      INSERT INTO items VALUES(1,'key',X'00FF');";
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(schema).unwrap();
+        let mut session = recording_session(&conn).unwrap().unwrap();
+        conn.execute_batch(
+            "UPDATE items SET data=X'01' WHERE a=1;
+             BEGIN; UPDATE items SET data=X'02' WHERE a=1; ROLLBACK;
+             SAVEPOINT retry; DELETE FROM items; ROLLBACK TO retry; RELEASE retry;
+             INSERT INTO items VALUES(2,'temporary',X'03');
+             DELETE FROM items WHERE a=2;
+             INSERT OR REPLACE INTO items VALUES(1,'key',X'04FF');",
+        )
+        .unwrap();
+        let mut delta = Vec::new();
+        session.changeset_strm(&mut delta).unwrap();
+        let replay = Connection::open_in_memory().unwrap();
+        replay.execute_batch(schema).unwrap();
+        replay
+            .apply_strm(&mut delta.as_slice(), None::<fn(&str) -> bool>, |_, _| {
+                rusqlite::session::ConflictAction::SQLITE_CHANGESET_ABORT
+            })
+            .unwrap();
+        let rows = replay
+            .prepare("SELECT a,b,data FROM items")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![(1, "key".into(), vec![4, 255])]);
+    }
 
     fn mem() -> (Connection, i64) {
         let c = Connection::open_in_memory().unwrap();

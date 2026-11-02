@@ -129,6 +129,13 @@ struct GlobalArgs {
 #[command(group(clap::ArgGroup::new("auth").required(true).args(["auth_basic", "auth_bearer"])))]
 #[command(group(clap::ArgGroup::new("account").required(true).args(["account_id", "account_name"])))]
 struct JmapImportArgs {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write a native SQLite changeset after a successful import"
+    )]
+    changeset_out: Option<PathBuf>,
+
     #[arg(long, value_name = "URL", help = "Base URL or full JMAP session URL")]
     url: String,
 
@@ -376,6 +383,7 @@ struct InspectArgs {
 
 pub enum Action {
     Import(CommonConfig, ImportConfig),
+    ImportWithChangeset(CommonConfig, ImportConfig, PathBuf),
     ImportImap(CommonConfig, ImapImportConfig),
     ImportDav(CommonConfig, DavImportConfig),
     ImportManageSieve(CommonConfig, ManageSieveImportConfig),
@@ -757,6 +765,11 @@ fn resolve_dav_auth(
 
 fn resolve_jmap_import(args: JmapImportArgs) -> Result<Action, Error> {
     let common = common_config(&args.global, args.archive);
+    if common.dry_run && args.changeset_out.is_some() {
+        return Err(Error::Usage(
+            "--changeset-out cannot be used with --dry-run".into(),
+        ));
+    }
     let auth = resolve_auth(
         args.auth_basic.as_deref(),
         args.auth_password.as_deref(),
@@ -765,18 +778,19 @@ fn resolve_jmap_import(args: JmapImportArgs) -> Result<Action, Error> {
     let account = resolve_account(args.account_id, args.account_name)?;
     let objects = args.objects.as_deref().map(parse_object_list).transpose()?;
 
-    Ok(Action::Import(
-        common,
-        ImportConfig {
-            connect: ConnectConfig {
-                url: args.url,
-                auth,
-                account,
-            },
-            objects,
-            allow_source_change: args.allow_source_change,
+    let config = ImportConfig {
+        connect: ConnectConfig {
+            url: args.url,
+            auth,
+            account,
         },
-    ))
+        objects,
+        allow_source_change: args.allow_source_change,
+    };
+    Ok(match args.changeset_out {
+        Some(path) => Action::ImportWithChangeset(common, config, path),
+        None => Action::Import(common, config),
+    })
 }
 
 fn resolve_imap_import(args: ImapImportArgs) -> Result<Action, Error> {
