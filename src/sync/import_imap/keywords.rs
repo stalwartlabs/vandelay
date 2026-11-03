@@ -66,6 +66,48 @@ pub fn translate_flags(imap_flags: &[String], include_deleted: bool) -> Translat
     }
 }
 
+pub fn merge_keywords(imap_keywords: &[String], mime_keywords: &[String]) -> Vec<String> {
+    let mut keywords = Vec::with_capacity(imap_keywords.len() + mime_keywords.len());
+    for keyword in imap_keywords.iter().chain(mime_keywords) {
+        if !keywords
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(keyword))
+        {
+            keywords.push(keyword.clone());
+        }
+    }
+    keywords
+}
+
+pub fn normalize_mime_keyword(keyword: &str) -> Option<String> {
+    let mut normalized = String::with_capacity(keyword.len());
+    let mut previous_was_separator = false;
+    for ch in keyword.trim().chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            normalized.push(ch);
+            previous_was_separator = false;
+        } else if !previous_was_separator {
+            normalized.push('_');
+            previous_was_separator = true;
+        }
+    }
+    while normalized.ends_with('_') {
+        normalized.pop();
+    }
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+pub fn normalize_mime_keywords(keywords: &[String]) -> Vec<String> {
+    keywords
+        .iter()
+        .filter_map(|keyword| normalize_mime_keyword(keyword))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +211,27 @@ mod tests {
             t.keywords,
             vec!["MyLabel", "$seen", "$Important", "$flagged"]
         );
+    }
+
+    #[test]
+    fn merges_imap_and_mime_keywords_without_duplicates() {
+        let merged = merge_keywords(
+            &["$seen".to_owned(), "VIP".to_owned()],
+            &["bearbeitet von KL".to_owned(), "vip".to_owned()],
+        );
+        assert_eq!(merged, vec!["$seen", "VIP", "bearbeitet von KL"]);
+    }
+
+    #[test]
+    fn normalizes_mime_keywords_for_jmap() {
+        assert_eq!(
+            normalize_mime_keyword("bearbeitet von AZ").as_deref(),
+            Some("bearbeitet_von_AZ")
+        );
+        assert_eq!(
+            normalize_mime_keyword("  Review / Legal  ").as_deref(),
+            Some("Review_Legal")
+        );
+        assert_eq!(normalize_mime_keyword("---"), None);
     }
 }

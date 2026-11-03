@@ -30,6 +30,36 @@ pub fn email_index_from_blob(bytes: &[u8]) -> EmailIndex {
     email_meta_from_blob(bytes).0
 }
 
+pub fn mime_keywords_from_blob(bytes: &[u8]) -> Vec<String> {
+    let Some(message) = MessageParser::default().parse(bytes) else {
+        return Vec::new();
+    };
+    let mut keywords = Vec::new();
+    for value in message.header_values(HeaderName::Other("Keywords".into())) {
+        match value {
+            HeaderValue::Text(value) => add_mime_keywords(value.as_ref(), &mut keywords),
+            HeaderValue::TextList(values) => {
+                for value in values {
+                    add_mime_keywords(value.as_ref(), &mut keywords);
+                }
+            }
+            _ => {}
+        }
+    }
+    keywords
+}
+
+fn add_mime_keywords(value: &str, keywords: &mut Vec<String>) {
+    for keyword in value.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+        if !keywords
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(keyword))
+        {
+            keywords.push(keyword.to_owned());
+        }
+    }
+}
+
 pub fn email_meta_from_blob(bytes: &[u8]) -> (EmailIndex, Option<String>) {
     let Some(m) = MessageParser::default().parse(bytes) else {
         return (email_index(&[], &[], "", "", &[]), None);
@@ -98,6 +128,20 @@ mod tests {
             email_key(&idx),
             EmailKey::MessageId("a@h\u{1f}b@h".to_owned())
         );
+    }
+
+    #[test]
+    fn parses_mime_keywords() {
+        let keywords = mime_keywords_from_blob(
+            b"Keywords: bearbeitet von KL, Wiedervorlage\r\nKeywords: VIP\r\n\r\nbody",
+        );
+        assert_eq!(keywords, vec!["bearbeitet von KL", "Wiedervorlage", "VIP"]);
+    }
+
+    #[test]
+    fn ignores_empty_mime_keywords() {
+        let keywords = mime_keywords_from_blob(b"Keywords: ,  \r\n\r\nbody");
+        assert!(keywords.is_empty());
     }
 
     #[test]
