@@ -7,6 +7,9 @@ All notable changes to this project will be documented in this file. This projec
 ### Added
 - IMAP: `--mime-keywords` imports the phrases of the `Keywords:` header as JMAP keywords, which is how Exchange exposes categories over IMAP (#55)
 
+### Fixed
+- MS Exchange EWS: with Basic or delegated OAuth authentication, `--mailbox` naming another mailbox (one the signed-in user has FullAccess to) still imported the signed-in user's own mailbox; folders are now addressed in the mailbox given by `--mailbox`
+
 ## [1.0.14] - 2026-11-01
 
 ### Added

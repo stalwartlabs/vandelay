@@ -10,7 +10,17 @@ use crate::exchange_ews::types::{DistinguishedFolderId, FolderId, ItemId, Server
 #[derive(Debug, Clone, Copy)]
 pub enum FolderRef<'a> {
     Distinguished(DistinguishedFolderId),
+    DistinguishedIn(DistinguishedFolderId, &'a str),
     Concrete(&'a FolderId),
+}
+
+impl<'a> FolderRef<'a> {
+    pub fn distinguished(id: DistinguishedFolderId, mailbox: Option<&'a str>) -> FolderRef<'a> {
+        match mailbox {
+            Some(mailbox) => FolderRef::DistinguishedIn(id, mailbox),
+            None => FolderRef::Distinguished(id),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -260,6 +270,13 @@ fn write_folder_ref(out: &mut String, parent: FolderRef<'_>) {
             out.push_str(d.as_str());
             out.push_str("\"/>");
         }
+        FolderRef::DistinguishedIn(d, mailbox) => {
+            out.push_str("<t:DistinguishedFolderId Id=\"");
+            out.push_str(d.as_str());
+            out.push_str("\"><t:Mailbox><t:EmailAddress>");
+            write_escaped(out, mailbox);
+            out.push_str("</t:EmailAddress></t:Mailbox></t:DistinguishedFolderId>");
+        }
         FolderRef::Concrete(f) => write_folder_id_element(out, f),
     }
 }
@@ -288,6 +305,27 @@ mod tests {
             Traversal::Deep,
         );
         assert!(body.contains("<t:DistinguishedFolderId Id=\"archiveroot\"/>"));
+    }
+
+    #[test]
+    fn distinguished_folder_in_named_mailbox_carries_escaped_address() {
+        let body = find_folder_body(
+            FolderRef::distinguished(
+                DistinguishedFolderId::MsgFolderRoot,
+                Some("b&o@corp.example"),
+            ),
+            Traversal::Deep,
+        );
+        assert!(body.contains(
+            "<t:DistinguishedFolderId Id=\"msgfolderroot\"><t:Mailbox>\
+             <t:EmailAddress>b&amp;o@corp.example</t:EmailAddress></t:Mailbox>\
+             </t:DistinguishedFolderId>"
+        ));
+        let body = find_folder_body(
+            FolderRef::distinguished(DistinguishedFolderId::MsgFolderRoot, None),
+            Traversal::Deep,
+        );
+        assert!(body.contains("<t:DistinguishedFolderId Id=\"msgfolderroot\"/>"));
     }
 
     #[test]

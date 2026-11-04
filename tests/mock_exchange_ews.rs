@@ -936,3 +936,76 @@ fn get_folder_messages_preserve_position_when_one_errors() {
     assert!(!msgs[1].success);
     assert!(msgs[2].success);
 }
+
+fn plan_folders_against_mock(
+    kind: vandelay::exchange_ews::types::MailboxKind,
+    mailbox: Option<&str>,
+    body_matcher: Matcher,
+) {
+    use vandelay::logging::Logger;
+    use vandelay::sync::import_exchange_ews::folders::plan_folders;
+
+    let mut server = mockito::Server::new();
+    let url = format!("{}/EWS/Exchange.asmx", server.url());
+    let find_folder = envelope(&format!(
+        "<m:FindFolderResponse{NS}><m:ResponseMessages><m:FindFolderResponseMessage ResponseClass=\"Success\">\
+         <m:ResponseCode>NoError</m:ResponseCode>\
+         <m:RootFolder TotalItemsInView=\"0\" IncludesLastItemInRange=\"true\"><t:Folders/></m:RootFolder>\
+         </m:FindFolderResponseMessage></m:ResponseMessages></m:FindFolderResponse>"
+    ));
+    let get_folder = envelope(&format!(
+        "<m:GetFolderResponse{NS}><m:ResponseMessages>\
+         <m:GetFolderResponseMessage ResponseClass=\"Success\">\
+         <m:ResponseCode>NoError</m:ResponseCode>\
+         <m:Folders><t:Folder><t:FolderId Id=\"ROOT\" ChangeKey=\"K\"/></t:Folder></m:Folders>\
+         </m:GetFolderResponseMessage></m:ResponseMessages></m:GetFolderResponse>"
+    ));
+    let find = server
+        .mock("POST", "/EWS/Exchange.asmx")
+        .match_header("soapaction", Matcher::Regex("/FindFolder\"$".into()))
+        .match_body(body_matcher.clone())
+        .with_status(200)
+        .with_header("content-type", TXT_XML)
+        .with_body(find_folder)
+        .expect(1)
+        .create();
+    let get = server
+        .mock("POST", "/EWS/Exchange.asmx")
+        .match_header("soapaction", Matcher::Regex("/GetFolder\"$".into()))
+        .match_body(body_matcher)
+        .with_status(200)
+        .with_header("content-type", TXT_XML)
+        .with_body(get_folder)
+        .expect_at_least(1)
+        .create();
+
+    let plan = plan_folders(&client(0), &url, kind, mailbox, Logger::new(0))
+        .expect("folder planning should succeed");
+    assert_eq!(plan.root_folder_id, "ROOT");
+    find.assert();
+    get.assert();
+}
+
+#[test]
+fn explicit_mailbox_addresses_distinguished_folders_in_that_mailbox() {
+    // Regression for importing a FullAccess mailbox with Basic auth: folders must name --mailbox.
+    plan_folders_against_mock(
+        vandelay::exchange_ews::types::MailboxKind::Primary,
+        Some("bob@corp.example"),
+        Matcher::Regex(
+            "<t:DistinguishedFolderId Id=\"[a-z]+\"><t:Mailbox><t:EmailAddress>bob@corp.example</t:EmailAddress></t:Mailbox></t:DistinguishedFolderId>".into(),
+        ),
+    );
+}
+
+#[test]
+fn public_folders_ignore_explicit_mailbox() {
+    // Public folder roots cannot carry a Mailbox element.
+    plan_folders_against_mock(
+        vandelay::exchange_ews::types::MailboxKind::PublicFolders,
+        Some("bob@corp.example"),
+        Matcher::Regex(
+            "^(?s)[^@]*<t:DistinguishedFolderId Id=\"publicfoldersroot\"/>[^@]*$".into(),
+        ),
+    );
+}

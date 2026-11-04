@@ -119,8 +119,14 @@ pub fn run(common: CommonConfig, config: EwsImportConfig) -> Result<Summary, Err
     let mut calendar_event_counts = TypeCounts::default();
     let mut contact_counts = TypeCounts::default();
 
-    let plan =
-        plan_folders(&client, &session_url, config.mailbox_kind, logger).map_err(Error::from)?;
+    let plan = plan_folders(
+        &client,
+        &session_url,
+        config.mailbox_kind,
+        config.mailbox.as_deref(),
+        logger,
+    )
+    .map_err(Error::from)?;
 
     folders::reconcile(
         &mut conn,
@@ -189,8 +195,14 @@ fn run_dry(
     config: &EwsImportConfig,
     logger: crate::logging::Logger,
 ) -> Result<Summary, Error> {
-    let plan =
-        plan_folders(client, session_url, config.mailbox_kind, logger).map_err(Error::from)?;
+    let plan = plan_folders(
+        client,
+        session_url,
+        config.mailbox_kind,
+        config.mailbox.as_deref(),
+        logger,
+    )
+    .map_err(Error::from)?;
     let mut summary = Summary::default();
     let mut mailbox_counts = TypeCounts::default();
     let mut calendar_counts = TypeCounts::default();

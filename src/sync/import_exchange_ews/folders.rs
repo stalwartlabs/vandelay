@@ -41,10 +41,12 @@ pub fn plan_folders(
     client: &EwsClient,
     url: &str,
     mailbox_kind: MailboxKind,
+    mailbox: Option<&str>,
     logger: Logger,
 ) -> Result<FolderPlan, EwsError> {
+    let mailbox = mailbox.filter(|_| !matches!(mailbox_kind, MailboxKind::PublicFolders));
     let root = mailbox_kind.distinguished_root();
-    let request = find_folder_body(FolderRef::Distinguished(root), Traversal::Deep);
+    let request = find_folder_body(FolderRef::distinguished(root, mailbox), Traversal::Deep);
     let resp = client.call(url, "FindFolder", &request)?;
     let parsed = parse_find_folder_response(&resp.body)?;
     if logger.enabled(LEVEL_PROGRESS) {
@@ -96,8 +98,8 @@ pub fn plan_folders(
             (_, FolderClass::Skipped) => {}
         }
     }
-    let well_known_roles = resolve_well_known_roles(client, url, mailbox_kind, logger)?;
-    let root_folder_id = resolve_root_folder_id(client, url, mailbox_kind)?;
+    let well_known_roles = resolve_well_known_roles(client, url, mailbox_kind, mailbox, logger)?;
+    let root_folder_id = resolve_root_folder_id(client, url, mailbox_kind, mailbox)?;
     Ok(FolderPlan {
         mail,
         calendar,
@@ -111,6 +113,7 @@ fn resolve_well_known_roles(
     client: &EwsClient,
     url: &str,
     mailbox_kind: MailboxKind,
+    mailbox: Option<&str>,
     logger: Logger,
 ) -> Result<HashMap<String, &'static str>, EwsError> {
     if !matches!(mailbox_kind, MailboxKind::Primary) {
@@ -118,7 +121,7 @@ fn resolve_well_known_roles(
     }
     let folders: Vec<FolderRef<'_>> = WELL_KNOWN_ROLES
         .iter()
-        .map(|(d, _)| FolderRef::Distinguished(*d))
+        .map(|(d, _)| FolderRef::distinguished(*d, mailbox))
         .collect();
     let request = get_folder_body(&folders, FolderShape::IdOnly);
     let resp = match client.call(url, "GetFolder", &request) {
@@ -154,9 +157,13 @@ fn resolve_root_folder_id(
     client: &EwsClient,
     url: &str,
     mailbox_kind: MailboxKind,
+    mailbox: Option<&str>,
 ) -> Result<String, EwsError> {
     let root = mailbox_kind.distinguished_root();
-    let body = get_folder_body(&[FolderRef::Distinguished(root)], FolderShape::IdOnly);
+    let body = get_folder_body(
+        &[FolderRef::distinguished(root, mailbox)],
+        FolderShape::IdOnly,
+    );
     let resp = client.call(url, "GetFolder", &body)?;
     let entries = parse_get_folder_response(&resp.body)?;
     Ok(entries
