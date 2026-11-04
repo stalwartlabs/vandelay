@@ -2938,7 +2938,7 @@ dependencies = [
 
 [[package]]
 name = "vandelay"
-version = "1.0.14"
+version = "1.0.15"
 dependencies = [
  "blake3",
  "calcard",

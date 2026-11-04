@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.15] - Unreleased
+
+### Added
+- IMAP: `--mime-keywords` imports the phrases of the `Keywords:` header as JMAP keywords, which is how Exchange exposes categories over IMAP (#55)
+
 ## [1.0.14] - 2026-11-01
 
 ### Added

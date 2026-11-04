@@ -167,6 +167,7 @@ fn run_import(
         subscribed_only: false,
         automap: true,
         include_deleted: false,
+        mime_keywords: false,
         fetch_batch: 256,
         imap_connections: 1,
         allow_source_change: false,
@@ -915,6 +916,71 @@ fn coordinator_present_flag_change_updates_keywords() {
     assert!(
         kw.contains("$seen") && kw.contains("$flagged"),
         "keywords should reflect the new \\Flagged: {kw}"
+    );
+}
+
+const MSG_BODY_KEYWORDS: &[u8] = b"From: a@b\r\nTo: c@d\r\nSubject: hi\r\nMessage-ID: <m2@h>\r\nKeywords: bearbeitet von KL, VIP\r\nDate: Mon, 12 May 2025 10:00:00 +0000\r\n\r\nhello";
+
+fn stored_keywords(archive: &PathBuf) -> Vec<String> {
+    let dbc = Connection::open(archive).unwrap();
+    let kw: String = dbc
+        .query_row("SELECT keywords FROM emails LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    let mut kws: Vec<String> = serde_json::from_str(&kw).unwrap();
+    kws.sort_unstable();
+    kws
+}
+
+// With --mime-keywords the Keywords header is imported and survives a later IMAP flag refresh.
+#[test]
+fn coordinator_mime_keywords_imported_and_kept_on_flag_refresh() {
+    let mut scripts: Vec<Script> = Vec::new();
+    scripts.extend(single_inbox_scripts(100, 2, MSG_BODY_KEYWORDS));
+    scripts.push(control_script_present_flags(
+        100,
+        2,
+        &[1],
+        &[(1, "\\Seen \\Flagged")],
+    ));
+    scripts.push(worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"));
+    let server = MockImap::start_scripts(scripts);
+    let archive = tempfile("mime_keywords");
+    run_import(&server, "alice", archive.clone(), |c| {
+        c.mime_keywords = true
+    })
+    .expect("first import");
+    let first = stored_keywords(&archive);
+    assert!(
+        first.contains(&"bearbeitet_von_kl".to_owned()) && first.contains(&"vip".to_owned()),
+        "{first:?}"
+    );
+    let summary = run_import(&server, "alice", archive.clone(), |c| {
+        c.mime_keywords = true
+    })
+    .expect("second import");
+    let email = summary
+        .per_type
+        .iter()
+        .find(|(k, _)| *k == "email")
+        .unwrap();
+    assert_eq!(email.1.created, 0);
+    assert_eq!(email.1.updated, 1);
+    let mut expected = first;
+    expected.push("$flagged".to_owned());
+    expected.sort_unstable();
+    assert_eq!(stored_keywords(&archive), expected);
+}
+
+// Without --mime-keywords the Keywords header is ignored.
+#[test]
+fn coordinator_ignores_mime_keywords_by_default() {
+    let server = MockImap::start_scripts(single_inbox_scripts(100, 2, MSG_BODY_KEYWORDS));
+    let archive = tempfile("mime_keywords_off");
+    run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
+    let kws = stored_keywords(&archive);
+    assert!(
+        !kws.iter().any(|k| k == "vip" || k == "bearbeitet_von_kl"),
+        "{kws:?}"
     );
 }
 
@@ -2235,6 +2301,7 @@ fn dry_run_never_selects_noselect_ancestors() {
         subscribed_only: false,
         automap: true,
         include_deleted: false,
+        mime_keywords: false,
         fetch_batch: 256,
         imap_connections: 1,
         allow_source_change: false,

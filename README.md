@@ -176,12 +176,12 @@ vandelay import imap \
   (--auth-basic <USER> [--auth-password <PASS>] | --auth-bearer [TOKEN] --auth-user <USER>) \
   [--include <REGEX>...] [--exclude <REGEX>...] [--exclude-special <ROLE>...] \
   [--folder <NAME>...] [--subscribed-only] [--noautomap] \
-  [--include-deleted] [--allow-cleartext] [--compress] \
+  [--include-deleted] [--mime-keywords] [--allow-cleartext] [--compress] \
   [--fetch-batch <N>] [--imap-connections <1..8>] \
   <ARCHIVE>
 ```
 
-Imports mail (and only mail) from any IMAP server. Folder selection is via `--include`/`--exclude` regexes (mutually exclusive with the exact-match `--folder`); `--exclude-special` drops by SPECIAL-USE role.
+Imports mail (and only mail) from any IMAP server. Folder selection is via `--include`/`--exclude` regexes (mutually exclusive with the exact-match `--folder`); `--exclude-special` drops by SPECIAL-USE role. `--mime-keywords` also turns the phrases of each message's `Keywords:` header into JMAP keywords (lowercased, with spaces and characters JMAP does not allow replaced by `_`); Exchange exposes categories this way over IMAP.
 
 #### CalDAV
 

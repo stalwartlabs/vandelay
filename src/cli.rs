@@ -267,6 +267,12 @@ struct ImapImportArgs {
 
     #[arg(
         long,
+        help = "Add the phrases of each message's Keywords: header (Exchange categories) as JMAP keywords"
+    )]
+    mime_keywords: bool,
+
+    #[arg(
+        long,
         value_name = "N",
         default_value_t = 256,
         help = "UIDs per metadata FETCH chunk"
@@ -810,6 +816,7 @@ fn resolve_imap_import(args: ImapImportArgs) -> Result<Action, Error> {
             subscribed_only: args.subscribed_only,
             automap: !args.noautomap,
             include_deleted: args.include_deleted,
+            mime_keywords: args.mime_keywords,
             fetch_batch: args.fetch_batch,
             imap_connections,
             allow_source_change: args.allow_source_change,

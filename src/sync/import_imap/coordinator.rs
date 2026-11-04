@@ -26,7 +26,9 @@ use crate::imap::retry::{
 };
 use crate::imap::transport::Connector;
 use crate::logging::{LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
-use crate::sync::emailmeta::email_index_from_blob;
+use crate::sync::emailmeta::{
+    add_mime_keywords, email_index_and_mime_keywords, email_index_from_blob,
+};
 use crate::sync::keys::index_to_json;
 use crate::sync::{CommonConfig, RunOutcome, Summary, TypeCounts};
 
@@ -47,6 +49,7 @@ pub(super) struct RunOpts {
     source_id: i64,
     fetch_batch: usize,
     include_deleted: bool,
+    mime_keywords: bool,
     logger: Logger,
 }
 
@@ -194,6 +197,7 @@ pub struct ImapImportConfig {
     pub subscribed_only: bool,
     pub automap: bool,
     pub include_deleted: bool,
+    pub mime_keywords: bool,
     pub fetch_batch: usize,
     pub imap_connections: usize,
     pub allow_source_change: bool,
@@ -400,6 +404,7 @@ fn run_into(
         source_id,
         fetch_batch: config.fetch_batch.max(1),
         include_deleted: config.include_deleted,
+        mime_keywords: config.mime_keywords,
         logger,
     };
 
@@ -710,6 +715,7 @@ fn reconcile_folder(
         source_id,
         fetch_batch,
         include_deleted: _,
+        mime_keywords: _,
         logger,
     } = opts;
 
@@ -950,6 +956,7 @@ fn insert_single_message(
         source_id,
         fetch_batch: _,
         include_deleted,
+        mime_keywords,
         logger,
     } = opts;
     let folder = target.folder;
@@ -987,15 +994,15 @@ fn insert_single_message(
             .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned()),
     };
     let blob_id = db::blobs::intern_blob(tx, body)?;
-    let message_match = index_to_json(&email_index_from_blob(body));
+    let mut keywords = translation.keywords;
+    let index = if mime_keywords {
+        email_index_and_mime_keywords(body, &mut keywords)
+    } else {
+        email_index_from_blob(body)
+    };
+    let message_match = index_to_json(&index);
     let mailbox_ids = Value::Array(vec![Value::from(mailbox_local)]);
-    let keywords = Value::Array(
-        translation
-            .keywords
-            .iter()
-            .map(|k| Value::String(k.clone()))
-            .collect(),
-    );
+    let keywords = Value::Array(keywords.into_iter().map(Value::String).collect());
     tx.execute(
         "INSERT INTO emails (blob_id, received_at, mailbox_ids, keywords, message_match)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1027,6 +1034,7 @@ fn refresh_present_flags(
         source_id,
         fetch_batch,
         include_deleted,
+        mime_keywords,
         logger: _,
     } = opts;
     let mut updated: u64 = 0;
@@ -1049,23 +1057,19 @@ fn refresh_present_flags(
             if translation.has_deleted_flag && !include_deleted {
                 continue;
             }
-            let Some((local_id, existing)) =
-                load_email_keywords(&tx, source_id, folder, uidvalidity, uid)?
+            let Some(stored) = load_email_keywords(&tx, source_id, folder, uidvalidity, uid)?
             else {
                 continue;
             };
-            if keyword_set_differs(&existing, &translation.keywords) {
-                let json = Value::Array(
-                    translation
-                        .keywords
-                        .iter()
-                        .cloned()
-                        .map(Value::String)
-                        .collect(),
-                );
+            let mut keywords = translation.keywords;
+            if mime_keywords && let Some(blob) = db::blobs::blob_bytes(&tx, stored.blob_id)? {
+                add_mime_keywords(&blob, &mut keywords);
+            }
+            if keyword_set_differs(&stored.keywords, &keywords) {
+                let json = Value::Array(keywords.into_iter().map(Value::String).collect());
                 tx.execute(
                     "UPDATE emails SET keywords = ?1 WHERE id = ?2",
-                    params![json.to_string(), local_id],
+                    params![json.to_string(), stored.local_id],
                 )?;
                 updated += 1;
             }
@@ -1075,24 +1079,34 @@ fn refresh_present_flags(
     Ok(updated)
 }
 
+struct StoredKeywords {
+    local_id: i64,
+    blob_id: i64,
+    keywords: Vec<String>,
+}
+
 fn load_email_keywords(
     tx: &rusqlite::Transaction<'_>,
     source_id: i64,
     folder: &str,
     uidvalidity: u32,
     uid: u32,
-) -> Result<Option<(i64, Vec<String>)>, Error> {
+) -> Result<Option<StoredKeywords>, Error> {
     let Some(local_id) = db::imap_ids::local_for_email(tx, source_id, folder, uidvalidity, uid)?
     else {
         return Ok(None);
     };
-    let kw_json: String = tx.query_row(
-        "SELECT keywords FROM emails WHERE id = ?1",
+    let (blob_id, kw_json): (i64, String) = tx.query_row(
+        "SELECT blob_id, keywords FROM emails WHERE id = ?1",
         params![local_id],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    let kws: Vec<String> = serde_json::from_str(&kw_json).unwrap_or_default();
-    Ok(Some((local_id, kws)))
+    let keywords = serde_json::from_str(&kw_json).unwrap_or_default();
+    Ok(Some(StoredKeywords {
+        local_id,
+        blob_id,
+        keywords,
+    }))
 }
 
 fn keyword_set_differs(a: &[String], b: &[String]) -> bool {

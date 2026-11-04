@@ -36,6 +36,7 @@ fn imap_config(account: &Account, imap: &Endpoint) -> ImapImportConfig {
         subscribed_only: false,
         automap: true,
         include_deleted: false,
+        mime_keywords: false,
         fetch_batch: 64,
         imap_connections: 2,
         allow_source_change: false,
