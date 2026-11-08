@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file. This projec
 - IMAP: `--mime-keywords` imports the phrases of the `Keywords:` header as JMAP keywords, which is how Exchange exposes categories over IMAP (#55)
 
 ### Fixed
+- Maildir: folder names stored in modified UTF-7 (`.&AOk-t&AOk-`, `.R&-D`) are decoded (`été`, `R&D`); folder selection and role guessing use the decoded name
 - MS Exchange EWS: with Basic or delegated OAuth authentication, `--mailbox` naming another mailbox (one the signed-in user has FullAccess to) still imported the signed-in user's own mailbox; folders are now addressed in the mailbox given by `--mailbox`
 
 ## [1.0.14] - 2026-11-01

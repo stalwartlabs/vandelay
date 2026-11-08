@@ -4,15 +4,19 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use std::path::{Path, PathBuf};
+use std::{
+    borrow::Cow,
+    path::{Path, PathBuf},
+};
 
 use regex::Regex;
 
-use crate::imap::automap;
+use crate::imap::{automap, name::decode_mailbox_name};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedFolder {
     pub name: String,
+    pub decoded_name: String,
     pub leaf: String,
     pub parent_path: Option<String>,
     pub path: PathBuf,
@@ -56,6 +60,7 @@ pub fn discover(root: &Path, automap_enabled: bool) -> Result<Vec<ResolvedFolder
     }
     let mut folders = vec![ResolvedFolder {
         name: "INBOX".to_owned(),
+        decoded_name: "INBOX".to_owned(),
         leaf: "INBOX".to_owned(),
         parent_path: None,
         path: root.to_path_buf(),
@@ -96,15 +101,16 @@ pub fn discover(root: &Path, automap_enabled: bool) -> Result<Vec<ResolvedFolder
         if let Some(p) = parent_path.as_deref() {
             ensure_ephemeral_parents(p, &mut known, &mut folders, root);
         }
-        let leaf = leaf_of(&canonical);
+        let decoded_name = decode_name(&canonical);
         let role = if automap_enabled {
-            automap::role_for_folder(&canonical, &[], "", true)
+            automap::role_for_folder(&decoded_name, &[], "", true)
         } else {
             None
         };
         folders.push(ResolvedFolder {
+            leaf: decode_segment(leaf_of(&canonical)).into_owned(),
             name: canonical.clone(),
-            leaf: leaf.to_owned(),
+            decoded_name,
             parent_path,
             path,
             role,
@@ -125,11 +131,11 @@ fn ensure_ephemeral_parents(
         if known.iter().any(|n| n == &ancestor) {
             continue;
         }
-        let leaf = leaf_of(&ancestor).to_owned();
         let parent_path = split_parent(&ancestor);
         folders.push(ResolvedFolder {
+            decoded_name: decode_name(&ancestor),
+            leaf: decode_segment(leaf_of(&ancestor)).into_owned(),
             name: ancestor.clone(),
-            leaf,
             parent_path,
             path: root.to_path_buf(),
             role: None,
@@ -156,6 +162,24 @@ fn split_parent(name: &str) -> Option<String> {
     name.rfind('.').map(|i| name[..i].to_owned())
 }
 
+fn decode_segment(segment: &str) -> Cow<'_, str> {
+    if !segment.contains('&') {
+        return Cow::Borrowed(segment);
+    }
+    decode_mailbox_name(segment).map_or(Cow::Borrowed(segment), Cow::Owned)
+}
+
+fn decode_name(name: &str) -> String {
+    let mut decoded = String::with_capacity(name.len());
+    for (i, segment) in name.split('.').enumerate() {
+        if i > 0 {
+            decoded.push('.');
+        }
+        decoded.push_str(&decode_segment(segment));
+    }
+    decoded
+}
+
 fn leaf_of(name: &str) -> &str {
     match name.rfind('.') {
         Some(i) => &name[i + 1..],
@@ -166,7 +190,7 @@ fn leaf_of(name: &str) -> &str {
 pub fn apply_filters(folders: Vec<ResolvedFolder>, filters: &FolderFilters) -> Vec<ResolvedFolder> {
     folders
         .into_iter()
-        .filter(|f| match_filters(&f.name, filters))
+        .filter(|f| match_filters(&f.decoded_name, filters))
         .collect()
 }
 
@@ -179,11 +203,11 @@ pub fn restore_ephemeral_parents(folders: &mut Vec<ResolvedFolder>, root: &Path)
                 if known.contains(&ancestor) || to_add.iter().any(|x| x.name == ancestor) {
                     continue;
                 }
-                let leaf = leaf_of(&ancestor).to_owned();
                 let parent_path = split_parent(&ancestor);
                 to_add.push(ResolvedFolder {
+                    decoded_name: decode_name(&ancestor),
+                    leaf: decode_segment(leaf_of(&ancestor)).into_owned(),
                     name: ancestor,
-                    leaf,
                     parent_path,
                     path: root.to_path_buf(),
                     role: None,
@@ -387,6 +411,7 @@ mod tests {
             .iter()
             .map(|n| ResolvedFolder {
                 name: (*n).to_owned(),
+                decoded_name: (*n).to_owned(),
                 leaf: (*n).to_owned(),
                 parent_path: None,
                 path: PathBuf::new(),
@@ -490,5 +515,62 @@ mod tests {
                 "Archive".to_owned(),
             ]
         );
+    }
+
+    // Dovecot stores non-ASCII and '&' in folder names as modified UTF-7.
+    #[test]
+    fn discover_decodes_modified_utf7_names() {
+        let td = tempfile::tempdir().unwrap();
+        make_maildir(
+            td.path(),
+            &[".&AOk-t&AOk-", ".R&-D", ".Plain", ".&ZeVnLIqe-.&U,BTFw-"],
+        );
+        let folders = discover(td.path(), true).unwrap();
+        let by_name = |name: &str| folders.iter().find(|f| f.name == name).unwrap();
+
+        let ete = by_name("&AOk-t&AOk-");
+        assert_eq!(ete.decoded_name, "été");
+        assert_eq!(ete.leaf, "été");
+        assert_eq!(by_name("R&-D").leaf, "R&D");
+        assert_eq!(by_name("Plain").leaf, "Plain");
+
+        let nested = by_name("&ZeVnLIqe-.&U,BTFw-");
+        assert_eq!(nested.decoded_name, "日本語.台北");
+        assert_eq!(nested.leaf, "台北");
+        assert_eq!(nested.parent_path.as_deref(), Some("&ZeVnLIqe-"));
+        let parent = by_name("&ZeVnLIqe-");
+        assert!(parent.ephemeral);
+        assert_eq!(parent.leaf, "日本語");
+    }
+
+    // Names that are not valid modified UTF-7 are kept byte for byte.
+    #[test]
+    fn decode_keeps_literal_ampersands_and_utf8() {
+        for name in ["R&D", "AT&T", "Tom & Jerry-2", "Été", "Sales&", "A&-B&C"] {
+            assert_eq!(decode_name(name), name);
+        }
+        assert_eq!(decode_name("R&D.&AOk-t&AOk-"), "R&D.été");
+    }
+
+    #[test]
+    fn filters_match_decoded_names() {
+        let mut folders = folders_for(&["INBOX", "Plain"]);
+        folders.push(ResolvedFolder {
+            name: "&AOk-t&AOk-".to_owned(),
+            decoded_name: "été".to_owned(),
+            leaf: "été".to_owned(),
+            parent_path: None,
+            path: PathBuf::new(),
+            role: None,
+            ephemeral: false,
+        });
+        let filters = FolderFilters {
+            include: Vec::new(),
+            exclude: Vec::new(),
+            explicit: vec!["été".to_owned()],
+        };
+        let kept = apply_filters(folders, &filters);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "&AOk-t&AOk-");
     }
 }
