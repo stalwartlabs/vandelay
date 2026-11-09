@@ -139,6 +139,7 @@ struct Net {
     limits: Limits,
     session: Session,
     dry_run: bool,
+    prune: bool,
     threads: usize,
 }
 
@@ -163,6 +164,7 @@ pub fn run(common: CommonConfig, config: ExportConfig) -> Result<Summary, Error>
         limits: connected.limits,
         session: connected.session.clone(),
         dry_run: ctx.dry_run(),
+        prune: config.prune,
         threads: ctx.common.threads,
     };
 

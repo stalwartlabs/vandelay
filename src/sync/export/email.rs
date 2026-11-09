@@ -14,6 +14,7 @@ use super::{Maps, Net, Plan, Uploader};
 use crate::error::Error;
 use crate::jmap::error::JmapError;
 use crate::jmap::request::{Request, check_method_error, get_objects, retry_method_call};
+use crate::jmap::request::{SetRequest, set_call};
 use crate::jmap::retry::MethodCallKind;
 use crate::jmap::session::Limits;
 use crate::jmap::wire::JmapId;
@@ -61,7 +62,8 @@ pub fn reconcile(
 ) -> Result<Plan, Error> {
     let ty = ObjectType::Email;
 
-    let target_min = target_query_get(net, ty, Some(&["messageId"])).map_err(Error::from)?;
+    let target_min = target_query_get(net, ty, Some(&["messageId", "mailboxIds", "keywords"]))
+        .map_err(Error::from)?;
     let mut indices: Vec<EmailIndex> = target_min.iter().map(server_index).collect();
 
     let fallback_ids: Vec<JmapId> = target_min
@@ -116,6 +118,30 @@ pub fn reconcile(
         .collect();
     let local_keys = email_keys(&local_indices);
 
+    let mut plan = Plan::default();
+    if net.prune {
+        let local_keyset: HashSet<&EmailKey> = local_keys.iter().collect();
+        let tkeys = email_keys(&indices);
+        for (v, key) in target_min.iter().zip(tkeys.iter()) {
+            if !local_keyset.contains(key)
+                && let Some(id) = jid(v)
+            {
+                plan.prune_candidates.push(id);
+            }
+        }
+        plan.prune_candidates.sort();
+        sync_membership(
+            net,
+            maps,
+            counts,
+            logger,
+            &target_min,
+            &tkeys,
+            &local,
+            &local_keys,
+        );
+    }
+
     let mut uploader = Uploader::new(net, &ctx.conn);
     let pool = (!net.dry_run).then(|| UploadPool::new(net, net.threads, EMAIL_MIME));
     let unmatched: Vec<&(i64, EmailRow)> = local_keys
@@ -147,7 +173,131 @@ pub fn reconcile(
         rest = tail;
     }
 
-    Ok(Plan::default())
+    Ok(plan)
+}
+
+fn id_set(v: &Value, key: &str) -> HashSet<String> {
+    v.get(key)
+        .and_then(Value::as_object)
+        .map(|o| {
+            o.iter()
+                .filter(|(_, b)| b.as_bool().unwrap_or(false))
+                .map(|(k, _)| k.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// With `--prune`, make mailbox membership and keywords of emails that already
+/// exist on the target (matched by key) identical to the archive. Without this
+/// an email moved between folders locally (e.g. Junk -> Inbox) would be
+/// "skipped" forever and stay in its old folder on the target.
+#[allow(clippy::too_many_arguments)]
+fn sync_membership(
+    net: &Net,
+    maps: &Maps,
+    counts: &mut TypeCounts,
+    logger: &Logger,
+    target: &[Value],
+    target_keys: &[EmailKey],
+    local: &[(i64, EmailRow)],
+    local_keys: &[EmailKey],
+) {
+    // desired state per key: union over all local rows carrying that key
+    let mut desired: HashMap<&EmailKey, (HashSet<String>, HashSet<String>)> = HashMap::new();
+    let mut unresolved: HashSet<&EmailKey> = HashSet::new();
+    for (key, (_, row)) in local_keys.iter().zip(local.iter()) {
+        let entry = desired.entry(key).or_default();
+        for ml in &row.mailbox_locals {
+            match maps.target(ObjectType::Mailbox, *ml) {
+                Some(t) => {
+                    entry.0.insert(t.0);
+                }
+                None => {
+                    unresolved.insert(key);
+                }
+            }
+        }
+        for k in &row.keywords {
+            entry.1.insert(k.clone());
+        }
+    }
+
+    let mut update = Map::new();
+    for (v, key) in target.iter().zip(target_keys.iter()) {
+        let (Some(id), Some((want_mb, want_kw))) = (jid(v), desired.get(key)) else {
+            continue;
+        };
+        if unresolved.contains(key) || want_mb.is_empty() {
+            continue;
+        }
+        let have_mb = id_set(v, "mailboxIds");
+        let fold = |s: &HashSet<String>| -> HashSet<String> {
+            s.iter().map(|k| k.to_lowercase()).collect()
+        };
+        let have_kw = id_set(v, "keywords");
+        let mut patch = Map::new();
+        if &have_mb != want_mb {
+            patch.insert(
+                "mailboxIds".to_owned(),
+                Value::Object(
+                    want_mb
+                        .iter()
+                        .map(|m| (m.clone(), Value::Bool(true)))
+                        .collect(),
+                ),
+            );
+        }
+        if fold(&have_kw) != fold(want_kw) {
+            patch.insert(
+                "keywords".to_owned(),
+                Value::Object(
+                    want_kw
+                        .iter()
+                        .map(|k| (k.clone(), Value::Bool(true)))
+                        .collect(),
+                ),
+            );
+        }
+        if !patch.is_empty() {
+            update.insert(id, Value::Object(patch));
+        }
+    }
+    if update.is_empty() {
+        return;
+    }
+    let n = update.len() as u64;
+    if net.dry_run {
+        counts.updated += n;
+        return;
+    }
+    match set_call(
+        &net.client,
+        &net.api,
+        &net.account,
+        ObjectType::Email.jmap_name(),
+        SetRequest {
+            update: Some(Value::Object(update)),
+            create: None,
+            destroy: None,
+            extra_args: &[],
+        },
+        &net.limits,
+    ) {
+        Ok(outcome) => {
+            counts.updated += outcome.updated.len() as u64;
+            for (id, err) in &outcome.not_updated {
+                logger.warn(&format!("prune: Email {id} membership not updated: {err}"));
+                counts.failed += 1;
+            }
+        }
+        Err(e) => {
+            logger.warn(&format!(
+                "Email/set update of mailbox membership failed: {e}"
+            ));
+            counts.failed += n;
+        }
+    }
 }
 
 const EMAIL_MIME: &str = "message/rfc822";
