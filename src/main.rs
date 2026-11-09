@@ -35,6 +35,13 @@ fn run() -> i32 {
             let logger = common.logger;
             (sync::import_jmap::run_reporting(common, config), logger)
         }
+        Action::ImportWithChangeset(common, config, path) => {
+            let logger = common.logger;
+            (
+                sync::import_jmap::run_reporting_with_changeset(common, config, Some(&path)),
+                logger,
+            )
+        }
         Action::ImportImap(common, config) => {
             let logger = common.logger;
             (sync::import_imap::run_reporting(common, config), logger)

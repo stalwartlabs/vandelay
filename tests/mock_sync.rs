@@ -802,6 +802,73 @@ fn import_cfg_objects(base: &str, objects: Vec<ObjectType>) -> ImportConfig {
     }
 }
 
+#[test]
+fn native_changeset_exports_only_successful_imports() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let _session = server
+        .mock("GET", "/")
+        .with_body(session_body(&base))
+        .create();
+    let directory = tempfile::tempdir().unwrap();
+    let archive = directory.path().join("archive.sqlite");
+    let output = directory.path().join("delta.changeset");
+    let outcome = sync::import_jmap::run_reporting_with_changeset(
+        common(&archive),
+        import_cfg_objects(&base, vec![]),
+        Some(&output),
+    );
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    assert!(!outcome.summary.any_failed());
+    assert!(!std::fs::read(&output).unwrap().is_empty());
+
+    let empty = directory.path().join("empty.changeset");
+    let outcome = sync::import_jmap::run_reporting_with_changeset(
+        common(&archive),
+        import_cfg_objects(&base, vec![]),
+        Some(&empty),
+    );
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    assert_eq!(std::fs::metadata(empty).unwrap().len(), 0);
+
+    let before = std::fs::read(&output).unwrap();
+    let outcome = sync::import_jmap::run_reporting_with_changeset(
+        common(&archive),
+        import_cfg_objects(&base, vec![]),
+        Some(&output),
+    );
+    assert!(outcome.error.is_some());
+    assert_eq!(std::fs::read(output).unwrap(), before);
+
+    let unwritable = directory.path().join("missing-parent/output.changeset");
+    let outcome = sync::import_jmap::run_reporting_with_changeset(
+        common(&archive),
+        import_cfg_objects(&base, vec![]),
+        Some(&unwritable),
+    );
+    assert!(
+        outcome.error.is_some(),
+        "export failure must fail the invocation"
+    );
+    assert!(!unwritable.exists());
+
+    let unsupported = directory.path().join("unsupported.changeset");
+    {
+        let conn = rusqlite::Connection::open(&archive).unwrap();
+        conn.execute("CREATE TABLE extra(value TEXT)", []).unwrap();
+    }
+    let outcome = sync::import_jmap::run_reporting_with_changeset(
+        common(&archive),
+        import_cfg_objects(&base, vec![]),
+        Some(&unsupported),
+    );
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    assert!(
+        !unsupported.exists(),
+        "must not silently omit a table without a key"
+    );
+}
+
 fn export_cfg_objects(base: &str, objects: Vec<ObjectType>) -> ExportConfig {
     ExportConfig {
         connect: ConnectConfig {
@@ -932,10 +999,15 @@ fn import_removes_vanished_mailbox_from_archive_on_second_pass() {
         .expect(1)
         .create();
 
-    let s2 = sync::import_jmap::run(
+    let replay = tmp();
+    std::fs::copy(&archive, &replay).unwrap();
+    let delta = tmp();
+    let s2 = sync::import_jmap::run_reporting_with_changeset(
         common(&archive),
         import_cfg_objects(&base, vec![ObjectType::Mailbox]),
+        Some(&delta),
     )
+    .into_result()
     .expect("second import");
     let mb2 = s2
         .per_type
@@ -946,6 +1018,34 @@ fn import_removes_vanished_mailbox_from_archive_on_second_pass() {
     assert_eq!(mb2.fetched, 0, "second pass fetches nothing");
     assert_eq!(mb2.updated, 0, "no changed mailboxes reported");
     assert_eq!(mb2.deleted, 1, "vanished mailbox B is deleted");
+    {
+        let conn = rusqlite::Connection::open(&replay).unwrap();
+        conn.apply_strm(
+            &mut std::fs::File::open(&delta).unwrap(),
+            None::<fn(&str) -> bool>,
+            |_, _| rusqlite::session::ConflictAction::SQLITE_CHANGESET_ABORT,
+        )
+        .unwrap();
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM mailboxes ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(names, vec!["alpha", "charlie"]);
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM sync_state_jmap WHERE type_name='Mailbox'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            state, "s2",
+            "native replay includes the synchronization cursor"
+        );
+    }
     {
         let conn = rusqlite::Connection::open(&archive).unwrap();
         let names: Vec<String> = conn
@@ -958,6 +1058,8 @@ fn import_removes_vanished_mailbox_from_archive_on_second_pass() {
         assert_eq!(names, vec!["alpha".to_owned(), "charlie".to_owned()]);
     }
     let _ = std::fs::remove_file(&archive);
+    let _ = std::fs::remove_file(&replay);
+    let _ = std::fs::remove_file(&delta);
 }
 
 #[test]
@@ -3833,12 +3935,19 @@ fn import_failed_update_holds_cursor_for_retry() {
         .expect(1)
         .create();
 
-    let s2 = sync::import_jmap::run(
+    let delta = tmp();
+    let s2 = sync::import_jmap::run_reporting_with_changeset(
         common(&archive),
         import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+        Some(&delta),
     )
+    .into_result()
     .expect("second import");
     bad_update.assert();
+    assert!(
+        !delta.exists(),
+        "partial summaries must not export a changeset"
+    );
     let em2 = s2
         .per_type
         .iter()
