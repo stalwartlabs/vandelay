@@ -7,6 +7,8 @@ All notable changes to this project will be documented in this file. This projec
 ### Fixed
 - MS Exchange EWS: Exchange 2019 servers (version 15.2) were addressed with the schema version `Exchange2019`, which does not exist, so every call was refused once and sent again as `Exchange2016`; they are now addressed as `Exchange2016`, and once a server has refused a schema version, the client no longer goes back above the one it accepted (fixes #64)
 - MS Exchange EWS and Graph: Outlook categories were stored as message keywords with only their case lowered, so `Project review` or `Congés` gave keywords JMAP does not allow; they now go through the same reduction as IMAP `--mime-keywords` (`Catégorie Rouge` becomes `cat_gorie_rouge`) and are deduplicated. A read-receipt request no longer adds the unregistered `$notified` keyword (fixes #65)
+- MS Exchange EWS: all-day events, the exceptions of all-day series, and contact birthdays and anniversaries landed one day early east of UTC, because EWS sends them as UTC instants and only the date part was kept; the date is now taken in the event's time zone (UTC for contacts), rounded to the nearest midnight. Items already in an archive are only corrected when they change in the source mailbox, so re-import into a fresh archive (fixes #59)
+- MS Exchange EWS: Outlook's "no date" (year 4500 or later) was imported as a real date; such contact anniversaries are dropped and such calendar items are skipped. Archives imported with an earlier version keep the ones already stored, so re-import into a fresh archive (fixes #66)
 
 ## [1.0.15] - 2026-11-08
 

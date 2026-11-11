@@ -4,8 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+use chrono::Datelike;
 use serde_json::{Map, Value, json};
 
+use crate::exchange::date::{is_outlook_no_date, nearest_midnight};
 use crate::exchange_ews::parse::{ContactItemRaw, RawContactAddress};
 
 pub fn synthetic_uid(item_id: &str) -> String {
@@ -315,18 +317,17 @@ fn im_service_from_key(key: &str) -> Option<String> {
 }
 
 fn partial_date(s: &str) -> Option<Value> {
-    let head = s.split('T').next().unwrap_or(s);
-    let mut parts = head.splitn(3, '-');
-    let year: u32 = parts.next()?.parse().ok()?;
-    let month: u32 = parts.next()?.parse().ok()?;
-    let day: u32 = parts.next()?.parse().ok()?;
+    if is_outlook_no_date(s) {
+        return None;
+    }
+    let date = nearest_midnight(s, None)?;
     let mut o = Map::new();
     o.insert("@type".to_owned(), Value::String("PartialDate".to_owned()));
-    if year > 0 {
-        o.insert("year".to_owned(), Value::from(year));
+    if date.year() > 0 {
+        o.insert("year".to_owned(), Value::from(date.year()));
     }
-    o.insert("month".to_owned(), Value::from(month));
-    o.insert("day".to_owned(), Value::from(day));
+    o.insert("month".to_owned(), Value::from(date.month()));
+    o.insert("day".to_owned(), Value::from(date.day()));
     Some(Value::Object(o))
 }
 
@@ -404,6 +405,47 @@ mod tests {
         assert_eq!(v["anniversaries"]["birth"]["kind"], "birth");
         assert_eq!(v["anniversaries"]["birth"]["date"]["month"], 4);
         assert_eq!(v["anniversaries"]["wedding"]["kind"], "wedding");
+    }
+
+    #[test]
+    fn birthday_stored_as_local_midnight_in_utc_keeps_its_day() {
+        let raw = ContactItemRaw {
+            display_name: Some("X".to_owned()),
+            birthday: Some("1990-04-14T22:00:00Z".to_owned()),
+            ..ContactItemRaw::default()
+        };
+        let v = to_jscontact(&raw);
+        assert_eq!(
+            v["anniversaries"]["birth"]["date"],
+            json!({"@type": "PartialDate", "year": 1990, "month": 4, "day": 15})
+        );
+    }
+
+    #[test]
+    fn year_zero_birthday_has_no_year() {
+        let raw = ContactItemRaw {
+            display_name: Some("X".to_owned()),
+            birthday: Some("0000-04-15T00:00:00Z".to_owned()),
+            ..ContactItemRaw::default()
+        };
+        let v = to_jscontact(&raw);
+        assert_eq!(
+            v["anniversaries"]["birth"]["date"],
+            json!({"@type": "PartialDate", "month": 4, "day": 15})
+        );
+    }
+
+    #[test]
+    fn outlook_no_date_anniversary_is_dropped() {
+        let raw = ContactItemRaw {
+            display_name: Some("X".to_owned()),
+            birthday: Some("1990-04-15T00:00:00Z".to_owned()),
+            wedding_anniversary: Some("4501-01-01T00:00:00Z".to_owned()),
+            ..ContactItemRaw::default()
+        };
+        let v = to_jscontact(&raw);
+        assert!(v["anniversaries"].get("wedding").is_none());
+        assert_eq!(v["anniversaries"]["birth"]["date"]["day"], 15);
     }
 
     #[test]

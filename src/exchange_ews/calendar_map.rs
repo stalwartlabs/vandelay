@@ -4,9 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+use chrono::NaiveDate;
 use serde_json::{Map, Value, json};
 
 use crate::exchange::address::{as_smtp_address, extract_smtp_address};
+use crate::exchange::date::nearest_midnight;
 use crate::exchange::jscalendar::{
     drop_calendar_address_dependents, is_override_ignored, synthetic_attendee_address,
 };
@@ -99,18 +101,12 @@ fn build_event_map(raw: &CalendarItemRaw, iana: Option<&str>) -> Map<String, Val
         event.insert("keywords".to_owned(), Value::Object(kw));
     }
     if let Some(true) = raw.is_all_day_event {
-        if let Some(start) = raw.start.as_ref() {
-            let date_only = start.split('T').next().unwrap_or(start.as_str());
-            event.insert(
-                "start".to_owned(),
-                Value::String(format!("{date_only}T00:00:00")),
-            );
+        let start = raw.start.as_deref().and_then(|s| nearest_midnight(s, iana));
+        if let Some(start) = start {
+            event.insert("start".to_owned(), Value::String(all_day_key(start)));
         }
         event.insert("showWithoutTime".to_owned(), Value::Bool(true));
-        let days = match (raw.start.as_ref(), raw.end.as_ref()) {
-            (Some(s), Some(e)) => all_day_span_days(s, e).max(1),
-            _ => 1,
-        };
+        let days = all_day_span_days(start, raw.end.as_deref(), iana);
         event.insert("duration".to_owned(), Value::String(format!("P{days}D")));
     } else {
         if let Some(start) = raw.start.as_ref() {
@@ -346,7 +342,7 @@ fn build_recurrence_overrides(
             .original_start
             .as_deref()
             .or(occ.start.as_deref())
-            .map(|s| to_local_datetime_in(s, iana))
+            .map(|s| occurrence_key(raw, s, iana))
         else {
             continue;
         };
@@ -358,12 +354,12 @@ fn build_recurrence_overrides(
                 let occ_event = build_event_map(full, iana);
                 override_patch(&occ_event, base_event, &key)
             }
-            None => time_only_patch(occ, iana),
+            None => time_only_patch(raw, occ, iana),
         };
         map.insert(key, Value::Object(patch));
     }
     for occ in &raw.deleted_occurrences {
-        let Some(key) = occ.start.as_deref().map(|s| to_local_datetime_in(s, iana)) else {
+        let Some(key) = occ.start.as_deref().map(|s| occurrence_key(raw, s, iana)) else {
             continue;
         };
         map.insert(key, json!({"excluded": true}));
@@ -406,8 +402,23 @@ fn override_patch(
     patch
 }
 
-fn time_only_patch(occ: &RawOccurrence, iana: Option<&str>) -> Map<String, Value> {
+fn time_only_patch(
+    series: &CalendarItemRaw,
+    occ: &RawOccurrence,
+    iana: Option<&str>,
+) -> Map<String, Value> {
     let mut o = Map::new();
+    if series.is_all_day_event == Some(true) {
+        let start = occ.start.as_deref().and_then(|s| nearest_midnight(s, iana));
+        if let Some(start) = start {
+            o.insert("start".to_owned(), Value::String(all_day_key(start)));
+        }
+        if occ.end.is_some() {
+            let days = all_day_span_days(start, occ.end.as_deref(), iana);
+            o.insert("duration".to_owned(), Value::String(format!("P{days}D")));
+        }
+        return o;
+    }
     if let Some(s) = occ.start.as_ref() {
         o.insert(
             "start".to_owned(),
@@ -420,6 +431,19 @@ fn time_only_patch(occ: &RawOccurrence, iana: Option<&str>) -> Map<String, Value
         o.insert("duration".to_owned(), Value::String(dur));
     }
     o
+}
+
+fn occurrence_key(series: &CalendarItemRaw, start: &str, iana: Option<&str>) -> String {
+    if series.is_all_day_event == Some(true)
+        && let Some(date) = nearest_midnight(start, iana)
+    {
+        return all_day_key(date);
+    }
+    to_local_datetime_in(start, iana)
+}
+
+fn all_day_key(date: NaiveDate) -> String {
+    format!("{date}T00:00:00")
 }
 
 fn normalise_utc_datetime(s: &str) -> String {
@@ -486,32 +510,11 @@ fn convert_utc_to_local(s: &str, iana: &str) -> Option<String> {
     Some(local.format("%Y-%m-%dT%H:%M:%S").to_string())
 }
 
-fn all_day_span_days(start: &str, end: &str) -> u32 {
-    fn date_only(s: &str) -> &str {
-        s.split('T').next().unwrap_or(s)
+fn all_day_span_days(start: Option<NaiveDate>, end: Option<&str>, iana: Option<&str>) -> i64 {
+    match (start, end.and_then(|e| nearest_midnight(e, iana))) {
+        (Some(start), Some(end)) => (end - start).num_days().max(1),
+        _ => 1,
     }
-    fn ymd(s: &str) -> Option<(i64, u32, u32)> {
-        let mut p = s.split('-');
-        let y: i64 = p.next()?.parse().ok()?;
-        let m: u32 = p.next()?.parse().ok()?;
-        let d: u32 = p.next()?.parse().ok()?;
-        Some((y, m, d))
-    }
-    fn to_days(y: i64, m: u32, d: u32) -> i64 {
-        let (mut y, m) = if m <= 2 {
-            (y - 1, m as i64 + 12)
-        } else {
-            (y, m as i64)
-        };
-        y += 4800;
-        let mm = m + 1;
-        365 * y + y / 4 - y / 100 + y / 400 + 30 * mm + 3 * (mm + 1) / 5 + d as i64 - 32045
-    }
-    let (Some(s), Some(e)) = (ymd(date_only(start)), ymd(date_only(end))) else {
-        return 1;
-    };
-    let diff = to_days(e.0, e.1, e.2) - to_days(s.0, s.1, s.2);
-    if diff <= 0 { 1 } else { diff as u32 }
 }
 
 fn duration_iso8601(start: &str, end: &str) -> Option<String> {
@@ -1139,9 +1142,65 @@ mod tests {
 
     #[test]
     fn all_day_span_helper_is_inclusive_of_start() {
-        assert_eq!(all_day_span_days("2025-07-04", "2025-07-04"), 1);
-        assert_eq!(all_day_span_days("2025-07-04", "2025-07-05"), 1);
-        assert_eq!(all_day_span_days("2025-07-04", "2025-07-07"), 3);
-        assert_eq!(all_day_span_days("bad", "input"), 1);
+        let start = NaiveDate::from_ymd_opt(2025, 7, 4);
+        assert_eq!(all_day_span_days(start, Some("2025-07-04"), None), 1);
+        assert_eq!(all_day_span_days(start, Some("2025-07-05"), None), 1);
+        assert_eq!(all_day_span_days(start, Some("2025-07-07"), None), 3);
+        assert_eq!(all_day_span_days(None, Some("2025-07-07"), None), 1);
+        assert_eq!(all_day_span_days(start, Some("bad"), None), 1);
+    }
+
+    #[test]
+    fn all_day_event_east_of_utc_keeps_its_local_date() {
+        let raw = CalendarItemRaw {
+            uid: Some("uid-paris".to_owned()),
+            is_all_day_event: Some(true),
+            start: Some("2026-11-11T23:00:00Z".to_owned()),
+            end: Some("2026-11-12T23:00:00Z".to_owned()),
+            start_tz: Some("Romance Standard Time".to_owned()),
+            ..CalendarItemRaw::default()
+        };
+        let v = to_jscalendar(&raw).data;
+        assert_eq!(v["start"], "2026-11-12T00:00:00");
+        assert_eq!(v["duration"], "P1D");
+        assert!(v.get("timeZone").is_none());
+    }
+
+    #[test]
+    fn all_day_series_exceptions_match_generated_occurrences() {
+        let raw = CalendarItemRaw {
+            uid: Some("uid-paris-series".to_owned()),
+            is_all_day_event: Some(true),
+            start: Some("2026-11-11T23:00:00Z".to_owned()),
+            end: Some("2026-11-12T23:00:00Z".to_owned()),
+            start_tz: Some("Romance Standard Time".to_owned()),
+            recurrence: Some(crate::exchange_ews::parse::RawRecurrence {
+                pattern: Some(RecurrencePattern::Daily { interval: 1 }),
+                range: Some(RecurrenceRange::Numbered {
+                    start_date: "2026-11-12".to_owned(),
+                    number_of_occurrences: 5,
+                }),
+            }),
+            modified_occurrences: vec![RawOccurrence {
+                item_id: Default::default(),
+                start: Some("2026-11-14T23:00:00Z".to_owned()),
+                end: Some("2026-11-15T23:00:00Z".to_owned()),
+                original_start: Some("2026-11-12T23:00:00Z".to_owned()),
+            }],
+            deleted_occurrences: vec![RawOccurrence {
+                item_id: Default::default(),
+                start: Some("2026-11-13T23:00:00Z".to_owned()),
+                end: None,
+                original_start: None,
+            }],
+            ..CalendarItemRaw::default()
+        };
+        let v = to_jscalendar(&raw).data;
+        assert_eq!(v["start"], "2026-11-12T00:00:00");
+        let over = v["recurrenceOverrides"].as_object().unwrap();
+        assert_eq!(over.len(), 2);
+        assert_eq!(over["2026-11-13T00:00:00"]["start"], "2026-11-15T00:00:00");
+        assert_eq!(over["2026-11-13T00:00:00"]["duration"], "P1D");
+        assert_eq!(over["2026-11-14T00:00:00"]["excluded"], true);
     }
 }

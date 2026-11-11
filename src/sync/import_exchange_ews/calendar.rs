@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::db::exchange_ews_ids;
 use crate::error::Error;
+use crate::exchange::date::is_outlook_no_date;
 use crate::exchange_ews::calendar_map::to_jscalendar_with_exceptions;
 use crate::exchange_ews::parse::{CalendarItemRaw, parse_calendar_item};
 use crate::exchange_ews::types::{CalendarItemType, ItemId};
@@ -126,7 +127,8 @@ fn reconcile_one(
             if matches!(
                 parsed.calendar_item_type,
                 Some(CalendarItemType::Occurrence) | Some(CalendarItemType::Exception)
-            ) {
+            ) || parsed.start.as_deref().is_some_and(is_outlook_no_date)
+            {
                 counts.skipped += 1;
                 return Ok(());
             }

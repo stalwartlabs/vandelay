@@ -4,7 +4,36 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta};
+use chrono_tz::Tz;
+
 const END_OF_DAY: &str = "23:59:59";
+const HALF_DAY: TimeDelta = TimeDelta::hours(12);
+const OUTLOOK_NO_DATE_YEAR: i32 = 4500;
+
+pub fn nearest_midnight(value: &str, iana: Option<&str>) -> Option<NaiveDate> {
+    let trimmed = value.trim();
+    let local = match DateTime::parse_from_rfc3339(trimmed) {
+        Ok(instant) => match iana.and_then(|tz| tz.parse::<Tz>().ok()) {
+            Some(tz) => instant.with_timezone(&tz).naive_local(),
+            None => instant.naive_local(),
+        },
+        Err(_) => NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f")
+            .or_else(|_| {
+                NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").map(|d| d.and_time(NaiveTime::MIN))
+            })
+            .ok()?,
+    };
+    local.checked_add_signed(HALF_DAY).map(|dt| dt.date())
+}
+
+pub fn is_outlook_no_date(value: &str) -> bool {
+    value
+        .trim()
+        .split_once('-')
+        .and_then(|(year, _)| year.parse::<i32>().ok())
+        .is_some_and(|year| year >= OUTLOOK_NO_DATE_YEAR)
+}
 
 pub fn recurrence_until(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
@@ -56,6 +85,72 @@ fn two_digits(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn date(y: i32, m: u32, d: u32) -> Option<NaiveDate> {
+        NaiveDate::from_ymd_opt(y, m, d)
+    }
+
+    #[test]
+    fn utc_instant_rounds_to_local_midnight_east_of_utc() {
+        assert_eq!(
+            nearest_midnight("2026-11-11T23:00:00Z", Some("Europe/Paris")),
+            date(2026, 11, 12)
+        );
+        assert_eq!(
+            nearest_midnight("2026-07-11T22:00:00Z", Some("Europe/Paris")),
+            date(2026, 7, 12)
+        );
+    }
+
+    #[test]
+    fn utc_instant_rounds_to_local_midnight_west_of_utc() {
+        assert_eq!(
+            nearest_midnight("2026-11-12T05:00:00Z", Some("America/New_York")),
+            date(2026, 11, 12)
+        );
+    }
+
+    #[test]
+    fn zone_off_by_an_hour_still_gives_the_same_day() {
+        assert_eq!(
+            nearest_midnight("2026-11-11T23:00:00Z", Some("Europe/London")),
+            date(2026, 11, 12)
+        );
+        assert_eq!(
+            nearest_midnight("2026-11-11T23:00:00Z", Some("Europe/Helsinki")),
+            date(2026, 11, 12)
+        );
+    }
+
+    #[test]
+    fn utc_instant_without_zone_rounds_in_utc() {
+        assert_eq!(
+            nearest_midnight("1990-04-14T22:00:00Z", None),
+            date(1990, 4, 15)
+        );
+        assert_eq!(
+            nearest_midnight("1990-04-15T05:00:00Z", None),
+            date(1990, 4, 15)
+        );
+    }
+
+    #[test]
+    fn floating_and_bare_dates_are_kept() {
+        assert_eq!(
+            nearest_midnight("2025-12-25T00:00:00", Some("Europe/Paris")),
+            date(2025, 12, 25)
+        );
+        assert_eq!(nearest_midnight("2025-12-25", None), date(2025, 12, 25));
+        assert_eq!(nearest_midnight("garbage", None), None);
+    }
+
+    #[test]
+    fn outlook_no_date_sentinel() {
+        assert!(is_outlook_no_date("4500-08-31T23:00:00Z"));
+        assert!(is_outlook_no_date("4501-01-01T00:00:00Z"));
+        assert!(!is_outlook_no_date("2026-11-12T00:00:00Z"));
+        assert!(!is_outlook_no_date("garbage"));
+    }
 
     #[test]
     fn bare_date_gets_end_of_day() {
