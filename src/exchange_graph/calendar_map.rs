@@ -4,9 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+use chrono::NaiveDate;
 use serde_json::{Map, Value, json};
 
 use crate::exchange::address::{as_smtp_address, extract_smtp_address};
+use crate::exchange::date::all_day_date;
 use crate::exchange::jscalendar::{drop_calendar_address_dependents, synthetic_attendee_address};
 use crate::exchange::tz::resolve_to_iana;
 use crate::exchange_graph::error::GraphError;
@@ -54,6 +56,7 @@ pub struct ConvertedEvent {
     pub series_master_id: Option<String>,
     pub event_type: EventType,
     pub original_start: Option<String>,
+    pub zone: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,24 +140,32 @@ pub fn convert_event(
         .or_else(|| fallback_calendar_tz.and_then(windows_or_iana_to_iana))
         .filter(|z| z != "Etc/UTC");
 
-    if let Some(start) = start_dt.as_deref() {
-        let value = match (is_all_day, display_tz.as_deref()) {
-            (false, Some(tz)) => utc_naive_to_local(start, tz).unwrap_or_else(|| start.to_owned()),
-            _ => start.to_owned(),
-        };
-        card.insert("start".to_owned(), Value::from(value));
-    }
-
-    if let (Some(start), Some(end)) = (start_dt.as_deref(), end_dt.as_deref())
-        && let Some(dur) = duration_iso8601(start, end)
-    {
-        card.insert("duration".to_owned(), Value::from(dur));
-    }
-
     if is_all_day {
+        let zone = display_tz.as_deref();
+        let start = start_dt.as_deref().and_then(|s| all_day_date(s, zone));
+        if let Some(start) = start {
+            card.insert("start".to_owned(), Value::from(all_day_key(start)));
+            let days = end_dt
+                .as_deref()
+                .and_then(|e| all_day_date(e, zone))
+                .map_or(1, |end| (end - start).num_days().max(1));
+            card.insert("duration".to_owned(), Value::from(format!("P{days}D")));
+        }
         card.insert("showWithoutTime".to_owned(), Value::Bool(true));
     } else {
-        let label = display_tz.unwrap_or_else(|| "Etc/UTC".to_owned());
+        if let Some(start) = start_dt.as_deref() {
+            let value = display_tz
+                .as_deref()
+                .and_then(|tz| utc_naive_to_local(start, tz))
+                .unwrap_or_else(|| start.to_owned());
+            card.insert("start".to_owned(), Value::from(value));
+        }
+        if let (Some(start), Some(end)) = (start_dt.as_deref(), end_dt.as_deref())
+            && let Some(dur) = duration_iso8601(start, end)
+        {
+            card.insert("duration".to_owned(), Value::from(dur));
+        }
+        let label = display_tz.as_deref().unwrap_or("Etc/UTC");
         card.insert("timeZone".to_owned(), Value::from(label));
     }
 
@@ -343,7 +354,12 @@ pub fn convert_event(
         series_master_id,
         event_type,
         original_start,
+        zone: display_tz,
     })
+}
+
+pub fn all_day_key(date: NaiveDate) -> String {
+    format!("{date}T00:00:00")
 }
 
 fn cancelled_occurrence_key(entry: &str, start_time: Option<&str>) -> Option<String> {
@@ -919,6 +935,31 @@ mod tests {
         assert_eq!(conv.data["start"], "2025-03-12T00:00:00");
         assert_eq!(conv.data["showWithoutTime"], true);
         assert!(conv.data.get("timeZone").is_none());
+    }
+
+    #[test]
+    fn all_day_utc_instant_east_of_utc_keeps_its_local_date() {
+        let mut v = sample();
+        v["isAllDay"] = Value::Bool(true);
+        v["originalStartTimeZone"] = Value::from("Romance Standard Time");
+        v["start"]["dateTime"] = Value::from("2026-10-23T22:00:00.0000000");
+        v["end"]["dateTime"] = Value::from("2026-10-25T23:00:00.0000000");
+        let conv = convert_event(&v, None).unwrap();
+        assert_eq!(conv.data["start"], "2026-10-24T00:00:00");
+        assert_eq!(conv.data["duration"], "P2D");
+        assert_eq!(conv.zone.as_deref(), Some("Europe/Paris"));
+    }
+
+    #[test]
+    fn all_day_midnight_is_kept_whatever_the_zone() {
+        let mut v = sample();
+        v["isAllDay"] = Value::Bool(true);
+        v["originalStartTimeZone"] = Value::from("New Zealand Standard Time");
+        v["start"]["dateTime"] = Value::from("2026-11-12T00:00:00.0000000");
+        v["end"]["dateTime"] = Value::from("2026-11-13T00:00:00.0000000");
+        let conv = convert_event(&v, None).unwrap();
+        assert_eq!(conv.data["start"], "2026-11-12T00:00:00");
+        assert_eq!(conv.data["duration"], "P1D");
     }
 
     #[test]

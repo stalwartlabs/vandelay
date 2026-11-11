@@ -12,10 +12,12 @@ use serde_json::{Value, json};
 
 use crate::db::exchange_graph_ids;
 use crate::error::Error;
+use crate::exchange::date::{all_day_date, is_outlook_no_date};
 use crate::exchange::jscalendar::override_patch_from_event;
 use crate::exchange_graph::api::{self, PREFER_BODY_HTML, PREFER_BODY_TEXT, PREFER_TIMEZONE_UTC};
 use crate::exchange_graph::calendar_map::{
-    ConvertedEvent, EventType, classify_event_type, convert_event,
+    ConvertedEvent, EventType, all_day_key, classify_event_type, convert_event,
+    windows_or_iana_to_iana,
 };
 use crate::exchange_graph::error::GraphError;
 use crate::exchange_graph::types::EventBodyFormat;
@@ -27,6 +29,11 @@ use super::coordinator::{CHUNK_SIZE, GraphCoordinator};
 use super::folders::CalendarFolder;
 
 pub type EventAttachment = (String, String, Vec<u8>);
+
+struct Occurrence {
+    start: String,
+    zone: Option<String>,
+}
 
 fn fetch_event_attachments(
     client: &crate::exchange_graph::client::GraphClient,
@@ -132,6 +139,7 @@ pub fn reconcile_all(
         let mut attachments_by_id: HashMap<String, Vec<EventAttachment>> = HashMap::new();
         for (graph_id, result, attachments) in fetched {
             match result {
+                Ok(raw) if starts_on_outlook_no_date(&raw) => counts.skipped += 1,
                 Ok(raw) => match convert_event(&raw, None) {
                     Ok(c) => {
                         attachments_by_id.insert(graph_id.clone(), attachments);
@@ -207,6 +215,13 @@ fn fetch_events(
         }
     }
     out
+}
+
+fn starts_on_outlook_no_date(raw: &Value) -> bool {
+    raw.get("start")
+        .and_then(|s| s.get("dateTime"))
+        .and_then(Value::as_str)
+        .is_some_and(is_outlook_no_date)
 }
 
 fn exception_windows(years: i32) -> Vec<(String, String)> {
@@ -313,11 +328,7 @@ fn apply_series_expansion(
             let Some(raw_key) = ex.original_start.as_deref() else {
                 continue;
             };
-            let tz = card
-                .get("timeZone")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let key = normalise_override_key(raw_key, tz.as_deref());
+            let key = occurrence_key(&card, raw_key, ex.zone.as_deref());
             if let Some(map) = card.as_object_mut() {
                 let entry = map
                     .entry("recurrenceOverrides".to_owned())
@@ -369,7 +380,7 @@ fn apply_series_expansion(
 fn cancelled_occurrence_keys(
     card: &Value,
     master_id: &str,
-    occurrences: &HashMap<String, Vec<String>>,
+    occurrences: &HashMap<String, Vec<Occurrence>>,
     exceptions: &[&ConvertedEvent],
     windows: &[(String, String)],
 ) -> Vec<String> {
@@ -391,16 +402,13 @@ fn cancelled_occurrence_keys(
     else {
         return Vec::new();
     };
-    let tz = card.get("timeZone").and_then(Value::as_str);
-
     let mut actual: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for utc in occurrences.get(master_id).into_iter().flatten() {
-        actual.insert(local_date_of(utc, tz));
+    for occ in occurrences.get(master_id).into_iter().flatten() {
+        actual.insert(local_date_of(card, &occ.start, occ.zone.as_deref()));
     }
     for ex in exceptions {
         if let Some(raw) = ex.original_start.as_deref() {
-            let key = normalise_override_key(raw, tz);
-            actual.insert(key.split('T').next().unwrap_or(&key).to_owned());
+            actual.insert(local_date_of(card, raw, ex.zone.as_deref()));
         }
     }
 
@@ -427,17 +435,30 @@ fn cancelled_occurrence_keys(
     out
 }
 
-fn local_date_of(utc: &str, tz: Option<&str>) -> String {
-    let key = normalise_override_key(utc, tz);
-    key.split('T').next().unwrap_or(&key).to_owned()
+fn local_date_of(master: &Value, utc: &str, zone: Option<&str>) -> String {
+    let mut key = occurrence_key(master, utc, zone);
+    if let Some((date, _)) = key.split_once('T') {
+        let len = date.len();
+        key.truncate(len);
+    }
+    key
+}
+
+fn occurrence_key(master: &Value, utc: &str, zone: Option<&str>) -> String {
+    if master.get("showWithoutTime").and_then(Value::as_bool) == Some(true)
+        && let Some(date) = all_day_date(utc, zone)
+    {
+        return all_day_key(date);
+    }
+    normalise_override_key(utc, master.get("timeZone").and_then(Value::as_str))
 }
 
 fn fetch_calendar_occurrences(
     ctx: &GraphCoordinator<'_>,
     calendar_id: &str,
     counts: &mut TypeCounts,
-) -> HashMap<String, Vec<String>> {
-    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+) -> HashMap<String, Vec<Occurrence>> {
+    let mut out: HashMap<String, Vec<Occurrence>> = HashMap::new();
     for (from, to) in exception_windows(ctx.exception_window_years) {
         let url = ctx
             .endpoints
@@ -455,9 +476,14 @@ fn fetch_calendar_occurrences(
                     else {
                         continue;
                     };
-                    out.entry(master.to_owned())
-                        .or_default()
-                        .push(start.to_owned());
+                    let zone = raw
+                        .get("originalStartTimeZone")
+                        .and_then(Value::as_str)
+                        .and_then(windows_or_iana_to_iana);
+                    out.entry(master.to_owned()).or_default().push(Occurrence {
+                        start: start.to_owned(),
+                        zone,
+                    });
                 }
             }
             Err(e) => {
@@ -650,6 +676,56 @@ fn delete_vanished(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn all_day_daily_master() -> Value {
+        json!({
+            "@type": "Event",
+            "start": "2026-11-12T00:00:00",
+            "duration": "P1D",
+            "showWithoutTime": true,
+            "recurrenceRule": {"@type": "RecurrenceRule", "frequency": "daily", "count": 3}
+        })
+    }
+
+    #[test]
+    fn all_day_override_key_takes_the_date_in_the_event_zone() {
+        let master = all_day_daily_master();
+        let paris = Some("Europe/Paris");
+        assert_eq!(
+            occurrence_key(&master, "2026-11-12T23:00:00Z", paris),
+            "2026-11-13T00:00:00"
+        );
+        assert_eq!(
+            occurrence_key(&master, "2026-11-13T00:00:00Z", paris),
+            "2026-11-13T00:00:00"
+        );
+        assert_eq!(
+            local_date_of(&master, "2026-11-13T23:00:00.0000000", paris),
+            "2026-11-14"
+        );
+    }
+
+    #[test]
+    fn all_day_occurrences_east_of_utc_are_not_reported_cancelled() {
+        let master = all_day_daily_master();
+        let zone = Some("Europe/Paris".to_owned());
+        let occurrences = HashMap::from([(
+            "M".to_owned(),
+            ["2026-11-11T23:00:00.0000000", "2026-11-13T23:00:00.0000000"]
+                .into_iter()
+                .map(|start| Occurrence {
+                    start: start.to_owned(),
+                    zone: zone.clone(),
+                })
+                .collect(),
+        )]);
+        let windows = vec![(
+            "2026-11-01T00:00:00".to_owned(),
+            "2026-11-30T00:00:00".to_owned(),
+        )];
+        let cancelled = cancelled_occurrence_keys(&master, "M", &occurrences, &[], &windows);
+        assert_eq!(cancelled, vec!["2026-11-13T00:00:00".to_owned()]);
+    }
 
     #[test]
     fn exception_windows_never_exceed_the_graph_limit() {

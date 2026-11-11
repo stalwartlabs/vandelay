@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, TimeZone};
 use chrono_tz::Tz;
 
 const END_OF_DAY: &str = "23:59:59";
@@ -23,6 +23,22 @@ pub fn nearest_midnight(value: &str, iana: Option<&str>) -> Option<NaiveDate> {
                 NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").map(|d| d.and_time(NaiveTime::MIN))
             })
             .ok()?,
+    };
+    local.checked_add_signed(HALF_DAY).map(|dt| dt.date())
+}
+
+pub fn all_day_date(utc: &str, iana: Option<&str>) -> Option<NaiveDate> {
+    let trimmed = utc.trim();
+    let instant = DateTime::parse_from_rfc3339(trimmed)
+        .map(|dt| dt.naive_utc())
+        .or_else(|_| NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f"))
+        .ok()?;
+    if instant.time() == NaiveTime::MIN {
+        return Some(instant.date());
+    }
+    let local = match iana.and_then(|tz| tz.parse::<Tz>().ok()) {
+        Some(tz) => tz.from_utc_datetime(&instant).naive_local(),
+        None => instant,
     };
     local.checked_add_signed(HALF_DAY).map(|dt| dt.date())
 }
@@ -142,6 +158,39 @@ mod tests {
         );
         assert_eq!(nearest_midnight("2025-12-25", None), date(2025, 12, 25));
         assert_eq!(nearest_midnight("garbage", None), None);
+    }
+
+    #[test]
+    fn all_day_midnight_is_taken_as_the_date() {
+        assert_eq!(
+            all_day_date("2026-11-12T00:00:00.0000000", Some("Pacific/Auckland")),
+            date(2026, 11, 12)
+        );
+        assert_eq!(
+            all_day_date("2026-11-12T00:00:00Z", Some("America/New_York")),
+            date(2026, 11, 12)
+        );
+    }
+
+    #[test]
+    fn all_day_utc_instant_moves_to_the_local_date() {
+        assert_eq!(
+            all_day_date("2026-11-11T23:00:00.0000000", Some("Europe/Paris")),
+            date(2026, 11, 12)
+        );
+        assert_eq!(
+            all_day_date("2026-11-11T11:00:00Z", Some("Pacific/Auckland")),
+            date(2026, 11, 12)
+        );
+        assert_eq!(
+            all_day_date("2026-11-12T05:00:00.0000000", Some("America/New_York")),
+            date(2026, 11, 12)
+        );
+        assert_eq!(
+            all_day_date("2026-11-11T23:00:00", None),
+            date(2026, 11, 12)
+        );
+        assert_eq!(all_day_date("garbage", None), None);
     }
 
     #[test]

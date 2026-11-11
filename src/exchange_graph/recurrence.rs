@@ -6,7 +6,7 @@
 
 use serde_json::{Value, json};
 
-use crate::exchange::date::recurrence_until;
+use crate::exchange::date::{is_outlook_no_date, recurrence_until};
 use crate::exchange_graph::error::GraphError;
 
 pub fn convert_patterned_recurrence(pr: &Value) -> Result<Value, GraphError> {
@@ -86,6 +86,7 @@ pub fn convert_patterned_recurrence_rule(
             if let Some(local) = range
                 .get("endDate")
                 .and_then(Value::as_str)
+                .filter(|end| !is_outlook_no_date(end))
                 .and_then(recurrence_until)
             {
                 rule.insert("until".to_owned(), Value::from(local));
@@ -273,6 +274,16 @@ mod tests {
         });
         let out = convert_patterned_recurrence(&pr).unwrap();
         assert_eq!(out["until"], "2026-12-31T23:59:59");
+    }
+
+    #[test]
+    fn range_end_on_outlook_no_date_has_no_until() {
+        let rule = convert_patterned_recurrence(&json!({
+            "pattern": {"type": "daily", "interval": 1},
+            "range": {"type": "endDate", "startDate": "2026-01-01", "endDate": "4500-12-31"}
+        }))
+        .unwrap();
+        assert!(rule.get("until").is_none());
     }
 
     #[test]

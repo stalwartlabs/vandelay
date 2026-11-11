@@ -163,7 +163,7 @@ impl Endpoints {
         format!(
             "{}/calendars/{}/calendarView?startDateTime={window_start}&endDateTime={window_end}\
              &$filter=type%20eq%20%27occurrence%27&$top={top}\
-             &$select=id,type,seriesMasterId,start",
+             &$select=id,type,seriesMasterId,start,originalStartTimeZone",
             self.me_or_user(),
             url_escape(calendar_id)
         )

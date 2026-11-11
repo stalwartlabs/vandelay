@@ -4,8 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+use chrono::Datelike;
 use serde_json::{Map, Value, json};
 
+use crate::exchange::date::{is_outlook_no_date, nearest_midnight};
 use crate::exchange_graph::error::GraphError;
 
 #[derive(Debug, Clone)]
@@ -372,24 +374,17 @@ fn normalise_utc_datetime(raw: &str) -> String {
 }
 
 fn parse_partial_date(raw: &str) -> Option<Value> {
-    let date_part = raw.split('T').next().unwrap_or(raw);
-    let mut iter = date_part.split('-');
-    let year: u64 = iter.next()?.parse().ok()?;
+    if is_outlook_no_date(raw) {
+        return None;
+    }
+    let date = nearest_midnight(raw, None)?;
     let mut obj = Map::new();
     obj.insert("@type".to_owned(), Value::from("PartialDate"));
-    obj.insert("year".to_owned(), Value::from(year));
-    if let Some(month_str) = iter.next()
-        && let Ok(month) = month_str.parse::<u64>()
-        && (1..=12).contains(&month)
-    {
-        obj.insert("month".to_owned(), Value::from(month));
-        if let Some(day_str) = iter.next()
-            && let Ok(day) = day_str.parse::<u64>()
-            && (1..=31).contains(&day)
-        {
-            obj.insert("day".to_owned(), Value::from(day));
-        }
+    if date.year() > 0 {
+        obj.insert("year".to_owned(), Value::from(date.year()));
     }
+    obj.insert("month".to_owned(), Value::from(date.month()));
+    obj.insert("day".to_owned(), Value::from(date.day()));
     Some(Value::Object(obj))
 }
 
@@ -575,6 +570,24 @@ mod tests {
         let conv = convert_contact(&c).unwrap();
         let ja = conv.data["localizations"]["ja"].as_object().unwrap();
         assert_eq!(ja["organizations/org-1/name"], "アクメ");
+    }
+
+    #[test]
+    fn birthday_stored_as_local_midnight_in_utc_keeps_its_day() {
+        for raw in ["1990-04-14T22:00:00Z", "1990-04-15T11:59:00Z", "1990-04-15"] {
+            let conv = convert_contact(&json!({"id": "X", "birthday": raw})).unwrap();
+            assert_eq!(
+                conv.data["anniversaries"]["anniversary-1"]["date"],
+                json!({"@type": "PartialDate", "year": 1990, "month": 4, "day": 15})
+            );
+        }
+    }
+
+    #[test]
+    fn outlook_no_date_birthday_is_dropped() {
+        let c = json!({"id": "X", "birthday": "4501-01-01T00:00:00Z"});
+        let conv = convert_contact(&c).unwrap();
+        assert!(conv.data.get("anniversaries").is_none());
     }
 
     #[test]
