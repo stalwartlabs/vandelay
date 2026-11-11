@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Connection, params};
 
@@ -52,10 +52,15 @@ pub fn plan_folders(
     if logger.enabled(LEVEL_PROGRESS) {
         eprintln!("FindFolder returned {} folders", parsed.folders.len());
     }
+    let folders = drop_hidden_subtrees(parsed.folders);
+    let parents: HashMap<String, String> = folders
+        .iter()
+        .filter_map(|f| Some((f.folder_id.id.clone(), f.parent_id.clone()?)))
+        .collect();
     let mut mail = Vec::new();
     let mut calendar = Vec::new();
     let mut contacts = Vec::new();
-    for folder in parsed.folders {
+    for folder in folders {
         let class = FolderClass::from_ipf(&folder.folder_class);
         if class == FolderClass::Mail
             && FolderClass::is_mail_fallback(&folder.folder_class)
@@ -98,6 +103,7 @@ pub fn plan_folders(
             (_, FolderClass::Skipped) => {}
         }
     }
+    reparent_under_mail_ancestors(&mut mail, &parents);
     let well_known_roles = resolve_well_known_roles(client, url, mailbox_kind, mailbox, logger)?;
     let root_folder_id = resolve_root_folder_id(client, url, mailbox_kind, mailbox)?;
     Ok(FolderPlan {
@@ -107,6 +113,56 @@ pub fn plan_folders(
         well_known_roles,
         root_folder_id,
     })
+}
+
+fn drop_hidden_subtrees(mut folders: Vec<FolderEntry>) -> Vec<FolderEntry> {
+    if !folders.iter().any(|f| f.is_hidden) {
+        return folders;
+    }
+    let by_id: HashMap<&str, &FolderEntry> = folders
+        .iter()
+        .map(|f| (f.folder_id.id.as_str(), f))
+        .collect();
+    let hidden: HashSet<String> = folders
+        .iter()
+        .filter(|f| {
+            let mut current = Some(*f);
+            for _ in 0..=by_id.len() {
+                let Some(folder) = current else {
+                    return false;
+                };
+                if folder.is_hidden {
+                    return true;
+                }
+                current = folder
+                    .parent_id
+                    .as_deref()
+                    .and_then(|p| by_id.get(p).copied());
+            }
+            false
+        })
+        .map(|f| f.folder_id.id.clone())
+        .collect();
+    folders.retain(|f| !hidden.contains(&f.folder_id.id));
+    folders
+}
+
+fn reparent_under_mail_ancestors(mail: &mut [ClassifiedFolder], parents: &HashMap<String, String>) {
+    let mail_ids: HashSet<String> = mail.iter().map(|f| f.folder.folder_id.id.clone()).collect();
+    for folder in mail.iter_mut() {
+        let mut parent = folder.folder.parent_id.as_deref();
+        for _ in 0..=parents.len() {
+            match parent {
+                Some(p) if !mail_ids.contains(p) => match parents.get(p) {
+                    Some(grandparent) => parent = Some(grandparent),
+                    None => break,
+                },
+                _ => break,
+            }
+        }
+        let parent = parent.map(str::to_owned);
+        folder.folder.parent_id = parent;
+    }
 }
 
 fn resolve_well_known_roles(
@@ -216,14 +272,10 @@ pub fn reconcile(
         exchange_ews_ids::folders_of_type(conn, source_id, exchange_ews_ids::ADDRESS_BOOK)
             .map_err(|e| Error::Partial(e.to_string()))?;
 
-    let mut id_to_local: HashMap<String, i64> = HashMap::new();
-    for (id, row) in local_mailbox
+    let mut mailbox_local_ids: HashMap<String, i64> = local_mailbox
         .iter()
-        .chain(local_calendar.iter())
-        .chain(local_addressbook.iter())
-    {
-        id_to_local.insert(id.clone(), row.local_id);
-    }
+        .map(|(id, row)| (id.clone(), row.local_id))
+        .collect();
 
     let ordered_mail = order_by_parent(&plan.mail);
     let ordered_calendar = order_by_parent(&plan.calendar);
@@ -242,19 +294,17 @@ pub fn reconcile(
         let mut ctx = UpsertCtx {
             conn,
             source_id,
-            id_to_local: &mut id_to_local,
             local: &local_mailbox,
             counts: &mut *counts.mailbox,
             root_folder_id: &plan.root_folder_id,
         };
-        upsert_mailbox(&mut ctx, folder, role)?;
+        upsert_mailbox(&mut ctx, &mut mailbox_local_ids, folder, role)?;
     }
     for folder in &ordered_calendar {
         server_ids_calendar.push(folder.folder.folder_id.id.clone());
         let mut ctx = UpsertCtx {
             conn,
             source_id,
-            id_to_local: &mut id_to_local,
             local: &local_calendar,
             counts: &mut *counts.calendar,
             root_folder_id: &plan.root_folder_id,
@@ -266,7 +316,6 @@ pub fn reconcile(
         let mut ctx = UpsertCtx {
             conn,
             source_id,
-            id_to_local: &mut id_to_local,
             local: &local_addressbook,
             counts: &mut *counts.addressbook,
             root_folder_id: &plan.root_folder_id,
@@ -369,7 +418,6 @@ fn order_by_parent(folders: &[ClassifiedFolder]) -> Vec<&ClassifiedFolder> {
 struct UpsertCtx<'a> {
     conn: &'a mut Connection,
     source_id: i64,
-    id_to_local: &'a mut HashMap<String, i64>,
     local: &'a HashMap<String, exchange_ews_ids::FolderRow>,
     counts: &'a mut TypeCounts,
     root_folder_id: &'a str,
@@ -377,10 +425,11 @@ struct UpsertCtx<'a> {
 
 fn upsert_mailbox(
     ctx: &mut UpsertCtx<'_>,
+    mailbox_local_ids: &mut HashMap<String, i64>,
     folder: &ClassifiedFolder,
     role: Option<&'static str>,
 ) -> Result<(), Error> {
-    let parent_local = parent_local_id(folder, ctx.id_to_local, ctx.root_folder_id);
+    let parent_local = parent_local_id(folder, mailbox_local_ids, ctx.root_folder_id);
     let tx = ctx
         .conn
         .unchecked_transaction()
@@ -428,8 +477,7 @@ fn upsert_mailbox(
         new_id
     };
     tx.commit().map_err(|e| Error::Partial(e.to_string()))?;
-    ctx.id_to_local
-        .insert(folder.folder.folder_id.id.clone(), local_id);
+    mailbox_local_ids.insert(folder.folder.folder_id.id.clone(), local_id);
     Ok(())
 }
 
@@ -439,7 +487,7 @@ fn upsert_calendar(ctx: &mut UpsertCtx<'_>, folder: &ClassifiedFolder) -> Result
         .unchecked_transaction()
         .map_err(|e| Error::Partial(e.to_string()))?;
     let existing = ctx.local.get(&folder.folder.folder_id.id);
-    let local_id = if let Some(row) = existing {
+    if let Some(row) = existing {
         tx.execute(
             "UPDATE calendars SET name = ?1 WHERE id = ?2",
             params![folder.folder.display_name, row.local_id],
@@ -454,7 +502,6 @@ fn upsert_calendar(ctx: &mut UpsertCtx<'_>, folder: &ClassifiedFolder) -> Result
         )
         .map_err(|e| Error::Partial(e.to_string()))?;
         ctx.counts.fetched += 1;
-        row.local_id
     } else {
         tx.execute(
             "INSERT INTO calendars (name, sort_order, is_subscribed, is_visible) \
@@ -474,11 +521,8 @@ fn upsert_calendar(ctx: &mut UpsertCtx<'_>, folder: &ClassifiedFolder) -> Result
         )
         .map_err(|e| Error::Partial(e.to_string()))?;
         ctx.counts.created += 1;
-        new_id
-    };
+    }
     tx.commit().map_err(|e| Error::Partial(e.to_string()))?;
-    ctx.id_to_local
-        .insert(folder.folder.folder_id.id.clone(), local_id);
     Ok(())
 }
 
@@ -488,7 +532,7 @@ fn upsert_address_book(ctx: &mut UpsertCtx<'_>, folder: &ClassifiedFolder) -> Re
         .unchecked_transaction()
         .map_err(|e| Error::Partial(e.to_string()))?;
     let existing = ctx.local.get(&folder.folder.folder_id.id);
-    let local_id = if let Some(row) = existing {
+    if let Some(row) = existing {
         tx.execute(
             "UPDATE address_books SET name = ?1 WHERE id = ?2",
             params![folder.folder.display_name, row.local_id],
@@ -503,7 +547,6 @@ fn upsert_address_book(ctx: &mut UpsertCtx<'_>, folder: &ClassifiedFolder) -> Re
         )
         .map_err(|e| Error::Partial(e.to_string()))?;
         ctx.counts.fetched += 1;
-        row.local_id
     } else {
         tx.execute(
             "INSERT INTO address_books (name, sort_order, is_subscribed) \
@@ -523,24 +566,21 @@ fn upsert_address_book(ctx: &mut UpsertCtx<'_>, folder: &ClassifiedFolder) -> Re
         )
         .map_err(|e| Error::Partial(e.to_string()))?;
         ctx.counts.created += 1;
-        new_id
-    };
+    }
     tx.commit().map_err(|e| Error::Partial(e.to_string()))?;
-    ctx.id_to_local
-        .insert(folder.folder.folder_id.id.clone(), local_id);
     Ok(())
 }
 
 fn parent_local_id(
     folder: &ClassifiedFolder,
-    id_to_local: &HashMap<String, i64>,
+    mailbox_local_ids: &HashMap<String, i64>,
     root_folder_id: &str,
 ) -> Option<i64> {
     let parent_id = folder.folder.parent_id.as_deref()?;
     if parent_id == root_folder_id || parent_id.is_empty() {
         return None;
     }
-    id_to_local.get(parent_id).copied()
+    mailbox_local_ids.get(parent_id).copied()
 }
 
 fn delete_vanished(
@@ -733,6 +773,143 @@ mod tests {
         assert_eq!(mailboxes, 0);
         assert_eq!(emails, 0, "no orphaned email row may remain");
         assert_eq!(orphan_idmap, 0, "both idmap rows must be removed");
+    }
+
+    fn entry(id: &str, parent: &str, class: &str, hidden: bool) -> FolderEntry {
+        FolderEntry {
+            folder_id: crate::exchange_ews::types::FolderId {
+                id: id.to_owned(),
+                change_key: "CK".to_owned(),
+            },
+            parent_id: Some(parent.to_owned()),
+            display_name: id.to_owned(),
+            folder_class: class.to_owned(),
+            is_hidden: hidden,
+            ..FolderEntry::default()
+        }
+    }
+
+    fn classified(id: &str, parent: &str, kind: FolderClass) -> ClassifiedFolder {
+        ClassifiedFolder {
+            folder: entry(id, parent, "", false),
+            kind,
+        }
+    }
+
+    #[test]
+    fn hidden_folders_are_dropped_with_their_descendants() {
+        let folders = vec![
+            entry("CONTACTS", "ROOT", "IPF.Contact", false),
+            entry("RECIPIENT_CACHE", "CONTACTS", "IPF.Contact", true),
+            entry("YAMMER", "ROOT", "IPF.Note", true),
+            entry("YAMMER_FEEDS", "YAMMER", "IPF.Note", false),
+            entry("YAMMER_DEEP", "YAMMER_FEEDS", "IPF.Note", false),
+            entry("INBOX", "ROOT", "IPF.Note", false),
+        ];
+        let kept: Vec<String> = drop_hidden_subtrees(folders)
+            .into_iter()
+            .map(|f| f.folder_id.id)
+            .collect();
+        assert_eq!(kept, ["CONTACTS", "INBOX"]);
+    }
+
+    #[test]
+    fn mail_folder_is_filed_under_its_nearest_mail_ancestor() {
+        let parents: HashMap<String, String> = [
+            ("PROJECTS", "ROOT"),
+            ("PCAL", "PROJECTS"),
+            ("SUB", "PCAL"),
+            ("CAL", "ROOT"),
+            ("NOTES", "CAL"),
+            ("INBOX", "ROOT"),
+            ("A", "B"),
+            ("B", "A"),
+            ("LOOP", "A"),
+        ]
+        .into_iter()
+        .map(|(id, parent)| (id.to_owned(), parent.to_owned()))
+        .collect();
+        let mut mail = vec![
+            classified("PROJECTS", "ROOT", FolderClass::Mail),
+            classified("SUB", "PCAL", FolderClass::Mail),
+            classified("NOTES", "CAL", FolderClass::Mail),
+            classified("INBOX", "ROOT", FolderClass::Mail),
+            classified("LOOP", "A", FolderClass::Mail),
+        ];
+        reparent_under_mail_ancestors(&mut mail, &parents);
+        let parent_of = |id: &str| {
+            mail.iter()
+                .find(|f| f.folder.folder_id.id == id)
+                .and_then(|f| f.folder.parent_id.clone())
+        };
+        assert_eq!(parent_of("SUB").as_deref(), Some("PROJECTS"));
+        assert_eq!(parent_of("NOTES").as_deref(), Some("ROOT"));
+        assert_eq!(parent_of("INBOX").as_deref(), Some("ROOT"));
+        assert_ne!(parent_of("LOOP").as_deref(), Some("PROJECTS"));
+    }
+
+    #[test]
+    fn rerun_does_not_take_a_calendar_local_id_as_mailbox_parent() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init::apply_schema(&conn).unwrap();
+        let sid = crate::db::sources::upsert_source(
+            &conn,
+            &crate::db::sources::SourceKey {
+                kind: "exchange_ews".to_owned(),
+                session_url: "https://x/EWS/Exchange.asmx".to_owned(),
+                account_id: "u@d".to_owned(),
+            },
+            Some("u"),
+            "u@d",
+        )
+        .unwrap();
+        let plan = FolderPlan {
+            mail: vec![
+                classified("INBOX", "ROOT", FolderClass::Mail),
+                classified("NOTES", "CAL", FolderClass::Mail),
+            ],
+            calendar: vec![
+                classified("CAL", "ROOT", FolderClass::Calendar),
+                classified("CAL2", "ROOT", FolderClass::Calendar),
+            ],
+            contacts: vec![],
+            well_known_roles: HashMap::new(),
+            root_folder_id: "ROOT".to_owned(),
+        };
+        for _ in 0..2 {
+            let mut counts: [TypeCounts; 6] = Default::default();
+            let [
+                mailbox,
+                calendar,
+                addressbook,
+                email,
+                calendar_event,
+                contact,
+            ] = &mut counts;
+            reconcile(
+                &mut conn,
+                sid,
+                &plan,
+                &mut ReconcileCounts {
+                    mailbox,
+                    calendar,
+                    addressbook,
+                    email,
+                    calendar_event,
+                    contact,
+                },
+                Logger::new(LEVEL_DEFAULT),
+            )
+            .unwrap();
+            let parent: Option<i64> = conn
+                .query_row(
+                    "SELECT parent_id FROM mailboxes WHERE name = 'NOTES'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(parent, None);
+        }
     }
 
     fn row(id: &str, parent_ews_id: &str, local_id: i64) -> exchange_ews_ids::FolderRow {

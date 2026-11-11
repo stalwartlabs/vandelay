@@ -63,6 +63,7 @@ pub fn find_folder_body(parent: FolderRef<'_>, traversal: Traversal) -> String {
     out.push_str("<t:FieldURI FieldURI=\"folder:ParentFolderId\"/>");
     out.push_str("<t:FieldURI FieldURI=\"folder:TotalCount\"/>");
     out.push_str("<t:FieldURI FieldURI=\"folder:ChildFolderCount\"/>");
+    out.push_str("<t:ExtendedFieldURI PropertyTag=\"0x10F4\" PropertyType=\"Boolean\"/>");
     out.push_str("</t:AdditionalProperties>");
     out.push_str("</m:FolderShape><m:ParentFolderIds>");
     write_folder_ref(&mut out, parent);
@@ -295,6 +296,7 @@ mod tests {
         assert!(body.contains("folder:FolderClass"));
         assert!(body.contains("folder:DisplayName"));
         assert!(body.contains("folder:ParentFolderId"));
+        assert!(body.contains("PropertyTag=\"0x10F4\" PropertyType=\"Boolean\""));
     }
 
     #[test]

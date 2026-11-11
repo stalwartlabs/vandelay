@@ -262,6 +262,7 @@ pub struct FolderEntry {
     pub folder_class: String,
     pub total_count: Option<u32>,
     pub child_count: Option<u32>,
+    pub is_hidden: bool,
 }
 
 impl Default for FolderEntry {
@@ -277,6 +278,7 @@ impl Default for FolderEntry {
             folder_class: String::new(),
             total_count: None,
             child_count: None,
+            is_hidden: false,
         }
     }
 }
@@ -408,6 +410,7 @@ fn parse_folder_element<R: BufRead>(
     let mut buf = Vec::new();
     let mut depth: u32 = 1;
     let mut current: Option<&'static str> = None;
+    let mut in_hidden_ext = false;
     let mut cur = String::new();
     loop {
         buf.clear();
@@ -446,6 +449,14 @@ fn parse_folder_element<R: BufRead>(
                     } else if local.eq_ignore_ascii_case("ChildFolderCount") {
                         current = Some("childCount");
                         cur.clear();
+                    } else if local.eq_ignore_ascii_case("ExtendedFieldURI") {
+                        in_hidden_ext = attr_value(e, "PropertyTag").is_some_and(|tag| {
+                            let tag = tag.trim();
+                            tag.eq_ignore_ascii_case("0x10f4") || tag == "4340"
+                        });
+                    } else if in_hidden_ext && local.eq_ignore_ascii_case("Value") {
+                        current = Some("hidden");
+                        cur.clear();
                     } else {
                         current = None;
                     }
@@ -462,6 +473,7 @@ fn parse_folder_element<R: BufRead>(
                         "folderClass" => entry.folder_class = text.trim().to_owned(),
                         "totalCount" => entry.total_count = text.trim().parse().ok(),
                         "childCount" => entry.child_count = text.trim().parse().ok(),
+                        "hidden" => entry.is_hidden = matches!(text.trim(), "true" | "1"),
                         _ => {}
                     }
                 }
@@ -2211,6 +2223,32 @@ mod tests {
         assert_eq!(r.folders[0].parent_id.as_deref(), Some("ROOT"));
         assert_eq!(r.folders[1].element, FolderElement::CalendarFolder);
         assert!(!r.more);
+        assert!(!r.folders[0].is_hidden);
+    }
+
+    #[test]
+    fn find_folder_reads_pr_attr_hidden() {
+        let body = format!(
+            "<m:FindFolderResponse{NS}><m:ResponseMessages><m:FindFolderResponseMessage ResponseClass=\"Success\">\
+             <m:ResponseCode>NoError</m:ResponseCode>\
+             <m:RootFolder TotalItemsInView=\"2\" IncludesLastItemInRange=\"true\">\
+             <t:Folders>\
+             <t:ContactsFolder><t:FolderId Id=\"RC\"/><t:ParentFolderId Id=\"CONTACTS\"/>\
+               <t:FolderClass>IPF.Contact</t:FolderClass><t:DisplayName>Recipient Cache</t:DisplayName>\
+               <t:ExtendedProperty><t:ExtendedFieldURI PropertyTag=\"0x10f4\" PropertyType=\"Boolean\"/>\
+               <t:Value>true</t:Value></t:ExtendedProperty></t:ContactsFolder>\
+             <t:Folder><t:FolderId Id=\"F1\"/><t:ParentFolderId Id=\"ROOT\"/>\
+               <t:FolderClass>IPF.Note</t:FolderClass><t:DisplayName>Inbox</t:DisplayName>\
+               <t:ExtendedProperty><t:ExtendedFieldURI PropertyTag=\"0x10f4\" PropertyType=\"Boolean\"/>\
+               <t:Value>false</t:Value></t:ExtendedProperty></t:Folder>\
+             </t:Folders></m:RootFolder></m:FindFolderResponseMessage></m:ResponseMessages></m:FindFolderResponse>"
+        );
+        let r = parse_find_folder_response(body.as_bytes()).unwrap();
+        assert_eq!(r.folders.len(), 2);
+        assert!(r.folders[0].is_hidden);
+        assert_eq!(r.folders[0].display_name, "Recipient Cache");
+        assert!(!r.folders[1].is_hidden);
+        assert_eq!(r.folders[1].display_name, "Inbox");
     }
 
     #[test]
