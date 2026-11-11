@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file. This projec
 - MS Exchange EWS: Outlook's "no date" (year 4500 or later) was imported as a real date; such contact anniversaries are dropped and such calendar items are skipped. Archives imported with an earlier version keep the ones already stored, so re-import into a fresh archive (fixes #66)
 - MS Exchange EWS: hidden system folders (`PR_ATTR_HIDDEN`, such as `Recipient Cache`, `GAL Contacts` or `Yammer Root`) were imported as address books and mailboxes; they are now skipped together with their subfolders (fixes #61)
 - MS Exchange EWS: a mail folder under a calendar or contacts folder was filed at the top level on the first run, but on later runs took the local id of that calendar or address book as its parent, giving an unrelated parent or a FOREIGN KEY error that stopped the import; a mail folder is now filed under its nearest mail ancestor on every run (fixes #63)
+- MS Exchange EWS: an organizer, attendee, recipient or distribution list member picked from an address book carries that contact's ItemId, which replaced the ItemId of the event, message or list, causing `UNIQUE constraint failed` errors; FindItem dropped `Task` and `PostItem` entries and gave their ItemId to the item listed before them; and one item that failed to parse or store aborted the rest of its folder. Only the item's own ItemId is used now, every listed item is kept, and a failing item is logged and counted while the folder goes on (fixes #60)
 
 ## [1.0.15] - 2026-11-08
 

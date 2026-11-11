@@ -522,12 +522,15 @@ pub fn parse_find_item_response(body: &[u8]) -> Result<FindItemResponse, EwsErro
     let mut buf = Vec::new();
     let mut out = FindItemResponse::default();
     let mut in_root = false;
+    let mut depth = ItemDepth::default();
+    let mut items_level: Option<usize> = None;
     loop {
         buf.clear();
         let (ns, ev) = xml.read_resolved_event_into(&mut buf)?;
         let ns_kind = classify(&ns);
         match ev {
             Event::Start(ref e) | Event::Empty(ref e) => {
+                let level = depth.open(matches!(ev, Event::Empty(_)));
                 let local = e.local_name().as_ref().to_owned();
                 if is(ns_kind, &local, Ns::Messages, "RootFolder") {
                     in_root = true;
@@ -538,12 +541,16 @@ pub fn parse_find_item_response(body: &[u8]) -> Result<FindItemResponse, EwsErro
                         out.more = !matches!(v.trim(), "true" | "1");
                     }
                 } else if in_root && ns_kind == Ns::Types {
-                    if is_item_element(&local) {
+                    if items_level.is_none() && local.eq_ignore_ascii_case("Items") {
+                        items_level = Some(level);
+                    } else if items_level.is_some_and(|items| level == items + 1) {
+                        depth.enter_item(level);
                         out.items.push(ItemEntry {
                             element: local.clone(),
                             id: ItemId::default(),
                         });
-                    } else if local.eq_ignore_ascii_case("ItemId")
+                    } else if depth.is_item_child(level)
+                        && local.eq_ignore_ascii_case("ItemId")
                         && let Some(last) = out.items.last_mut()
                     {
                         capture_id_attrs(e, &mut last.id.id, &mut last.id.change_key);
@@ -551,9 +558,11 @@ pub fn parse_find_item_response(body: &[u8]) -> Result<FindItemResponse, EwsErro
                 }
             }
             Event::End(e) => {
+                depth.close();
                 let local = e.local_name().as_ref().to_owned();
                 if local.eq_ignore_ascii_case("RootFolder") {
                     in_root = false;
+                    items_level = None;
                 }
             }
             Event::Eof => break,
@@ -578,18 +587,49 @@ pub(crate) fn entity_to_char(g: &BytesRef) -> Option<char> {
 }
 
 fn is_item_element(local: &str) -> bool {
-    matches!(
-        local.to_ascii_lowercase().as_str(),
-        "message"
-            | "calendaritem"
-            | "contact"
-            | "distributionlist"
-            | "meetingrequest"
-            | "meetingresponse"
-            | "meetingmessage"
-            | "meetingcancellation"
-            | "item"
+    hashify::set_ignore_case!(
+        local.as_bytes(),
+        "Item",
+        "Message",
+        "SharingMessage",
+        "CalendarItem",
+        "Contact",
+        "DistributionList",
+        "MeetingMessage",
+        "MeetingRequest",
+        "MeetingResponse",
+        "MeetingCancellation",
+        "Task",
+        "PostItem",
     )
+}
+
+#[derive(Default)]
+struct ItemDepth {
+    depth: usize,
+    item_level: Option<usize>,
+}
+
+impl ItemDepth {
+    fn open(&mut self, is_empty: bool) -> usize {
+        let level = self.depth + 1;
+        if !is_empty {
+            self.depth = level;
+        }
+        level
+    }
+
+    fn close(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    fn enter_item(&mut self, level: usize) {
+        self.item_level = Some(level);
+    }
+
+    fn is_item_child(&self, level: usize) -> bool {
+        self.item_level.is_some_and(|item| level == item + 1)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -966,6 +1006,7 @@ pub fn parse_message_item(inner_xml: &str) -> Result<MessageItem, EwsError> {
     let mut category_collecting = false;
     let mut in_flag = false;
     let mut in_flagstatus_ext = false;
+    let mut depth = ItemDepth::default();
     let mut cur = String::new();
     loop {
         buf.clear();
@@ -975,12 +1016,16 @@ pub fn parse_message_item(inner_xml: &str) -> Result<MessageItem, EwsError> {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 let local = e.local_name().as_ref().to_owned();
                 let is_empty = matches!(ev, Event::Empty(_));
+                let level = depth.open(is_empty);
                 if item.element.is_empty() && is_item_element(&local) {
                     item.element = local.clone();
+                    depth.enter_item(level);
                 } else if ns_kind == Ns::Types {
                     cur.clear();
                     if local.eq_ignore_ascii_case("ItemId") {
-                        capture_id_attrs(e, &mut item.id.id, &mut item.id.change_key);
+                        if depth.is_item_child(level) {
+                            capture_id_attrs(e, &mut item.id.id, &mut item.id.change_key);
+                        }
                     } else if local.eq_ignore_ascii_case("ParentFolderId") {
                         let mut pid = String::new();
                         let mut ck = String::new();
@@ -1023,6 +1068,7 @@ pub fn parse_message_item(inner_xml: &str) -> Result<MessageItem, EwsError> {
                 }
             }
             Event::End(e) => {
+                depth.close();
                 let local = e.local_name().as_ref().to_owned();
                 let lower = local.to_ascii_lowercase();
                 if let Some(field) = current.take() {
@@ -1205,6 +1251,7 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
     let mut recurrence_text: Option<&'static str> = None;
     let mut recurrence = RawRecurrence::default();
     let mut pending = PendingRecurrence::default();
+    let mut depth = ItemDepth::default();
     let mut cur = String::new();
 
     loop {
@@ -1215,8 +1262,10 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
             Event::Start(ref e) | Event::Empty(ref e) => {
                 let local = e.local_name().as_ref().to_owned();
                 let is_empty = matches!(ev, Event::Empty(_));
+                let level = depth.open(is_empty);
                 if item.element.is_empty() && is_item_element(&local) {
                     item.element = local.clone();
+                    depth.enter_item(level);
                     continue;
                 }
                 if ns_kind != Ns::Types {
@@ -1277,7 +1326,7 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                         if let Some(occ) = deleted_stack.last_mut() {
                             capture_id_attrs(e, &mut occ.item_id.id, &mut occ.item_id.change_key);
                         }
-                    } else {
+                    } else if depth.is_item_child(level) {
                         capture_id_attrs(e, &mut item.id.id, &mut item.id.change_key);
                     }
                 } else if local.eq_ignore_ascii_case("ParentFolderId") {
@@ -1411,6 +1460,7 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                 }
             }
             Event::End(e) => {
+                depth.close();
                 let local = e.local_name().as_ref().to_owned();
                 let lower = local.to_ascii_lowercase();
                 if !recurrence_path.is_empty() {
@@ -1711,6 +1761,7 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
     let mut in_members = false;
     let mut member_mailbox = false;
     let mut current_member: Option<RawGroupMember> = None;
+    let mut depth = ItemDepth::default();
     let mut cur = String::new();
     loop {
         buf.clear();
@@ -1720,11 +1771,13 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 let local = e.local_name().as_ref().to_owned();
                 let is_empty = matches!(ev, Event::Empty(_));
+                let level = depth.open(is_empty);
                 if !seen_root_contact
                     && (local.eq_ignore_ascii_case("Contact")
                         || local.eq_ignore_ascii_case("DistributionList"))
                 {
                     seen_root_contact = true;
+                    depth.enter_item(level);
                     if local.eq_ignore_ascii_case("DistributionList") {
                         item.is_group = true;
                     }
@@ -1735,7 +1788,9 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
                 }
                 cur.clear();
                 if local.eq_ignore_ascii_case("ItemId") {
-                    capture_id_attrs(e, &mut item.id.id, &mut item.id.change_key);
+                    if depth.is_item_child(level) {
+                        capture_id_attrs(e, &mut item.id.id, &mut item.id.change_key);
+                    }
                 } else if local.eq_ignore_ascii_case("ParentFolderId") {
                     let mut pid = String::new();
                     let mut ck = String::new();
@@ -1855,6 +1910,7 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
                 }
             }
             Event::End(e) => {
+                depth.close();
                 let local = e.local_name().as_ref().to_owned();
                 let lower = local.to_ascii_lowercase();
                 if let Some(at) = address_text {
@@ -2249,6 +2305,96 @@ mod tests {
         assert_eq!(r.folders[0].display_name, "Recipient Cache");
         assert!(!r.folders[1].is_hidden);
         assert_eq!(r.folders[1].display_name, "Inbox");
+    }
+
+    #[test]
+    fn find_item_opens_an_entry_for_every_item_element() {
+        let body = format!(
+            "<m:FindItemResponse{NS}><m:ResponseMessages><m:FindItemResponseMessage ResponseClass=\"Success\">\
+             <m:ResponseCode>NoError</m:ResponseCode>\
+             <m:RootFolder TotalItemsInView=\"4\" IncludesLastItemInRange=\"true\"><t:Items>\
+             <t:Message><t:ItemId Id=\"M1\" ChangeKey=\"k\"/></t:Message>\
+             <t:Task><t:ItemId Id=\"T1\" ChangeKey=\"k\"/></t:Task>\
+             <t:PostItem><t:ItemId Id=\"P1\" ChangeKey=\"k\"/></t:PostItem>\
+             <t:FutureItem><t:ItemId Id=\"F1\" ChangeKey=\"k\"/></t:FutureItem>\
+             </t:Items></m:RootFolder></m:FindItemResponseMessage></m:ResponseMessages></m:FindItemResponse>"
+        );
+        let r = parse_find_item_response(body.as_bytes()).unwrap();
+        let ids: Vec<(&str, &str)> = r
+            .items
+            .iter()
+            .map(|i| (i.element.as_str(), i.id.id.as_str()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                ("Message", "M1"),
+                ("Task", "T1"),
+                ("PostItem", "P1"),
+                ("FutureItem", "F1")
+            ]
+        );
+    }
+
+    #[test]
+    fn find_item_ignores_item_ids_nested_in_mailboxes() {
+        let body = format!(
+            "<m:FindItemResponse{NS}><m:ResponseMessages><m:FindItemResponseMessage ResponseClass=\"Success\">\
+             <m:ResponseCode>NoError</m:ResponseCode>\
+             <m:RootFolder TotalItemsInView=\"1\" IncludesLastItemInRange=\"true\"><t:Items>\
+             <t:CalendarItem><t:ItemId Id=\"E1\" ChangeKey=\"k\"/>\
+             <t:Organizer><t:Mailbox><t:EmailAddress>bob@example.com</t:EmailAddress>\
+             <t:ItemId Id=\"CONTACT-BOB\"/></t:Mailbox></t:Organizer></t:CalendarItem>\
+             </t:Items></m:RootFolder></m:FindItemResponseMessage></m:ResponseMessages></m:FindItemResponse>"
+        );
+        let r = parse_find_item_response(body.as_bytes()).unwrap();
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].id.id, "E1");
+    }
+
+    #[test]
+    fn calendar_item_keeps_its_own_id_when_attendees_carry_contact_ids() {
+        let xml = "<m:Items xmlns:m=\"http://schemas.microsoft.com/exchange/services/2006/messages\" \
+                   xmlns:t=\"http://schemas.microsoft.com/exchange/services/2006/types\">\
+                   <t:CalendarItem><t:ItemId Id=\"EVENT-A\" ChangeKey=\"CK\"/>\
+                   <t:Organizer><t:Mailbox><t:EmailAddress>alice@example.com</t:EmailAddress>\
+                   <t:MailboxType>Contact</t:MailboxType><t:ItemId Id=\"CONTACT-ALICE\"/></t:Mailbox></t:Organizer>\
+                   <t:RequiredAttendees><t:Attendee><t:Mailbox>\
+                   <t:EmailAddress>bob@example.com</t:EmailAddress>\
+                   <t:MailboxType>Contact</t:MailboxType><t:ItemId Id=\"CONTACT-BOB\"/>\
+                   </t:Mailbox></t:Attendee></t:RequiredAttendees></t:CalendarItem></m:Items>";
+        let item = parse_calendar_item(xml).unwrap();
+        assert_eq!(item.id.id, "EVENT-A");
+        assert_eq!(item.id.change_key, "CK");
+        assert_eq!(item.required_attendees.len(), 1);
+    }
+
+    #[test]
+    fn message_item_keeps_its_own_id_when_recipients_carry_contact_ids() {
+        let xml = "<m:Items xmlns:m=\"http://schemas.microsoft.com/exchange/services/2006/messages\" \
+                   xmlns:t=\"http://schemas.microsoft.com/exchange/services/2006/types\">\
+                   <t:MeetingRequest><t:ItemId Id=\"MSG-A\" ChangeKey=\"CK\"/>\
+                   <t:ToRecipients><t:Mailbox><t:EmailAddress>bob@example.com</t:EmailAddress>\
+                   <t:ItemId Id=\"CONTACT-BOB\"/></t:Mailbox></t:ToRecipients></t:MeetingRequest></m:Items>";
+        let item = parse_message_item(xml).unwrap();
+        assert_eq!(item.id.id, "MSG-A");
+        assert_eq!(item.element, "MeetingRequest");
+    }
+
+    #[test]
+    fn distribution_list_keeps_its_own_id_when_members_carry_contact_ids() {
+        let xml = "<m:Items xmlns:m=\"http://schemas.microsoft.com/exchange/services/2006/messages\" \
+                   xmlns:t=\"http://schemas.microsoft.com/exchange/services/2006/types\">\
+                   <t:DistributionList><t:ItemId Id=\"DL-A\" ChangeKey=\"CK\"/>\
+                   <t:DisplayName>Team</t:DisplayName><t:Members><t:Member><t:Mailbox>\
+                   <t:Name>Bob</t:Name><t:EmailAddress>bob@example.com</t:EmailAddress>\
+                   <t:MailboxType>Contact</t:MailboxType><t:ItemId Id=\"CONTACT-BOB\"/>\
+                   </t:Mailbox></t:Member></t:Members></t:DistributionList></m:Items>";
+        let item = parse_contact_item(xml).unwrap();
+        assert_eq!(item.id.id, "DL-A");
+        assert!(item.is_group);
+        assert_eq!(item.members.len(), 1);
+        assert_eq!(item.members[0].email.as_deref(), Some("bob@example.com"));
     }
 
     #[test]

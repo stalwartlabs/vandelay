@@ -385,7 +385,13 @@ where
         let outcome = get_items(ctx, shape, win).map_err(Error::from)?;
         failed_items = failed_items.saturating_add(outcome.failed_items);
         for msg in outcome.messages {
-            on_message(msg)?;
+            if let Err(e) = on_message(msg) {
+                if e.aborts_run() {
+                    return Err(e);
+                }
+                ctx.logger.warn(&format!("EWS item not imported: {e}"));
+                failed_items = failed_items.saturating_add(1);
+            }
         }
     }
     Ok(failed_items)
@@ -426,6 +432,84 @@ pub fn delete_vanished(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jmap::http::{Auth, RetryPolicy};
+    use crate::logging::LEVEL_DEFAULT;
+
+    const NS: &str = " xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+                      xmlns:t=\"http://schemas.microsoft.com/exchange/services/2006/types\" \
+                      xmlns:m=\"http://schemas.microsoft.com/exchange/services/2006/messages\"";
+
+    fn fetch_three(fail_with: fn() -> Error) -> (Result<u64, Error>, Vec<String>) {
+        let mut server = mockito::Server::new();
+        let url = format!("{}/EWS/Exchange.asmx", server.url());
+        let messages: String = ["A", "B", "C"]
+            .iter()
+            .map(|id| {
+                format!(
+                    "<m:GetItemResponseMessage ResponseClass=\"Success\">\
+                     <m:ResponseCode>NoError</m:ResponseCode>\
+                     <m:Items><t:Message><t:ItemId Id=\"{id}\" ChangeKey=\"K\"/></t:Message></m:Items>\
+                     </m:GetItemResponseMessage>"
+                )
+            })
+            .collect();
+        let _m = server
+            .mock("POST", "/EWS/Exchange.asmx")
+            .with_status(200)
+            .with_header("content-type", "text/xml; charset=utf-8")
+            .with_body(format!(
+                "<soap:Envelope{NS}><soap:Body><m:GetItemResponse{NS}><m:ResponseMessages>\
+                 {messages}</m:ResponseMessages></m:GetItemResponse></soap:Body></soap:Envelope>"
+            ))
+            .create();
+        let client = EwsClient::new(
+            Auth::Bearer {
+                token: "t".to_owned(),
+            },
+            RetryPolicy::new(0),
+            false,
+        );
+        let ctx = ItemRunCtx {
+            client: &client,
+            url: &url,
+            source_id: 1,
+            batch_size: 10,
+            attachment_batch: 10,
+            connections: 1,
+            use_syncfolderitems: false,
+            sync_batch: SYNC_BATCH_MAX,
+            logger: Logger::new(LEVEL_DEFAULT),
+        };
+        let ids: Vec<ItemId> = ["A", "B", "C"]
+            .iter()
+            .map(|id| ItemId::new(*id, "K"))
+            .collect();
+        let mut seen = Vec::new();
+        let result = for_each_fetched_item(&ctx, ItemShape::Message, &ids, |msg| {
+            let parsed = crate::exchange_ews::parse::parse_message_item(&msg.inner_xml)
+                .map_err(|e| Error::Partial(e.to_string()))?;
+            seen.push(parsed.id.id.clone());
+            if parsed.id.id == "A" {
+                return Err(fail_with());
+            }
+            Ok(())
+        });
+        (result, seen)
+    }
+
+    #[test]
+    fn per_item_failure_does_not_abort_the_folder() {
+        let (result, seen) = fetch_three(|| Error::Partial("UNIQUE constraint failed".to_owned()));
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(seen, ["A", "B", "C"]);
+    }
+
+    #[test]
+    fn run_aborting_failure_still_stops() {
+        let (result, seen) = fetch_three(|| Error::Connection("gone".to_owned()));
+        assert!(result.is_err());
+        assert_eq!(seen, ["A"]);
+    }
 
     #[test]
     fn sync_batch_shrinks_by_half_down_to_floor() {

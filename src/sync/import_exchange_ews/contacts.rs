@@ -110,7 +110,8 @@ fn reconcile_one(
                 }
                 return Ok(());
             }
-            let parsed = parse_contact_item(&msg.inner_xml).map_err(Error::from)?;
+            let parsed = parse_contact_item(&msg.inner_xml)
+                .map_err(|e| Error::Partial(format!("unparsable item: {e}")))?;
             if parsed.id.id.is_empty() {
                 counts.failed += 1;
                 return Ok(());
