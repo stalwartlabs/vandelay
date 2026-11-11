@@ -210,6 +210,7 @@ const CALENDAR_FIELDS: &[&str] = &[
     "calendar:IsOnlineMeeting",
     "calendar:MeetingWorkspaceUrl",
     "calendar:NetShowUrl",
+    "calendar:MyResponseType",
     "item:ReminderIsSet",
     "item:ReminderMinutesBeforeStart",
     "calendar:Recurrence",
@@ -219,6 +220,8 @@ const CALENDAR_FIELDS: &[&str] = &[
     "item:Subject",
     "item:Body",
     "item:Categories",
+    "item:Sensitivity",
+    "item:Attachments",
     "item:DateTimeCreated",
     "item:LastModifiedTime",
     "item:ParentFolderId",
@@ -431,6 +434,22 @@ mod tests {
             !legacy.contains("SyncScope"),
             "SyncScope is an Exchange 2010 addition"
         );
+    }
+
+    #[test]
+    fn calendar_shape_requests_attachments_own_response_and_sensitivity() {
+        let body = get_item_body(
+            ItemShape::CalendarItem,
+            &[ItemId::new("X", "")],
+            ServerVersion::Exchange2007,
+        );
+        for field in [
+            "item:Attachments",
+            "calendar:MyResponseType",
+            "item:Sensitivity",
+        ] {
+            assert!(body.contains(&format!("\"{field}\"")), "{field}");
+        }
     }
 
     #[test]

@@ -859,6 +859,7 @@ fn for_each_fetched_item_streams_every_id_across_windows() {
         client: &c,
         url: &url,
         source_id: 1,
+        owner_smtp: None,
         batch_size: 1,
         attachment_batch: 1,
         connections: 2,

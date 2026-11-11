@@ -156,6 +156,8 @@ pub fn run(common: CommonConfig, config: EwsImportConfig) -> Result<Summary, Err
         client: &client,
         url: &session_url,
         source_id,
+        owner_smtp: (!matches!(config.mailbox_kind, MailboxKind::PublicFolders))
+            .then_some(mailbox.as_str()),
         batch_size: config.getitem_batch.max(1),
         attachment_batch: config.attachment_batch.max(1),
         connections: config.ews_connections.clamp(1, 8),

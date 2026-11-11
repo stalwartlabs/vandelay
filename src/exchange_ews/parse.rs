@@ -1129,6 +1129,8 @@ pub struct CalendarItemRaw {
     pub original_start: Option<String>,
     pub is_all_day_event: Option<bool>,
     pub legacy_free_busy_status: Option<String>,
+    pub my_response_type: Option<String>,
+    pub sensitivity: Option<String>,
     pub location: Option<String>,
     pub calendar_item_type: Option<CalendarItemType>,
     pub recurrence_id: Option<String>,
@@ -1362,6 +1364,10 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                     text_target = Some("isAllDay");
                 } else if local.eq_ignore_ascii_case("LegacyFreeBusyStatus") {
                     text_target = Some("freeBusy");
+                } else if local.eq_ignore_ascii_case("MyResponseType") {
+                    text_target = Some("myResponse");
+                } else if local.eq_ignore_ascii_case("Sensitivity") {
+                    text_target = Some("sensitivity");
                 } else if local.eq_ignore_ascii_case("Location") {
                     text_target = Some("location");
                 } else if local.eq_ignore_ascii_case("CalendarItemType") {
@@ -1485,6 +1491,8 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                             item.is_all_day_event = Some(matches!(text.trim(), "true" | "1"));
                         }
                         "freeBusy" => item.legacy_free_busy_status = Some(text),
+                        "myResponse" => item.my_response_type = Some(text.trim().to_owned()),
+                        "sensitivity" => item.sensitivity = Some(text.trim().to_owned()),
                         "location" => item.location = Some(text),
                         "calendarItemType" => {
                             item.calendar_item_type = CalendarItemType::parse(text.trim());
@@ -2686,6 +2694,31 @@ mod tests {
         assert_eq!(
             parsed.required_attendees[0].email.as_deref(),
             Some("/o=ExLabs/cn=att")
+        );
+    }
+
+    #[test]
+    fn calendar_parses_own_response_sensitivity_and_attachments() {
+        let body = format!(
+            "<t:CalendarItem{NS}>\
+             <t:ItemId Id=\"C1\" ChangeKey=\"K1\"/>\
+             <t:Sensitivity>Private</t:Sensitivity>\
+             <t:Attachments><t:FileAttachment><t:AttachmentId Id=\"ATT1\"/>\
+               <t:Name>agenda.pdf</t:Name><t:ContentType>application/pdf</t:ContentType>\
+               <t:LastModifiedTime>2020-01-01T00:00:00</t:LastModifiedTime>\
+             </t:FileAttachment></t:Attachments>\
+             <t:LastModifiedTime>2025-06-01T00:00:00Z</t:LastModifiedTime>\
+             <t:MyResponseType>Accept</t:MyResponseType>\
+             </t:CalendarItem>"
+        );
+        let parsed = parse_calendar_item(&body).unwrap();
+        assert_eq!(parsed.sensitivity.as_deref(), Some("Private"));
+        assert_eq!(parsed.my_response_type.as_deref(), Some("Accept"));
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].attachment_id, "ATT1");
+        assert_eq!(
+            parsed.last_modified.as_deref(),
+            Some("2025-06-01T00:00:00Z")
         );
     }
 

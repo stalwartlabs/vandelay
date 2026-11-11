@@ -181,7 +181,7 @@ fn apply_event(
     counts: &mut TypeCounts,
 ) -> Result<(), Error> {
     let modified_full = fetch_modified_occurrences(ctx, raw);
-    let mut built = to_jscalendar_with_exceptions(raw, &modified_full);
+    let mut built = to_jscalendar_with_exceptions(raw, &modified_full, ctx.owner_smtp);
     attach_calendar_links(conn, ctx, raw, &mut built.data)?;
     let calendar_ids = serde_json::json!([local_folder_id]).to_string();
     let data = built.data.to_string();
