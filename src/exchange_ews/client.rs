@@ -33,12 +33,18 @@ struct Inner {
     affinity_cookie: Mutex<Option<String>>,
     retry: RetryPolicy,
     rate_limit: RateLimitState,
-    version: Mutex<ServerVersion>,
+    version: Mutex<VersionState>,
     log_level: AtomicU8,
     retries_total: AtomicU64,
     retry_after_sleeps: AtomicU64,
     soap_calls: AtomicU64,
     user_agent: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VersionState {
+    current: ServerVersion,
+    accepted_ceiling: Option<ServerVersion>,
 }
 
 #[derive(Clone)]
@@ -77,7 +83,10 @@ impl EwsClient {
                 affinity_cookie: Mutex::new(None),
                 retry,
                 rate_limit: RateLimitState::new(),
-                version: Mutex::new(ServerVersion::Exchange2013Sp1),
+                version: Mutex::new(VersionState {
+                    current: ServerVersion::Exchange2013Sp1,
+                    accepted_ceiling: None,
+                }),
                 log_level: AtomicU8::new(LEVEL_DEFAULT),
                 retries_total: AtomicU64::new(0),
                 retry_after_sleeps: AtomicU64::new(0),
@@ -117,7 +126,14 @@ impl EwsClient {
 
     pub fn set_server_version(&self, version: ServerVersion) {
         if let Ok(mut g) = self.inner.version.lock() {
-            *g = version;
+            g.current = g.accepted_ceiling.map_or(version, |c| version.min(c));
+        }
+    }
+
+    fn pin_accepted_version(&self, version: ServerVersion) {
+        if let Ok(mut g) = self.inner.version.lock() {
+            g.current = version;
+            g.accepted_ceiling = Some(version);
         }
     }
 
@@ -125,7 +141,7 @@ impl EwsClient {
         self.inner
             .version
             .lock()
-            .map(|g| *g)
+            .map(|g| g.current)
             .unwrap_or(ServerVersion::Exchange2013Sp1)
     }
 
@@ -194,6 +210,7 @@ impl EwsClient {
         let logger = self.logger();
         let policy = self.inner.retry;
         let mut attempt: u32 = 0;
+        let mut downgraded = false;
         loop {
             self.inner.rate_limit.cooldown().wait();
             let sent_version = self.server_version();
@@ -210,6 +227,9 @@ impl EwsClient {
                         self.inner.rate_limit.on_success();
                         match summary {
                             Ok(EnvelopeKind::Body { version }) => {
+                                if downgraded {
+                                    self.pin_accepted_version(sent_version);
+                                }
                                 if let Some(v) = version.to_server_version() {
                                     self.set_server_version(v);
                                 }
@@ -234,6 +254,7 @@ impl EwsClient {
                                     }
                                     FaultStep::Downgrade(v) => {
                                         self.set_server_version(v);
+                                        downgraded = true;
                                         continue;
                                     }
                                 }
@@ -260,6 +281,7 @@ impl EwsClient {
                             }
                             FaultStep::Downgrade(v) => {
                                 self.set_server_version(v);
+                                downgraded = true;
                                 continue;
                             }
                         }
@@ -555,8 +577,22 @@ mod tests {
             RetryPolicy::new(0),
             false,
         );
-        c.set_server_version(ServerVersion::Exchange2019);
-        assert_eq!(c.server_version(), ServerVersion::Exchange2019);
+        c.set_server_version(ServerVersion::Exchange2016);
+        assert_eq!(c.server_version(), ServerVersion::Exchange2016);
+    }
+
+    #[test]
+    fn accepted_downgrade_caps_reported_version() {
+        let c = EwsClient::new(
+            Auth::Bearer { token: "t".into() },
+            RetryPolicy::new(0),
+            false,
+        );
+        c.pin_accepted_version(ServerVersion::Exchange2013Sp1);
+        c.set_server_version(ServerVersion::Exchange2016);
+        assert_eq!(c.server_version(), ServerVersion::Exchange2013Sp1);
+        c.set_server_version(ServerVersion::Exchange2010Sp2);
+        assert_eq!(c.server_version(), ServerVersion::Exchange2010Sp2);
     }
 
     #[test]

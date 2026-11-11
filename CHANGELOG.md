@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.16] - Unreleased
+
+### Fixed
+- MS Exchange EWS: Exchange 2019 servers (version 15.2) were addressed with the schema version `Exchange2019`, which does not exist, so every call was refused once and sent again as `Exchange2016`; they are now addressed as `Exchange2016`, and once a server has refused a schema version, the client no longer goes back above the one it accepted (fixes #64)
+
 ## [1.0.15] - 2026-11-08
 
 ### Added

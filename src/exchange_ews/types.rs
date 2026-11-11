@@ -103,7 +103,6 @@ pub enum ServerVersion {
     Exchange2013,
     Exchange2013Sp1,
     Exchange2016,
-    Exchange2019,
 }
 
 impl ServerVersion {
@@ -116,7 +115,6 @@ impl ServerVersion {
             ServerVersion::Exchange2013 => "Exchange2013",
             ServerVersion::Exchange2013Sp1 => "Exchange2013_SP1",
             ServerVersion::Exchange2016 => "Exchange2016",
-            ServerVersion::Exchange2019 => "Exchange2019",
         }
     }
 
@@ -127,16 +125,12 @@ impl ServerVersion {
             (14, 1) => ServerVersion::Exchange2010Sp1,
             (14, 2 | 3) => ServerVersion::Exchange2010Sp2,
             (15, 0) => ServerVersion::Exchange2013,
-            (15, 1) => ServerVersion::Exchange2016,
-            (15, 2) => ServerVersion::Exchange2019,
-            _ if major >= 15 => ServerVersion::Exchange2019,
             _ => ServerVersion::Exchange2016,
         }
     }
 
     pub fn lower(self) -> Option<ServerVersion> {
         match self {
-            ServerVersion::Exchange2019 => Some(ServerVersion::Exchange2016),
             ServerVersion::Exchange2016 => Some(ServerVersion::Exchange2013Sp1),
             ServerVersion::Exchange2013Sp1 => Some(ServerVersion::Exchange2013),
             ServerVersion::Exchange2013 => Some(ServerVersion::Exchange2010Sp2),
@@ -364,11 +358,15 @@ mod tests {
         );
         assert_eq!(
             ServerVersion::from_build(15, 2),
-            ServerVersion::Exchange2019
+            ServerVersion::Exchange2016
+        );
+        assert_eq!(
+            ServerVersion::from_build(15, 20),
+            ServerVersion::Exchange2016
         );
         assert_eq!(
             ServerVersion::from_build(99, 99),
-            ServerVersion::Exchange2019
+            ServerVersion::Exchange2016
         );
     }
 
@@ -396,7 +394,7 @@ mod tests {
 
     #[test]
     fn server_version_ladder_descends_to_floor() {
-        let mut v = ServerVersion::Exchange2019;
+        let mut v = ServerVersion::Exchange2016;
         let mut chain = vec![v];
         while let Some(next) = v.lower() {
             chain.push(next);
@@ -405,7 +403,6 @@ mod tests {
         assert_eq!(
             chain,
             vec![
-                ServerVersion::Exchange2019,
                 ServerVersion::Exchange2016,
                 ServerVersion::Exchange2013Sp1,
                 ServerVersion::Exchange2013,
