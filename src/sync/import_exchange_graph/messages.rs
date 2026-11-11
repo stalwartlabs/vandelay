@@ -14,7 +14,7 @@ use crate::exchange_graph::client::Accept;
 use crate::exchange_graph::error::GraphError;
 use crate::logging::LEVEL_PROGRESS;
 use crate::sync::TypeCounts;
-use crate::sync::emailmeta::email_meta_from_blob;
+use crate::sync::emailmeta::{email_meta_from_blob, jmap_keyword};
 use crate::sync::import_jmap::pool::Pool;
 use crate::sync::keys::index_to_json;
 
@@ -188,9 +188,6 @@ fn keyword_array(stub: &Value) -> String {
     if stub.get("isDraft").and_then(Value::as_bool) == Some(true) {
         kws.push("$draft".to_owned());
     }
-    if stub.get("isReadReceiptRequested").and_then(Value::as_bool) == Some(true) {
-        kws.push("$notified".to_owned());
-    }
     if stub
         .get("flag")
         .and_then(|f| f.get("flagStatus"))
@@ -200,8 +197,14 @@ fn keyword_array(stub: &Value) -> String {
         kws.push("$flagged".to_owned());
     }
     if let Some(cats) = stub.get("categories").and_then(Value::as_array) {
-        for cat in cats.iter().filter_map(Value::as_str) {
-            kws.push(cat.to_ascii_lowercase());
+        for keyword in cats
+            .iter()
+            .filter_map(Value::as_str)
+            .filter_map(jmap_keyword)
+        {
+            if !kws.contains(&keyword) {
+                kws.push(keyword);
+            }
         }
     }
     Value::Array(kws.into_iter().map(Value::String).collect()).to_string()

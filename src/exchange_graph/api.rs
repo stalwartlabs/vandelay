@@ -26,7 +26,7 @@ pub const EXCEPTION_WINDOW_MAX_DAYS: i64 = 1825;
 pub const DRIVE_ITEM_SELECT: &str =
     "id,name,size,folder,file,package,remoteItem,createdDateTime,lastModifiedDateTime";
 
-pub const MESSAGE_STATE_SELECT: &str = "id,isRead,isDraft,isReadReceiptRequested,flag,categories";
+pub const MESSAGE_STATE_SELECT: &str = "id,isRead,isDraft,flag,categories";
 
 #[derive(Debug, Clone)]
 pub struct Endpoints {

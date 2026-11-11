@@ -940,7 +940,6 @@ pub struct MessageItem {
     pub date_time_received: Option<String>,
     pub is_read: Option<bool>,
     pub is_draft: Option<bool>,
-    pub is_read_receipt_requested: Option<bool>,
     pub categories: Vec<String>,
     pub flag_status: Option<String>,
 }
@@ -988,8 +987,6 @@ pub fn parse_message_item(inner_xml: &str) -> Result<MessageItem, EwsError> {
                         current = Some("isRead");
                     } else if local.eq_ignore_ascii_case("IsDraft") {
                         current = Some("isDraft");
-                    } else if local.eq_ignore_ascii_case("IsReadReceiptRequested") {
-                        current = Some("readReceipt");
                     } else if local.eq_ignore_ascii_case("Categories") {
                         category_collecting = true;
                     } else if category_collecting && local.eq_ignore_ascii_case("String") {
@@ -1027,10 +1024,6 @@ pub fn parse_message_item(inner_xml: &str) -> Result<MessageItem, EwsError> {
                         "received" => item.date_time_received = Some(text),
                         "isRead" => item.is_read = Some(matches!(text.trim(), "true" | "1")),
                         "isDraft" => item.is_draft = Some(matches!(text.trim(), "true" | "1")),
-                        "readReceipt" => {
-                            item.is_read_receipt_requested =
-                                Some(matches!(text.trim(), "true" | "1"));
-                        }
                         "category" => item.categories.push(text),
                         "flagStatus" => item.flag_status = Some(text),
                         "flagStatusExt" if text.trim() == "2" => {

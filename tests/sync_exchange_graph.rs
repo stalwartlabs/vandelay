@@ -87,7 +87,7 @@ fn graph_fixture(server: &mut Server) {
     }
     json_mock(
         server,
-        "/me/mailFolders/F1/messages?$top=100&$select=id,isRead,isDraft,isReadReceiptRequested,flag,categories",
+        "/me/mailFolders/F1/messages?$top=100&$select=id,isRead,isDraft,flag,categories",
         r#"{"value":[{"id":"M1","isRead":true,"isDraft":false,
                       "flag":{"flagStatus":"flagged"},"categories":["Work"]}]}"#,
     );

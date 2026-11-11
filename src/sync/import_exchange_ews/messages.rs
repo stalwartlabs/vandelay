@@ -15,7 +15,7 @@ use crate::exchange_ews::types::ItemId;
 use crate::exchange_ews::xml::ItemShape;
 use crate::logging::LEVEL_PROGRESS;
 use crate::sync::TypeCounts;
-use crate::sync::emailmeta::email_meta_from_blob;
+use crate::sync::emailmeta::{email_meta_from_blob, jmap_keyword};
 use crate::sync::keys::index_to_json;
 
 use super::folders::FolderPlan;
@@ -253,14 +253,13 @@ fn keyword_array(item: &MessageItem) -> String {
     if matches!(item.is_draft, Some(true)) {
         kws.push("$draft".to_owned());
     }
-    if matches!(item.is_read_receipt_requested, Some(true)) {
-        kws.push("$notified".to_owned());
-    }
     if matches!(item.flag_status.as_deref(), Some("Flagged")) {
         kws.push("$flagged".to_owned());
     }
-    for cat in &item.categories {
-        kws.push(cat.to_ascii_lowercase());
+    for keyword in item.categories.iter().filter_map(|cat| jmap_keyword(cat)) {
+        if !kws.contains(&keyword) {
+            kws.push(keyword);
+        }
     }
     let value: Value = Value::Array(kws.into_iter().map(Value::String).collect());
     value.to_string()
@@ -281,9 +280,23 @@ mod tests {
             ..MessageItem::default()
         };
         let kws = keyword_array(&item);
-        for expected in ["$seen", "$draft", "$flagged", "red category", "vip"] {
+        for expected in ["$seen", "$draft", "$flagged", "red_category", "vip"] {
             assert!(kws.contains(expected), "missing {expected} in {kws}");
         }
+    }
+
+    #[test]
+    fn categories_become_valid_deduplicated_keywords() {
+        let item = MessageItem {
+            categories: vec![
+                "Catégorie Rouge".to_owned(),
+                "catégorie rouge".to_owned(),
+                "$seen".to_owned(),
+                "(  )".to_owned(),
+            ],
+            ..MessageItem::default()
+        };
+        assert_eq!(keyword_array(&item), r#"["cat_gorie_rouge","seen"]"#);
     }
 
     #[test]

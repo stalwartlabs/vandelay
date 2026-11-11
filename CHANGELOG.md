@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file. This projec
 
 ### Fixed
 - MS Exchange EWS: Exchange 2019 servers (version 15.2) were addressed with the schema version `Exchange2019`, which does not exist, so every call was refused once and sent again as `Exchange2016`; they are now addressed as `Exchange2016`, and once a server has refused a schema version, the client no longer goes back above the one it accepted (fixes #64)
+- MS Exchange EWS and Graph: Outlook categories were stored as message keywords with only their case lowered, so `Project review` or `Congés` gave keywords JMAP does not allow; they now go through the same reduction as IMAP `--mime-keywords` (`Catégorie Rouge` becomes `cat_gorie_rouge`) and are deduplicated. A read-receipt request no longer adds the unregistered `$notified` keyword (fixes #65)
 
 ## [1.0.15] - 2026-11-08
 

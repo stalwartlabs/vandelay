@@ -162,7 +162,6 @@ pub fn get_item_body(shape: ItemShape, ids: &[ItemId], version: ServerVersion) -
                     "<t:ExtendedFieldURI PropertyTag=\"0x1090\" PropertyType=\"Integer\"/>",
                 );
             }
-            out.push_str("<t:FieldURI FieldURI=\"message:IsReadReceiptRequested\"/>");
             out.push_str("</t:AdditionalProperties>");
         }
         ItemShape::CalendarItem => {
@@ -380,7 +379,6 @@ mod tests {
             "the extended-property fallback is only used when item:Flag is unavailable"
         );
         assert!(legacy.contains("item:DateTimeReceived"));
-        assert!(legacy.contains("message:IsReadReceiptRequested"));
         assert!(
             modern.contains("\"message:IsRead\"") && !modern.contains("\"item:IsRead\""),
             "IsRead is a MessageType property; its FieldURI is message:IsRead"

@@ -69,7 +69,7 @@ fn add_keywords_header(m: &Message<'_>, keywords: &mut Vec<String>) {
     }
 }
 
-fn jmap_keyword(phrase: &str) -> Option<String> {
+pub(crate) fn jmap_keyword(phrase: &str) -> Option<String> {
     let mut keyword = String::with_capacity(phrase.len().min(MAX_KEYWORD_LEN));
     let mut separator = false;
     for ch in phrase.chars() {
