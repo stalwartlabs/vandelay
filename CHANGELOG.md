@@ -18,6 +18,9 @@ All notable changes to this project will be documented in this file. This projec
 - MS Exchange Graph:
     - all-day events, the occurrences and exceptions of all-day series, and contact birthdays landed one day early east of UTC when Graph returned them as UTC instants rather than at midnight, and every occurrence of such a series could be imported as deleted; a value that is not at midnight is now taken in the event's time zone (UTC for birthdays), rounded to the nearest midnight. Outlook's "no date" (year 4500 or later) is no longer imported as a birthday, a recurrence end or an event (#59, #66)
 
+### Changed
+- Release builds: the `x86_64` and `aarch64` musl binaries are built with `cargo-zigbuild` like the other musl targets, so a release no longer depends on installing `musl-tools` from the Ubuntu package mirrors; dependency installation is retried
+
 ## [1.0.15] - 2026-11-08
 
 ### Added

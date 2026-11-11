@@ -96,8 +96,24 @@ jobs:
           path: target/distrib/
           merge-multiple: true
       - name: Install dependencies
+        shell: bash
+        env:
+          PACKAGES_INSTALL: ${{ matrix.packages_install }}
         run: |
-          ${{ matrix.packages_install }}
+          set -euo pipefail
+          if grep -q cargo-zigbuild <<<"$PACKAGES_INSTALL"; then
+            PACKAGES_INSTALL="$(grep -v -e '^sudo apt-get update$' -e '^sudo apt-get install musl-tools$' <<<"$PACKAGES_INSTALL" || true)"
+          fi
+          for attempt in 1 2 3; do
+            if bash -e -c "$PACKAGES_INSTALL"; then
+              exit 0
+            fi
+            echo "Installing dependencies failed on attempt $attempt"
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 30))
+            fi
+          done
+          exit 1
       - name: Update Rust toolchain to current stable
         shell: bash
         run: |
