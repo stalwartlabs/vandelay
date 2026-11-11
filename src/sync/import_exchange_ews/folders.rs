@@ -13,12 +13,12 @@ use crate::error::Error;
 use crate::exchange_ews::EwsClient;
 use crate::exchange_ews::error::EwsError;
 use crate::exchange_ews::parse::{
-    FolderEntry, parse_find_folder_response, parse_folder_inner, parse_get_folder_response,
-    parse_response_messages,
+    FolderEntry, parse_find_folder_response, parse_find_item_response, parse_folder_inner,
+    parse_get_folder_response, parse_response_messages,
 };
 use crate::exchange_ews::types::{DistinguishedFolderId, FolderClass, MailboxKind};
 use crate::exchange_ews::xml::{
-    FolderRef, FolderShape, Traversal, find_folder_body, get_folder_body,
+    FolderRef, FolderShape, Traversal, find_folder_body, find_item_body, get_folder_body,
 };
 use crate::logging::{LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
 use crate::sync::TypeCounts;
@@ -61,20 +61,24 @@ pub fn plan_folders(
     let mut calendar = Vec::new();
     let mut contacts = Vec::new();
     for folder in folders {
-        let class = FolderClass::from_ipf(&folder.folder_class);
-        if class == FolderClass::Mail
-            && FolderClass::is_mail_fallback(&folder.folder_class)
-            && logger.enabled(LEVEL_DEFAULT)
-        {
-            let shown = if folder.folder_class.trim().is_empty() {
-                "no"
-            } else {
-                "unrecognized"
-            };
-            eprintln!(
-                "warning: EWS folder {:?} has {shown} FolderClass ({:?}); importing as mail",
-                folder.display_name, folder.folder_class
-            );
+        let mut class = FolderClass::from_ipf(&folder.folder_class);
+        if class == FolderClass::Mail && FolderClass::is_mail_fallback(&folder.folder_class) {
+            let classless = folder.folder_class.trim().is_empty();
+            if classless && !matches!(mailbox_kind, MailboxKind::Archive) {
+                class = kind_from_items(client, url, &folder, logger);
+            }
+            if logger.enabled(LEVEL_DEFAULT) {
+                let shown = if classless { "no" } else { "unrecognized" };
+                let kind = match class {
+                    FolderClass::Calendar => "calendar",
+                    FolderClass::Contacts => "contacts",
+                    FolderClass::Mail | FolderClass::Skipped => "mail",
+                };
+                eprintln!(
+                    "warning: EWS folder {:?} has {shown} FolderClass ({:?}); importing as {kind}",
+                    folder.display_name, folder.folder_class
+                );
+            }
         }
         match (mailbox_kind, class) {
             (MailboxKind::Archive, FolderClass::Mail) => {
@@ -113,6 +117,42 @@ pub fn plan_folders(
         well_known_roles,
         root_folder_id,
     })
+}
+
+const CLASS_SAMPLE_SIZE: u32 = 10;
+
+fn kind_from_items(
+    client: &EwsClient,
+    url: &str,
+    folder: &FolderEntry,
+    logger: Logger,
+) -> FolderClass {
+    let request = find_item_body(
+        FolderRef::Concrete(&folder.folder_id),
+        Traversal::Shallow,
+        0,
+        CLASS_SAMPLE_SIZE,
+    );
+    let sampled = client
+        .call(url, "FindItem", &request)
+        .and_then(|resp| parse_find_item_response(&resp.body));
+    match sampled {
+        Ok(found) => FolderClass::from_item_classes(
+            found
+                .items
+                .iter()
+                .filter_map(|item| item.item_class.as_deref()),
+        ),
+        Err(e) => {
+            if logger.enabled(LEVEL_PROGRESS) {
+                eprintln!(
+                    "FindItem sample of {:?} failed: {e}; treating it as mail",
+                    folder.display_name
+                );
+            }
+            FolderClass::Mail
+        }
+    }
 }
 
 fn drop_hidden_subtrees(mut folders: Vec<FolderEntry>) -> Vec<FolderEntry> {
@@ -846,6 +886,40 @@ mod tests {
         assert_eq!(parent_of("NOTES").as_deref(), Some("ROOT"));
         assert_eq!(parent_of("INBOX").as_deref(), Some("ROOT"));
         assert_ne!(parent_of("LOOP").as_deref(), Some("PROJECTS"));
+    }
+
+    #[test]
+    fn classless_folder_kind_comes_from_its_items() {
+        let mut server = mockito::Server::new();
+        let url = format!("{}/EWS/Exchange.asmx", server.url());
+        let _m = server
+            .mock("POST", "/EWS/Exchange.asmx")
+            .with_status(200)
+            .with_header("content-type", "text/xml; charset=utf-8")
+            .with_body(
+                "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+                 xmlns:t=\"http://schemas.microsoft.com/exchange/services/2006/types\" \
+                 xmlns:m=\"http://schemas.microsoft.com/exchange/services/2006/messages\"><soap:Body>\
+                 <m:FindItemResponse><m:ResponseMessages><m:FindItemResponseMessage ResponseClass=\"Success\">\
+                 <m:ResponseCode>NoError</m:ResponseCode>\
+                 <m:RootFolder TotalItemsInView=\"1\" IncludesLastItemInRange=\"true\"><t:Items>\
+                 <t:Contact><t:ItemId Id=\"C1\"/><t:ItemClass>IPM.Contact</t:ItemClass></t:Contact>\
+                 </t:Items></m:RootFolder></m:FindItemResponseMessage></m:ResponseMessages>\
+                 </m:FindItemResponse></soap:Body></soap:Envelope>",
+            )
+            .create();
+        let client = EwsClient::new(
+            crate::jmap::http::Auth::Bearer {
+                token: "t".to_owned(),
+            },
+            crate::jmap::http::RetryPolicy::new(0),
+            false,
+        );
+        let folder = entry("LOCAL", "ROOT", "", false);
+        assert_eq!(
+            kind_from_items(&client, &url, &folder, Logger::new(LEVEL_DEFAULT)),
+            FolderClass::Contacts
+        );
     }
 
     #[test]

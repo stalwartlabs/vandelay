@@ -85,6 +85,9 @@ pub fn get_folder_body(folders: &[FolderRef<'_>], shape: FolderShape) -> String 
     out
 }
 
+const ITEM_CLASS_PROPERTY: &str =
+    "<t:AdditionalProperties><t:FieldURI FieldURI=\"item:ItemClass\"/></t:AdditionalProperties>";
+
 pub fn find_item_body(
     parent: FolderRef<'_>,
     traversal: Traversal,
@@ -94,7 +97,9 @@ pub fn find_item_body(
     let mut out = String::with_capacity(512);
     out.push_str("<m:FindItem Traversal=\"");
     out.push_str(traversal.as_str());
-    out.push_str("\"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape>");
+    out.push_str("\"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape>");
+    out.push_str(ITEM_CLASS_PROPERTY);
+    out.push_str("</m:ItemShape>");
     out.push_str("<m:IndexedPageItemView MaxEntriesReturned=\"");
     out.push_str(&page_size.to_string());
     out.push_str("\" Offset=\"");
@@ -119,6 +124,7 @@ pub fn sync_folder_items_body(
     let mut out = String::with_capacity(512);
     out.push_str("<m:SyncFolderItems><m:ItemShape>");
     out.push_str("<t:BaseShape>IdOnly</t:BaseShape>");
+    out.push_str(ITEM_CLASS_PROPERTY);
     out.push_str("</m:ItemShape><m:SyncFolderId>");
     write_folder_id_element(&mut out, folder);
     out.push_str("</m:SyncFolderId>");
@@ -422,6 +428,16 @@ mod tests {
         assert!(body.contains("<m:SyncState>STATE</m:SyncState>"));
         assert!(body.contains("<m:MaxChangesReturned>512</m:MaxChangesReturned>"));
         assert!(body.contains("<m:SyncScope>NormalItems</m:SyncScope>"));
+        assert!(body.contains("FieldURI=\"item:ItemClass\""));
+    }
+
+    #[test]
+    fn find_item_requests_item_class() {
+        let folder = FolderId::new("FID", "FCK");
+        let body = find_item_body(FolderRef::Concrete(&folder), Traversal::Shallow, 0, 10);
+        assert!(body.contains(
+            "<t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI=\"item:ItemClass\"/>"
+        ));
     }
 
     #[test]

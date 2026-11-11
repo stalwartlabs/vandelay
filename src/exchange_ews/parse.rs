@@ -514,6 +514,7 @@ pub struct FindItemResponse {
 pub struct ItemEntry {
     pub element: String,
     pub id: ItemId,
+    pub item_class: Option<String>,
 }
 
 pub fn parse_find_item_response(body: &[u8]) -> Result<FindItemResponse, EwsError> {
@@ -524,6 +525,7 @@ pub fn parse_find_item_response(body: &[u8]) -> Result<FindItemResponse, EwsErro
     let mut in_root = false;
     let mut depth = ItemDepth::default();
     let mut items_level: Option<usize> = None;
+    let mut reading_class = false;
     loop {
         buf.clear();
         let (ns, ev) = xml.read_resolved_event_into(&mut buf)?;
@@ -548,17 +550,28 @@ pub fn parse_find_item_response(body: &[u8]) -> Result<FindItemResponse, EwsErro
                         out.items.push(ItemEntry {
                             element: local.clone(),
                             id: ItemId::default(),
+                            item_class: None,
                         });
-                    } else if depth.is_item_child(level)
-                        && local.eq_ignore_ascii_case("ItemId")
-                        && let Some(last) = out.items.last_mut()
-                    {
-                        capture_id_attrs(e, &mut last.id.id, &mut last.id.change_key);
+                    } else if depth.is_item_child(level) {
+                        if local.eq_ignore_ascii_case("ItemId")
+                            && let Some(last) = out.items.last_mut()
+                        {
+                            capture_id_attrs(e, &mut last.id.id, &mut last.id.change_key);
+                        } else if local.eq_ignore_ascii_case("ItemClass") {
+                            reading_class = !matches!(ev, Event::Empty(_));
+                        }
                     }
+                }
+            }
+            Event::Text(ref t) if reading_class => {
+                if let Some(last) = out.items.last_mut() {
+                    let text: &str = t;
+                    last.item_class = Some(text.trim().to_owned());
                 }
             }
             Event::End(e) => {
                 depth.close();
+                reading_class = false;
                 let local = e.local_name().as_ref().to_owned();
                 if local.eq_ignore_ascii_case("RootFolder") {
                     in_root = false;
@@ -850,10 +863,23 @@ pub struct SyncFolderItemsResponse {
 
 #[derive(Debug, Clone)]
 pub enum SyncChange {
-    Create { id: ItemId, element: String },
-    Update { id: ItemId, element: String },
-    Delete { id: ItemId },
-    ReadFlagChange { id: ItemId, is_read: bool },
+    Create {
+        id: ItemId,
+        element: String,
+        item_class: Option<String>,
+    },
+    Update {
+        id: ItemId,
+        element: String,
+        item_class: Option<String>,
+    },
+    Delete {
+        id: ItemId,
+    },
+    ReadFlagChange {
+        id: ItemId,
+        is_read: bool,
+    },
 }
 
 pub fn parse_sync_folder_items_response(body: &[u8]) -> Result<SyncFolderItemsResponse, EwsError> {
@@ -868,6 +894,7 @@ pub fn parse_sync_folder_items_response(body: &[u8]) -> Result<SyncFolderItemsRe
     let mut current_change: Option<SyncChange> = None;
     let mut reading_is_read = false;
     let mut pending_is_read: Option<bool> = None;
+    let mut reading_item_class = false;
     loop {
         buf.clear();
         let (ns, ev) = xml.read_resolved_event_into(&mut buf)?;
@@ -887,11 +914,13 @@ pub fn parse_sync_folder_items_response(body: &[u8]) -> Result<SyncFolderItemsRe
                         current_change = Some(SyncChange::Create {
                             id: ItemId::default(),
                             element: String::new(),
+                            item_class: None,
                         });
                     } else if local.eq_ignore_ascii_case("Update") {
                         current_change = Some(SyncChange::Update {
                             id: ItemId::default(),
                             element: String::new(),
+                            item_class: None,
                         });
                     } else if local.eq_ignore_ascii_case("Delete") {
                         current_change = Some(SyncChange::Delete {
@@ -910,6 +939,8 @@ pub fn parse_sync_folder_items_response(body: &[u8]) -> Result<SyncFolderItemsRe
                         }
                     } else if local.eq_ignore_ascii_case("IsRead") {
                         reading_is_read = true;
+                    } else if local.eq_ignore_ascii_case("ItemClass") {
+                        reading_item_class = !is_empty;
                     } else if is_item_element(&local) {
                         match current_change.as_mut() {
                             Some(SyncChange::Create { element, .. })
@@ -939,6 +970,7 @@ pub fn parse_sync_folder_items_response(body: &[u8]) -> Result<SyncFolderItemsRe
                         }
                     }
                     "isread" => reading_is_read = false,
+                    "itemclass" => reading_item_class = false,
                     "changes" => in_changes = false,
                     _ => {}
                 }
@@ -948,6 +980,14 @@ pub fn parse_sync_folder_items_response(body: &[u8]) -> Result<SyncFolderItemsRe
                 let text = t.into_inner().into_owned();
                 if reading_is_read {
                     pending_is_read = Some(matches!(text.trim(), "true" | "1"));
+                }
+                if reading_item_class
+                    && let Some(
+                        SyncChange::Create { item_class, .. }
+                        | SyncChange::Update { item_class, .. },
+                    ) = current_change.as_mut()
+                {
+                    *item_class = Some(text.trim().to_owned());
                 }
                 match current_text {
                     Some("syncState") => sync_state = text,
@@ -2316,6 +2356,46 @@ mod tests {
     }
 
     #[test]
+    fn find_item_reads_item_class() {
+        let body = format!(
+            "<m:FindItemResponse{NS}><m:ResponseMessages><m:FindItemResponseMessage ResponseClass=\"Success\">\
+             <m:ResponseCode>NoError</m:ResponseCode>\
+             <m:RootFolder TotalItemsInView=\"2\" IncludesLastItemInRange=\"true\"><t:Items>\
+             <t:Contact><t:ItemId Id=\"C1\" ChangeKey=\"k\"/><t:ItemClass>IPM.Contact</t:ItemClass></t:Contact>\
+             <t:Message><t:ItemId Id=\"M1\" ChangeKey=\"k\"/></t:Message>\
+             </t:Items></m:RootFolder></m:FindItemResponseMessage></m:ResponseMessages></m:FindItemResponse>"
+        );
+        let r = parse_find_item_response(body.as_bytes()).unwrap();
+        assert_eq!(r.items[0].item_class.as_deref(), Some("IPM.Contact"));
+        assert_eq!(r.items[1].item_class, None);
+    }
+
+    #[test]
+    fn sync_folder_items_reads_item_class() {
+        let body = format!(
+            "<m:SyncFolderItemsResponse{NS}><m:ResponseMessages><m:SyncFolderItemsResponseMessage ResponseClass=\"Success\">\
+             <m:ResponseCode>NoError</m:ResponseCode>\
+             <m:SyncState>AAAA</m:SyncState>\
+             <m:IncludesLastItemInRange>true</m:IncludesLastItemInRange>\
+             <m:Changes>\
+               <t:Create><t:Task><t:ItemId Id=\"T1\"/><t:ItemClass>IPM.Task</t:ItemClass></t:Task></t:Create>\
+               <t:Update><t:Message><t:ItemId Id=\"M1\"/><t:ItemClass>IPM.Note</t:ItemClass></t:Message></t:Update>\
+             </m:Changes></m:SyncFolderItemsResponseMessage></m:ResponseMessages></m:SyncFolderItemsResponse>"
+        );
+        let r = parse_sync_folder_items_response(body.as_bytes()).unwrap();
+        let classes: Vec<Option<&str>> =
+            r.changes
+                .iter()
+                .map(|c| match c {
+                    SyncChange::Create { item_class, .. }
+                    | SyncChange::Update { item_class, .. } => item_class.as_deref(),
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(classes, [Some("IPM.Task"), Some("IPM.Note")]);
+    }
+
+    #[test]
     fn find_item_opens_an_entry_for_every_item_element() {
         let body = format!(
             "<m:FindItemResponse{NS}><m:ResponseMessages><m:FindItemResponseMessage ResponseClass=\"Success\">\
@@ -2531,7 +2611,7 @@ mod tests {
         assert!(!r.more);
         assert_eq!(r.changes.len(), 3);
         match &r.changes[0] {
-            SyncChange::Create { id, element } => {
+            SyncChange::Create { id, element, .. } => {
                 assert_eq!(id.id, "I1");
                 assert_eq!(element, "Message");
             }

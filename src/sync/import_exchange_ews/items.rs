@@ -42,6 +42,7 @@ fn shrink_sync_batch(current: u32) -> u32 {
 pub struct EnumeratedItem {
     pub element: String,
     pub id: ItemId,
+    pub item_class: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,8 +115,21 @@ fn try_sync_folder_items(
         let parsed = parse_sync_folder_items_response(&resp.body)?;
         for change in parsed.changes {
             match change {
-                SyncChange::Create { id, element } | SyncChange::Update { id, element } => {
-                    items.push(EnumeratedItem { element, id });
+                SyncChange::Create {
+                    id,
+                    element,
+                    item_class,
+                }
+                | SyncChange::Update {
+                    id,
+                    element,
+                    item_class,
+                } => {
+                    items.push(EnumeratedItem {
+                        element,
+                        id,
+                        item_class,
+                    });
                 }
                 SyncChange::Delete { id } => {
                     deletions.push(id.id);
@@ -124,6 +138,7 @@ fn try_sync_folder_items(
                     items.push(EnumeratedItem {
                         element: "Message".to_owned(),
                         id,
+                        item_class: None,
                     });
                 }
             }
@@ -176,6 +191,7 @@ fn enumerate_via_find_item(
             items.push(EnumeratedItem {
                 element: entry.element,
                 id: entry.id,
+                item_class: entry.item_class,
             });
         }
         if !parsed.more {
@@ -529,6 +545,7 @@ mod tests {
             items: vec![EnumeratedItem {
                 element: "Message".to_owned(),
                 id: ItemId::new("A", "ck-2"),
+                item_class: None,
             }],
             mode: EnumerationMode::Delta {
                 deletions: vec!["Z".to_owned()],
@@ -568,14 +585,17 @@ mod tests {
             EnumeratedItem {
                 element: "Message".to_owned(),
                 id: ItemId::new("A", "ck-1"),
+                item_class: None,
             },
             EnumeratedItem {
                 element: "Message".to_owned(),
                 id: ItemId::new("B", "ck-1"),
+                item_class: None,
             },
             EnumeratedItem {
                 element: "Message".to_owned(),
                 id: ItemId::new("C", "ck-2"),
+                item_class: None,
             },
         ];
         let local = vec![

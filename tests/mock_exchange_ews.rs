@@ -493,14 +493,17 @@ fn coordinator_diff_classifies_new_vanished_changed_unchanged() {
         EnumeratedItem {
             element: "Message".into(),
             id: ItemId::new("A", "ck-1"),
+            item_class: None,
         },
         EnumeratedItem {
             element: "Message".into(),
             id: ItemId::new("B", "ck-2"),
+            item_class: None,
         },
         EnumeratedItem {
             element: "Message".into(),
             id: ItemId::new("C", "ck-1"),
+            item_class: None,
         },
     ];
     let local = vec![

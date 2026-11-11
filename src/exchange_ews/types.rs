@@ -142,6 +142,27 @@ impl ServerVersion {
     }
 }
 
+const NON_MAIL_ITEM_CLASSES: [&str; 6] = [
+    "ipm.contact",
+    "ipm.distlist",
+    "ipm.appointment",
+    "ipm.task",
+    "ipm.stickynote",
+    "ipm.activity",
+];
+
+pub fn is_non_mail_item_class(class: &str) -> bool {
+    let class = class.trim();
+    NON_MAIL_ITEM_CLASSES.iter().any(|prefix| {
+        class
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            && class
+                .get(prefix.len()..)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    })
+}
+
 const SKIPPED_CONTAINER_CLASSES: [&str; 8] = [
     "ipf.task",
     "ipf.journal",
@@ -182,6 +203,19 @@ impl FolderClass {
         } else {
             FolderClass::Mail
         }
+    }
+
+    pub fn from_item_classes<'a>(classes: impl IntoIterator<Item = &'a str>) -> FolderClass {
+        for class in classes {
+            let lower = class.trim().to_ascii_lowercase();
+            if class_matches(&lower, "ipm.contact") || class_matches(&lower, "ipm.distlist") {
+                return FolderClass::Contacts;
+            }
+            if class_matches(&lower, "ipm.appointment") {
+                return FolderClass::Calendar;
+            }
+        }
+        FolderClass::Mail
     }
 
     pub fn is_mail_fallback(class: &str) -> bool {
@@ -302,6 +336,54 @@ impl fmt::Display for ResponseCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_mail_item_classes() {
+        for class in [
+            "IPM.Contact",
+            "IPM.DistList",
+            "IPM.Appointment",
+            "IPM.Appointment.Custom",
+            "IPM.Task",
+            "ipm.stickynote",
+            "IPM.Activity",
+        ] {
+            assert!(is_non_mail_item_class(class), "{class}");
+        }
+        for class in [
+            "IPM.Note",
+            "IPM.Note.SMIME",
+            "IPM.Schedule.Meeting.Request",
+            "IPM.Schedule.Meeting.Canceled",
+            "IPM.Post",
+            "REPORT.IPM.Note.NDR",
+            "IPM.Contactless",
+            "",
+        ] {
+            assert!(!is_non_mail_item_class(class), "{class}");
+        }
+    }
+
+    #[test]
+    fn folder_kind_from_item_classes() {
+        assert_eq!(
+            FolderClass::from_item_classes(["IPM.Note", "IPM.Contact"]),
+            FolderClass::Contacts
+        );
+        assert_eq!(
+            FolderClass::from_item_classes(["IPM.DistList"]),
+            FolderClass::Contacts
+        );
+        assert_eq!(
+            FolderClass::from_item_classes(["IPM.Appointment"]),
+            FolderClass::Calendar
+        );
+        assert_eq!(
+            FolderClass::from_item_classes(["IPM.Note", "IPM.Schedule.Meeting.Request"]),
+            FolderClass::Mail
+        );
+        assert_eq!(FolderClass::from_item_classes([]), FolderClass::Mail);
+    }
 
     #[test]
     fn folder_class_mapping() {
