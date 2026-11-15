@@ -19,7 +19,9 @@ use crate::jmap::session::Limits;
 use crate::jmap::wire::JmapId;
 use crate::logging::Logger;
 use crate::sync::import_jmap::mapping::{EMAIL_SELECT, EmailRow, TargetResolver, row_to_email};
-use crate::sync::keys::{EmailIndex, EmailKey, email_index, email_keys, index_from_json};
+use crate::sync::keys::{
+    EmailIndex, EmailKey, email_index, email_key, email_keys, index_from_json,
+};
 use crate::sync::{Context, TypeCounts};
 use crate::types::ObjectType;
 
@@ -138,6 +140,7 @@ pub fn reconcile(
         maps,
         counts,
         logger,
+        target_keys: &target_keys,
         batch: import_batch_size(&net.limits),
     };
     let mut rest = unmatched.as_slice();
@@ -151,6 +154,8 @@ pub fn reconcile(
 }
 
 const EMAIL_MIME: &str = "message/rfc822";
+const EMAIL_PARSE_MAX_ITEMS: usize = 10;
+const EMAIL_KEY_PROPERTIES: [&str; 5] = ["messageId", "from", "subject", "sentAt", "to"];
 
 pub fn import_batch_size(limits: &Limits) -> usize {
     usize::try_from(limits.max_objects_in_set.max(1)).unwrap_or(usize::MAX)
@@ -251,6 +256,7 @@ struct Exporter<'a, 'u> {
     maps: &'a Maps,
     counts: &'a mut TypeCounts,
     logger: &'a Logger,
+    target_keys: &'a HashSet<EmailKey>,
     batch: usize,
 }
 
@@ -302,6 +308,10 @@ impl<'r> Exporter<'_, '_> {
         attempt: Attempt,
     ) -> Result<Vec<Pending<'r>>, Error> {
         let mut failed = self.upload(&pending);
+        let on_target = match attempt {
+            Attempt::First => self.parsed_on_target(&pending, &failed)?,
+            Attempt::Reupload | Attempt::LastReupload => HashSet::new(),
+        };
         let mut ready: Vec<Pending<'r>> = Vec::with_capacity(pending.len());
         let mut items: Vec<(String, Value)> = Vec::with_capacity(pending.len());
         for p in pending {
@@ -327,6 +337,10 @@ impl<'r> Exporter<'_, '_> {
                     continue;
                 }
             };
+            if on_target.contains(&blob) {
+                self.counts.skipped += 1;
+                continue;
+            }
             if self.net.dry_run {
                 self.counts.created += 1;
                 continue;
@@ -394,6 +408,71 @@ impl<'r> Exporter<'_, '_> {
             }
         }
         Ok(retry)
+    }
+
+    fn parsed_on_target(
+        &self,
+        pending: &[Pending<'_>],
+        failed: &HashMap<i64, JmapError>,
+    ) -> Result<HashSet<String>, Error> {
+        let mut found = HashSet::new();
+        if self.net.dry_run || self.target_keys.is_empty() {
+            return Ok(found);
+        }
+        let blobs: Vec<&str> = pending
+            .iter()
+            .filter(|p| !failed.contains_key(&p.row.blob_local_id))
+            .filter_map(|p| self.uploader.cached(p.row.blob_local_id))
+            .map(|b| b.0.as_str())
+            .collect();
+        let calls = usize::try_from(self.net.limits.max_calls_in_request.max(1)).unwrap_or(1);
+        for group in blobs.chunks(EMAIL_PARSE_MAX_ITEMS.saturating_mul(calls)) {
+            let mut req = Request::new();
+            for (n, chunk) in group.chunks(EMAIL_PARSE_MAX_ITEMS).enumerate() {
+                req.call(
+                    "Email/parse",
+                    json!({
+                        "accountId": self.net.account,
+                        "blobIds": chunk,
+                        "properties": EMAIL_KEY_PROPERTIES,
+                    }),
+                    format!("p{n}"),
+                );
+            }
+            let resp = match req.send(&self.net.client, &self.net.api) {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let mapped = Error::from(e);
+                    if mapped.aborts_run() {
+                        return Err(mapped);
+                    }
+                    self.logger.warn(&format!(
+                        "Email/parse failed, importing without a target duplicate check: {mapped}"
+                    ));
+                    return Ok(found);
+                }
+            };
+            for mr in &resp.method_responses {
+                if let Err(e) = check_method_error(mr) {
+                    self.logger.warn(&format!(
+                        "Email/parse failed, importing without a target duplicate check: {e}"
+                    ));
+                    continue;
+                }
+                let Some(parsed) = mr.args.get("parsed").and_then(Value::as_object) else {
+                    continue;
+                };
+                found.extend(
+                    parsed
+                        .iter()
+                        .filter(|(_, email)| {
+                            self.target_keys.contains(&email_key(&server_index(email)))
+                        })
+                        .map(|(blob, _)| blob.clone()),
+                );
+            }
+        }
+        Ok(found)
     }
 
     fn upload(&mut self, pending: &[Pending<'_>]) -> HashMap<i64, JmapError> {

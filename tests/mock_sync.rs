@@ -529,6 +529,14 @@ fn mock_empty_target_with_inbox(
     server: &mut mockito::Server,
     session: String,
 ) -> Vec<mockito::Mock> {
+    mock_target_with_inbox(server, session, &[])
+}
+
+fn mock_target_with_inbox(
+    server: &mut mockito::Server,
+    session: String,
+    email_ids: &[&str],
+) -> Vec<mockito::Mock> {
     let api = "/jmap/api";
     vec![
         server.mock("GET", "/").with_status(404).create(),
@@ -565,12 +573,13 @@ fn mock_empty_target_with_inbox(
                 .to_string(),
             )
             .create(),
+        anchor_terminator(server, api, "Email"),
         server
             .mock("POST", api)
             .match_body(Matcher::Regex("Email/query".into()))
             .with_body(
                 json!({"methodResponses":[["Email/query",
-                    {"accountId":"w","ids":[]},"q"]]})
+                    {"accountId":"w","ids":email_ids},"q"]]})
                 .to_string(),
             )
             .create(),
@@ -763,6 +772,101 @@ fn export_email_blob_not_found_reuploads_and_retries() {
     batch.assert();
     retry.assert();
     let _ = std::fs::remove_file(&archive);
+}
+
+fn export_against_divergent_target_key(parse_response: Value, imports: usize) -> sync::TypeCounts {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
+            [],
+        )
+        .unwrap();
+        let blob = db::blobs::intern_blob(
+            &conn,
+            b"Message-ID: <a@h>\r\nMessage-ID: <b@h>\r\nSubject: s\r\n\r\nbody",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords,message_match)
+             VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]',?2)",
+            rusqlite::params![
+                blob,
+                json!({"m": ["a@h", "b@h"], "f": "00".repeat(32)}).to_string()
+            ],
+        )
+        .unwrap();
+    }
+    let _target = mock_target_with_inbox(&mut server, session_body(&base), &["T1"]);
+    let _eg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/get",{"accountId":"w","list":[
+                {"id":"T1","messageId":["b@h"]}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _up = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UP"}).to_string())
+        .expect(1)
+        .create();
+    let parse = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Email/parse".into()),
+            Matcher::Regex(r#""blobIds":\["UP"\]"#.into()),
+        ]))
+        .with_body(json!({ "methodResponses": [parse_response] }).to_string())
+        .expect(1)
+        .create();
+    let import = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/import".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/import",{"accountId":"w",
+                "created":{"e1":{"id":"x1","blobId":"UP","threadId":"t","size":10}}},"i"]]})
+            .to_string(),
+        )
+        .expect(imports)
+        .create();
+
+    let summary = sync::export::run(common(&archive), export_email_cfg(&base)).expect("export run");
+
+    parse.assert();
+    import.assert();
+    let _ = std::fs::remove_file(&archive);
+    email_counts(&summary)
+}
+
+#[test]
+fn export_email_matched_by_target_parse_is_not_reimported() {
+    // The stored key holds both Message-IDs, the target keeps only the last; Email/parse proves it is already there.
+    let email = export_against_divergent_target_key(
+        json!(["Email/parse",
+        {"accountId":"w","parsed":{"UP":{"messageId":["b@h"],"from":null,"subject":"s",
+            "sentAt":null,"to":null}},"notParsable":[],"notFound":[]},"p0"]),
+        0,
+    );
+    assert_eq!(email.created, 0);
+    assert_eq!(email.skipped, 1);
+    assert_eq!(email.failed, 0);
+}
+
+#[test]
+fn export_email_parse_error_falls_back_to_import() {
+    // A target without Email/parse still gets the message imported.
+    let email =
+        export_against_divergent_target_key(json!(["error", {"type":"unknownMethod"}, "p0"]), 1);
+    assert_eq!(email.created, 1);
+    assert_eq!(email.skipped, 0);
+    assert_eq!(email.failed, 0);
 }
 
 fn session_body_full(base: &str) -> String {
@@ -1754,6 +1858,16 @@ fn export_missing_target_email_is_created_on_rerun() {
         .with_body(json!({"blobId":"BUP"}).to_string())
         .expect(1)
         .create();
+    let parse = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/parse".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/parse",{"accountId":"w",
+                "parsed":{"BUP":{"messageId":["m-2@h"]}},"notParsable":[],"notFound":[]},"p0"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
     let create = server
         .mock("POST", api)
         .match_body(Matcher::Regex("Email/import".into()))
@@ -1780,6 +1894,7 @@ fn export_missing_target_email_is_created_on_rerun() {
     assert_eq!(email.created, 1, "missing email is created");
     assert_eq!(email.failed, 0);
     upload.assert();
+    parse.assert();
     create.assert();
     let _ = std::fs::remove_file(&archive);
 }
