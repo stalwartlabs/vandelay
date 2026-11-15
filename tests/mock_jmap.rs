@@ -7,25 +7,34 @@
 use std::time::Instant;
 
 use serde_json::json;
-use vandelay::jmap::account::{self, AccountSelector};
+use vandelay::archive::sources::SourceChange;
+use vandelay::error::ExitStatus;
+use vandelay::jmap::account::AccountSelector;
+use vandelay::jmap::connect::{ConnectConfig, JmapAccount};
 use vandelay::jmap::error::JmapError;
-use vandelay::jmap::http::{Auth, HttpClient, RetryPolicy};
-use vandelay::jmap::request::{
-    self, SetRequest, get_all, get_changes, get_objects, get_state, set_call,
-};
+use vandelay::jmap::http::JmapClient;
+use vandelay::jmap::request::{GetResult, SetRequest};
 use vandelay::jmap::session::{Limits, Session};
 use vandelay::jmap::wire::JmapId;
 use vandelay::jmap::wire::identity::Identity;
 use vandelay::jmap::wire::mailbox::Mailbox;
+use vandelay::logging::{Level, Logger};
+use vandelay::net::auth::Auth;
+use vandelay::net::http::{ClientOptions, TlsPolicy};
+use vandelay::net::retry::RetryPolicy;
+use vandelay::sync::RunMode;
 
-fn client(retries: u32) -> HttpClient {
-    HttpClient::new(
+fn client(retries: u32) -> JmapClient {
+    JmapClient::new(
         Auth::Basic {
             user: "u".into(),
             password: "p".into(),
         },
-        RetryPolicy::new(retries),
-        false,
+        ClientOptions {
+            retry: RetryPolicy::new(retries),
+            tls: TlsPolicy::Verify,
+            logger: Logger::new(Level::Quiet),
+        },
     )
 }
 
@@ -161,8 +170,9 @@ fn query_paginates_with_clamped_limit_and_terminates_structurally() {
     trailing_empty_page(&mut server, api);
 
     let url = format!("{}{}", server.url(), api);
-    let ids =
-        request::query_all_ids(&client(2), &url, "w", "Mailbox", &limits(3)).expect("query ok");
+    let ids = account(client(2), &url, limits(3))
+        .query_all_ids("Mailbox")
+        .expect("query ok");
     let got: Vec<String> = ids.into_iter().map(|i| i.0).collect();
     assert_eq!(got, vec!["a", "b", "c", "d", "e"]);
 }
@@ -195,8 +205,9 @@ fn anchor_not_found_restarts_pagination() {
     trailing_empty_page(&mut server, api);
 
     let url = format!("{}{}", server.url(), api);
-    let ids =
-        request::query_all_ids(&client(2), &url, "w", "Mailbox", &limits(2)).expect("query ok");
+    let ids = account(client(2), &url, limits(2))
+        .query_all_ids("Mailbox")
+        .expect("query ok");
     assert_eq!(ids, vec![JmapId("a".into())]);
 }
 
@@ -220,8 +231,9 @@ fn rate_limit_with_retry_after_is_honoured_then_succeeds() {
 
     let url = format!("{}{}", server.url(), api);
     let started = Instant::now();
-    let ids =
-        request::query_all_ids(&client(3), &url, "w", "Mailbox", &limits(2)).expect("query ok");
+    let ids = account(client(3), &url, limits(2))
+        .query_all_ids("Mailbox")
+        .expect("query ok");
     assert!(ids.is_empty());
     assert!(
         started.elapsed().as_millis() >= 900,
@@ -247,8 +259,9 @@ fn server_unavailable_503_is_retried() {
         .create();
     trailing_empty_page(&mut server, api);
     let url = format!("{}{}", server.url(), api);
-    let ids =
-        request::query_all_ids(&client(3), &url, "w", "Mailbox", &limits(2)).expect("query ok");
+    let ids = account(client(3), &url, limits(2))
+        .query_all_ids("Mailbox")
+        .expect("query ok");
     assert_eq!(ids, vec![JmapId("only".into())]);
 }
 
@@ -288,16 +301,9 @@ fn request_too_large_halves_and_resplits_without_consuming_retries() {
 
     let url = format!("{}{}", server.url(), api);
     let ids = vec![JmapId("a".into()), JmapId("b".into())];
-    let result: request::GetResult<Mailbox> = get_objects(
-        &client(0),
-        &url,
-        "w",
-        "Mailbox",
-        &ids,
-        Some(&["name"]),
-        &limits(500),
-    )
-    .expect("resplit succeeds");
+    let result: GetResult<Mailbox> = account(client(0), &url, limits(500))
+        .get("Mailbox", &ids, Some(&["name"]))
+        .expect("resplit succeeds");
     let mut names: Vec<String> = result.list.into_iter().map(|m| m.name).collect();
     names.sort();
     assert_eq!(names, vec!["A".to_owned(), "B".to_owned()]);
@@ -313,7 +319,9 @@ fn malformed_response_is_classified_not_retried_forever() {
         .with_body("{\"unexpected\":true}")
         .create();
     let url = format!("{}{}", server.url(), api);
-    let err = request::query_all_ids(&client(2), &url, "w", "Mailbox", &limits(2)).unwrap_err();
+    let err = account(client(2), &url, limits(2))
+        .query_all_ids("Mailbox")
+        .unwrap_err();
     assert!(matches!(err, JmapError::Malformed(_)), "got {err:?}");
 }
 
@@ -340,7 +348,8 @@ fn principal_substring_prefilter_rejects_near_matches() {
         )
         .create();
 
-    let id = account::resolve(&AccountSelector::Name("alice".into()), &session, &client(1))
+    let id = AccountSelector::Name("alice".into())
+        .resolve(&session, &client(1))
         .expect("resolved");
     assert_eq!(id, "w");
 }
@@ -364,9 +373,10 @@ fn principal_ambiguous_exact_match_is_rejected() {
             .to_string(),
         )
         .create();
-    let err =
-        account::resolve(&AccountSelector::Name("dup".into()), &session, &client(1)).unwrap_err();
-    assert_eq!(err.exit_code(), 3);
+    let err = AccountSelector::Name("dup".into())
+        .resolve(&session, &client(1))
+        .unwrap_err();
+    assert_eq!(err.exit_status(), ExitStatus::Account);
 }
 
 #[test]
@@ -389,9 +399,10 @@ fn principal_unknown_capability_400_is_actionable() {
         )
         .create();
 
-    let err =
-        account::resolve(&AccountSelector::Name("ghost".into()), &session, &client(0)).unwrap_err();
-    assert_eq!(err.exit_code(), 3);
+    let err = AccountSelector::Name("ghost".into())
+        .resolve(&session, &client(0))
+        .unwrap_err();
+    assert_eq!(err.exit_status(), ExitStatus::Account);
     let msg = err.to_string();
     assert!(msg.contains("urn:ietf:params:jmap:principals"));
     assert!(msg.contains("--account-id"));
@@ -413,16 +424,9 @@ fn get_reports_not_found_ids() {
         .create();
     let url = format!("{}{}", server.url(), api);
     let ids = vec![JmapId("a".into()), JmapId("b".into())];
-    let got: request::GetResult<Mailbox> = get_objects(
-        &client(1),
-        &url,
-        "w",
-        "Mailbox",
-        &ids,
-        Some(&["name"]),
-        &limits(500),
-    )
-    .expect("get ok");
+    let got: GetResult<Mailbox> = account(client(1), &url, limits(500))
+        .get("Mailbox", &ids, Some(&["name"]))
+        .expect("get ok");
     assert_eq!(got.list.len(), 1);
     assert_eq!(got.not_found, vec![JmapId("b".into())]);
 }
@@ -443,8 +447,9 @@ fn queryless_get_all_enumerates_full_list() {
         )
         .create();
     let url = format!("{}{}", server.url(), api);
-    let got: request::GetResult<Identity> =
-        get_all(&client(1), &url, "w", "Identity").expect("get_all ok");
+    let got: GetResult<Identity> = account(client(1), &url, limits(500))
+        .get_all("Identity")
+        .expect("get_all ok");
     assert_eq!(got.list.len(), 2);
     assert_eq!(got.list[1].email, "b@x.test");
 }
@@ -462,7 +467,9 @@ fn persistent_anchor_not_found_surfaces_after_restarts() {
         )
         .create();
     let url = format!("{}{}", server.url(), api);
-    let err = request::query_all_ids(&client(2), &url, "w", "Mailbox", &limits(2)).unwrap_err();
+    let err = account(client(2), &url, limits(2))
+        .query_all_ids("Mailbox")
+        .unwrap_err();
     assert!(matches!(err, JmapError::AnchorNotFound), "got {err:?}");
 }
 
@@ -480,16 +487,9 @@ fn single_object_exceeding_size_is_unsplittable() {
         .create();
     let url = format!("{}{}", server.url(), api);
     let ids = vec![JmapId("huge".into())];
-    let err: JmapError = get_objects::<Mailbox>(
-        &client(2),
-        &url,
-        "w",
-        "Mailbox",
-        &ids,
-        Some(&["name"]),
-        &limits(500),
-    )
-    .unwrap_err();
+    let err: JmapError = account(client(2), &url, limits(500))
+        .get::<Mailbox>("Mailbox", &ids, Some(&["name"]))
+        .unwrap_err();
     assert!(
         matches!(err, JmapError::SingleObjectTooLarge(_)),
         "got {err:?}"
@@ -513,18 +513,15 @@ fn set_call_decodes_created_and_per_object_set_errors() {
         )
         .create();
     let url = format!("{}{}", server.url(), api);
-    let outcome = set_call(
-        &client(1),
-        &url,
-        "w",
-        "Mailbox",
-        SetRequest {
-            create: Some(json!({ "c1": { "name": "Ok" }, "c2": { "name": "" } })),
-            ..Default::default()
-        },
-        &limits(500),
-    )
-    .expect("set envelope ok despite per-object failure");
+    let outcome = account(client(1), &url, limits(500))
+        .set(
+            "Mailbox",
+            SetRequest {
+                create: Some(json!({ "c1": { "name": "Ok" }, "c2": { "name": "" } })),
+                ..Default::default()
+            },
+        )
+        .expect("set envelope ok despite per-object failure");
     assert_eq!(outcome.created.len(), 1);
     assert_eq!(outcome.created[0].0, "c1");
     assert_eq!(outcome.not_created.len(), 1);
@@ -565,18 +562,15 @@ fn set_call_resplits_on_request_too_large() {
         .expect(1)
         .create();
     let url = format!("{}{}", server.url(), api);
-    let outcome = set_call(
-        &client(0),
-        &url,
-        "w",
-        "Mailbox",
-        SetRequest {
-            create: Some(json!({ "c1": { "name": "A" }, "c2": { "name": "B" } })),
-            ..Default::default()
-        },
-        &limits(500),
-    )
-    .expect("resplit succeeds with max_retries=0");
+    let outcome = account(client(0), &url, limits(500))
+        .set(
+            "Mailbox",
+            SetRequest {
+                create: Some(json!({ "c1": { "name": "A" }, "c2": { "name": "B" } })),
+                ..Default::default()
+            },
+        )
+        .expect("resplit succeeds with max_retries=0");
     let mut created: Vec<String> = outcome.created.into_iter().map(|(k, _)| k).collect();
     created.sort();
     assert_eq!(created, vec!["c1".to_owned(), "c2".to_owned()]);
@@ -642,6 +636,16 @@ fn upload_session(base: &str) -> Session {
     .unwrap()
 }
 
+fn account(client: JmapClient, api_url: &str, limits: Limits) -> JmapAccount {
+    let mut session = upload_session("http://unused.invalid");
+    session.api_url = api_url.to_owned();
+    JmapAccount::from_parts(client, session, "w".to_owned(), limits)
+}
+
+fn blob_account(client: &JmapClient, session: &Session) -> JmapAccount {
+    JmapAccount::from_parts(client.clone(), session.clone(), "w".to_owned(), limits(500))
+}
+
 #[test]
 fn retries_counter_increments_on_429() {
     let mut server = mockito::Server::new();
@@ -662,10 +666,16 @@ fn retries_counter_increments_on_429() {
 
     let c = client(3);
     let url = format!("{}{}", server.url(), api);
-    let _ = request::query_all_ids(&c, &url, "w", "Mailbox", &limits(2)).expect("query ok");
-    assert_eq!(c.retries_observed(), 1, "retry counter must bump on 429");
+    let _ = account(c.clone(), &url, limits(2))
+        .query_all_ids("Mailbox")
+        .expect("query ok");
     assert_eq!(
-        c.retry_after_sleeps(),
+        c.stats().retries_observed,
+        1,
+        "retry counter must bump on 429"
+    );
+    assert_eq!(
+        c.stats().retry_after_sleeps,
         1,
         "retry-after sleep counter must bump"
     );
@@ -673,8 +683,6 @@ fn retries_counter_increments_on_429() {
 
 #[test]
 fn upload_size_precheck_blocks_before_contacting_server() {
-    use vandelay::jmap::blobxfer;
-
     let mut server = mockito::Server::new();
     let no_hits = server
         .mock("POST", mockito::Matcher::Any)
@@ -684,7 +692,8 @@ fn upload_size_precheck_blocks_before_contacting_server() {
 
     let c = client(0);
     c.set_limits(&limits_concurrency(4, 4, 10));
-    let err = blobxfer::upload_bytes(&c, &session, "w", "application/octet-stream", &[0u8; 11])
+    let err = blob_account(&c, &session)
+        .upload(&[0u8; 11], "application/octet-stream")
         .unwrap_err();
     assert!(
         matches!(err, JmapError::SingleObjectTooLarge(_)),
@@ -724,15 +733,16 @@ fn concurrent_requests_400_problem_is_retried_then_succeeds() {
 
     let c = client(3);
     let url = format!("{}{}", server.url(), api);
-    let ids =
-        request::query_all_ids(&c, &url, "w", "Mailbox", &limits(2)).expect("eventual success");
+    let ids = account(c.clone(), &url, limits(2))
+        .query_all_ids("Mailbox")
+        .expect("eventual success");
     assert!(ids.is_empty());
     assert!(
-        c.retries_observed() >= 1,
+        c.stats().retries_observed >= 1,
         "concurrent-requests 400 must count as a retry"
     );
     assert_eq!(
-        c.retry_after_sleeps(),
+        c.stats().retry_after_sleeps,
         0,
         "concurrent-* errors carry no Retry-After"
     );
@@ -740,8 +750,6 @@ fn concurrent_requests_400_problem_is_retried_then_succeeds() {
 
 #[test]
 fn concurrent_uploads_400_problem_is_retried_then_succeeds() {
-    use vandelay::jmap::blobxfer;
-
     let mut server = mockito::Server::new();
     server
         .mock("POST", "/upload/w/")
@@ -766,15 +774,15 @@ fn concurrent_uploads_400_problem_is_retried_then_succeeds() {
     let session = upload_session(&server.url());
     let c = client(3);
     c.set_limits(&limits_concurrency(4, 4, 1_000_000));
-    let id = blobxfer::upload_bytes(&c, &session, "w", "text/plain", b"abc").expect("upload ok");
+    let id = blob_account(&c, &session)
+        .upload(b"abc", "text/plain")
+        .expect("upload ok");
     assert_eq!(id, JmapId("G7".into()));
-    assert!(c.retries_observed() >= 1);
+    assert!(c.stats().retries_observed >= 1);
 }
 
 #[test]
 fn blob_upload_quota_429_with_retry_after_is_honoured() {
-    use vandelay::jmap::blobxfer;
-
     let mut server = mockito::Server::new();
     server
         .mock("POST", "/upload/w/")
@@ -804,13 +812,15 @@ fn blob_upload_quota_429_with_retry_after_is_honoured() {
     let c = client(3);
     c.set_limits(&limits_concurrency(4, 4, 1_000_000));
     let started = Instant::now();
-    let id = blobxfer::upload_bytes(&c, &session, "w", "text/plain", b"abc").expect("upload ok");
+    let id = blob_account(&c, &session)
+        .upload(b"abc", "text/plain")
+        .expect("upload ok");
     assert_eq!(id, JmapId("Q1".into()));
     assert!(
         started.elapsed().as_millis() >= 900,
         "Retry-After of 1s should have delayed the upload retry"
     );
-    assert_eq!(c.retry_after_sleeps(), 1);
+    assert_eq!(c.stats().retry_after_sleeps, 1);
 }
 
 #[test]
@@ -843,13 +853,15 @@ fn long_retry_after_warns_at_default_verbosity() {
     let c = client(3);
     let url = format!("{}{}", server.url(), api);
     let started = Instant::now();
-    let _ = request::query_all_ids(&c, &url, "w", "Mailbox", &limits(2)).expect("query ok");
+    let _ = account(c.clone(), &url, limits(2))
+        .query_all_ids("Mailbox")
+        .expect("query ok");
     assert!(
         started.elapsed().as_secs() >= 10,
         "should have honored Retry-After: 11"
     );
-    assert_eq!(c.retries_observed(), 1);
-    assert_eq!(c.retry_after_sleeps(), 1);
+    assert_eq!(c.stats().retries_observed, 1);
+    assert_eq!(c.stats().retry_after_sleeps, 1);
 }
 
 #[test]
@@ -873,10 +885,12 @@ fn ratelimit_headers_without_retry_after_fall_back_to_backoff() {
 
     let c = client(3);
     let url = format!("{}{}", server.url(), api);
-    let _ = request::query_all_ids(&c, &url, "w", "Mailbox", &limits(2)).expect("query ok");
-    assert_eq!(c.retries_observed(), 1);
+    let _ = account(c.clone(), &url, limits(2))
+        .query_all_ids("Mailbox")
+        .expect("query ok");
+    assert_eq!(c.stats().retries_observed, 1);
     assert_eq!(
-        c.retry_after_sleeps(),
+        c.stats().retry_after_sleeps,
         0,
         "no Retry-After means we use the backoff schedule, not a header delay"
     );
@@ -884,8 +898,6 @@ fn ratelimit_headers_without_retry_after_fall_back_to_backoff() {
 
 #[test]
 fn upload_extracts_blob_id_and_download_streams_via_download_url() {
-    use vandelay::jmap::blobxfer;
-
     let mut server = mockito::Server::new();
     let base = server.url();
     let session: Session = serde_json::from_str(
@@ -908,8 +920,9 @@ fn upload_extracts_blob_id_and_download_streams_via_download_url() {
         .with_status(200)
         .with_body(json!({ "accountId": "w", "blobId": "G99", "type": "x", "size": 3 }).to_string())
         .create();
-    let blob_id =
-        blobxfer::upload_bytes(&client(1), &session, "w", "text/plain", b"abc").expect("upload ok");
+    let blob_id = blob_account(&client(1), &session)
+        .upload(b"abc", "text/plain")
+        .expect("upload ok");
     assert_eq!(blob_id, JmapId("G99".into()));
 
     server
@@ -917,8 +930,9 @@ fn upload_extracts_blob_id_and_download_streams_via_download_url() {
         .with_status(200)
         .with_body(b"hello")
         .create();
-    let bytes =
-        blobxfer::download_bytes(&client(1), &session, "w", "G99", "x", "n").expect("download ok");
+    let bytes = blob_account(&client(1), &session)
+        .download("G99", "x", "n")
+        .expect("download ok");
     assert_eq!(bytes, b"hello");
 }
 
@@ -951,19 +965,25 @@ fn persistent_problem_json_429_without_retry_after_eventually_succeeds_via_share
     let c = client(5);
     let url = format!("{}{}", server.url(), api);
     let started = Instant::now();
-    let _ = request::query_all_ids(&c, &url, "w", "Mailbox", &limits(2)).expect("eventual success");
+    let _ = account(c.clone(), &url, limits(2))
+        .query_all_ids("Mailbox")
+        .expect("eventual success");
     let waited = started.elapsed();
 
     limiter.assert();
     ok.assert();
-    assert_eq!(c.retries_observed(), 2, "two 429s consumed two retry slots");
     assert_eq!(
-        c.retry_after_sleeps(),
+        c.stats().retries_observed,
+        2,
+        "two 429s consumed two retry slots"
+    );
+    assert_eq!(
+        c.stats().retry_after_sleeps,
         0,
         "no Retry-After header means no Retry-After sleep counts"
     );
     assert_eq!(
-        c.throttle_level(),
+        c.rate_limit().level(),
         0,
         "successful response resets shared level"
     );
@@ -975,8 +995,6 @@ fn persistent_problem_json_429_without_retry_after_eventually_succeeds_via_share
 
 #[test]
 fn persistent_429_on_download_uses_shared_throttle() {
-    use vandelay::jmap::blobxfer;
-
     let mut server = mockito::Server::new();
     let session = upload_session(&server.url());
 
@@ -1004,18 +1022,19 @@ fn persistent_429_on_download_uses_shared_throttle() {
 
     let c = client(3);
     let started = Instant::now();
-    let bytes = blobxfer::download_bytes(&c, &session, "w", "B1", "text/plain", "blob")
+    let bytes = blob_account(&c, &session)
+        .download("B1", "text/plain", "blob")
         .expect("eventual success");
     let waited = started.elapsed();
     assert_eq!(bytes, b"payload");
     limiter.assert();
     ok.assert();
     assert!(
-        c.retries_observed() >= 1,
+        c.stats().retries_observed >= 1,
         "the 429 must be counted as a retry"
     );
     assert_eq!(
-        c.throttle_level(),
+        c.rate_limit().level(),
         0,
         "success after a 429 resets the shared level"
     );
@@ -1066,12 +1085,12 @@ fn shared_throttle_level_grows_across_concurrent_workers() {
 
     ok.assert();
     assert_eq!(
-        shared.throttle_level(),
+        shared.rate_limit().level(),
         0,
         "shared level must reset to 0 once the storm clears (a 2xx landed)"
     );
     assert!(
-        shared.retries_observed() >= 2,
+        shared.stats().retries_observed >= 2,
         "both workers saw a 429 (or more) before recovery"
     );
 }
@@ -1104,7 +1123,9 @@ fn get_changes_paginates_until_no_more() {
         .create();
 
     let url = format!("{}{}", server.url(), api);
-    let r = get_changes(&client(0), &url, "w", "Mailbox", "s1", &limits(500)).expect("changes");
+    let r = account(client(0), &url, limits(500))
+        .changes("Mailbox", "s1")
+        .expect("changes");
     let updated: Vec<String> = r.updated.iter().map(|i| i.0.clone()).collect();
     assert_eq!(updated, vec!["U1".to_owned(), "U2".to_owned()]);
     let created: Vec<String> = r.created.iter().map(|i| i.0.clone()).collect();
@@ -1126,8 +1147,9 @@ fn get_changes_cannot_calculate_changes_is_typed_error() {
         )
         .create();
     let url = format!("{}{}", server.url(), api);
-    let err =
-        get_changes(&client(0), &url, "w", "Email", "stale", &limits(500)).expect_err("must error");
+    let err = account(client(0), &url, limits(500))
+        .changes("Email", "stale")
+        .expect_err("must error");
     assert!(
         matches!(err, JmapError::CannotCalculateChanges),
         "got {err:?}"
@@ -1162,7 +1184,9 @@ fn get_changes_dedups_repeated_ids_across_pages() {
         .create();
 
     let url = format!("{}{}", server.url(), api);
-    let r = get_changes(&client(0), &url, "w", "Mailbox", "s1", &limits(500)).expect("changes");
+    let r = account(client(0), &url, limits(500))
+        .changes("Mailbox", "s1")
+        .expect("changes");
     let updated: Vec<String> = r.updated.iter().map(|i| i.0.clone()).collect();
     assert_eq!(
         updated,
@@ -1180,8 +1204,9 @@ fn get_changes_unknown_method_is_typed_error() {
         .with_body(json!({"methodResponses":[["error",{"type":"unknownMethod"},"c"]]}).to_string())
         .create();
     let url = format!("{}{}", server.url(), api);
-    let err =
-        get_changes(&client(0), &url, "w", "Email", "s1", &limits(500)).expect_err("must error");
+    let err = account(client(0), &url, limits(500))
+        .changes("Email", "s1")
+        .expect_err("must error");
     assert!(matches!(err, JmapError::UnknownMethod), "got {err:?}");
 }
 
@@ -1199,7 +1224,9 @@ fn get_state_reads_state_from_empty_get() {
         )
         .create();
     let url = format!("{}{}", server.url(), api);
-    let st = get_state(&client(0), &url, "w", "Email").expect("get_state");
+    let st = account(client(0), &url, limits(500))
+        .state("Email")
+        .expect("get_state");
     assert_eq!(st.as_deref(), Some("snap-1"));
 }
 
@@ -1265,34 +1292,37 @@ fn import_aborts_with_exit_two_when_the_advertised_api_url_is_unreachable() {
         .create();
 
     let archive = archive_path();
-    let err = vandelay::sync::import_jmap::run(
-        vandelay::sync::CommonConfig {
-            archive: archive.clone(),
-            threads: 1,
-            dry_run: false,
-            max_retries: 0,
-            allow_invalid_certs: false,
-            logger: vandelay::logging::Logger::from_flags(true, 0),
-        },
-        vandelay::sync::ImportConfig {
-            connect: vandelay::sync::ConnectConfig {
-                url: session_base.clone(),
-                auth: Auth::Basic {
-                    user: "u".into(),
-                    password: "p".into(),
-                },
-                account: AccountSelector::Id("w".into()),
+    let err = (vandelay::import::jmap::JmapImport {
+        connect: ConnectConfig {
+            url: session_base.clone(),
+            auth: Auth::Basic {
+                user: "u".into(),
+                password: "p".into(),
             },
-            objects: None,
-            allow_source_change: false,
+            account: AccountSelector::Id("w".into()),
         },
-    )
+        objects: None,
+        source_change: SourceChange::Reject,
+    })
+    .run(vandelay::sync::RunOptions {
+        archive: archive.clone(),
+        threads: 1,
+        mode: RunMode::Apply,
+        max_retries: 0,
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
+    })
+    .into_result()
     .expect_err("an unreachable apiUrl must abort the run");
 
     assert!(
         matches!(err, vandelay::error::Error::Connection(_)),
         "a 404 from the advertised apiUrl is a whole-run connection failure, got {err:?}"
     );
-    assert_eq!(err.exit_code(), 2, "must not report a partial failure");
+    assert_eq!(
+        err.exit_status(),
+        ExitStatus::Connection,
+        "must not report a partial failure"
+    );
     let _ = std::fs::remove_file(&archive);
 }

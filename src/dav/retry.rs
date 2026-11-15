@@ -6,7 +6,17 @@
 
 use serde_json::Value;
 
-use crate::jmap::retry::Disposition;
+const BAD_REQUEST: u16 = 400;
+const UNAUTHORIZED: u16 = 401;
+const FORBIDDEN: u16 = 403;
+const NOT_FOUND: u16 = 404;
+const GONE: u16 = 410;
+const LOCKED: u16 = 423;
+const TOO_MANY_REQUESTS: u16 = 429;
+const BAD_GATEWAY: u16 = 502;
+const SERVICE_UNAVAILABLE: u16 = 503;
+const GATEWAY_TIMEOUT: u16 = 504;
+const INSUFFICIENT_STORAGE: u16 = 507;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DavOutcome {
@@ -17,50 +27,42 @@ pub enum DavOutcome {
     Fatal,
 }
 
-pub fn classify(status: u16, body: &[u8]) -> DavOutcome {
-    if (200..300).contains(&status) {
-        return DavOutcome::Success;
-    }
-    if status == 401 {
-        return DavOutcome::Auth;
-    }
-    if status == 403 {
-        if is_google_usage_limit(body) {
-            return DavOutcome::Retryable;
+impl DavOutcome {
+    pub fn classify(status: u16, body: &[u8]) -> DavOutcome {
+        match status {
+            200..=299 => DavOutcome::Success,
+            UNAUTHORIZED => DavOutcome::Auth,
+            FORBIDDEN if DavOutcome::is_google_usage_limit(body) => DavOutcome::Retryable,
+            FORBIDDEN => DavOutcome::Auth,
+            NOT_FOUND | GONE => DavOutcome::Vanished,
+            LOCKED | TOO_MANY_REQUESTS | BAD_GATEWAY | SERVICE_UNAVAILABLE | GATEWAY_TIMEOUT
+            | INSUFFICIENT_STORAGE => DavOutcome::Retryable,
+            _ => DavOutcome::Fatal,
         }
-        return DavOutcome::Auth;
     }
-    if status == 404 || status == 410 {
-        return DavOutcome::Vanished;
-    }
-    if matches!(status, 423 | 429 | 502 | 503 | 504 | 507) {
-        return DavOutcome::Retryable;
-    }
-    match crate::jmap::retry::classify_http_status(status) {
-        Disposition::Retryable => DavOutcome::Retryable,
-        Disposition::Fatal => DavOutcome::Fatal,
-    }
-}
 
-fn is_google_usage_limit(body: &[u8]) -> bool {
-    let value: Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let errors = value
-        .get("error")
-        .and_then(|e| e.get("errors"))
-        .and_then(Value::as_array);
-    let Some(errors) = errors else {
-        return false;
-    };
-    errors.iter().any(|entry| {
-        entry
-            .get("domain")
-            .and_then(Value::as_str)
-            .map(|d| d == "usageLimits")
-            .unwrap_or(false)
-    })
+    pub fn is_gone(status: u16) -> bool {
+        matches!(status, NOT_FOUND | GONE)
+    }
+
+    pub fn is_error(status: u16) -> bool {
+        status >= BAD_REQUEST
+    }
+
+    fn is_google_usage_limit(body: &[u8]) -> bool {
+        let Ok(value) = serde_json::from_slice::<Value>(body) else {
+            return false;
+        };
+        value
+            .get("error")
+            .and_then(|e| e.get("errors"))
+            .and_then(Value::as_array)
+            .is_some_and(|errors| {
+                errors
+                    .iter()
+                    .any(|entry| entry.get("domain").and_then(Value::as_str) == Some("usageLimits"))
+            })
+    }
 }
 
 #[cfg(test)]
@@ -69,48 +71,48 @@ mod tests {
 
     #[test]
     fn success_range() {
-        assert_eq!(classify(200, b""), DavOutcome::Success);
-        assert_eq!(classify(207, b""), DavOutcome::Success);
-        assert_eq!(classify(299, b""), DavOutcome::Success);
+        assert_eq!(DavOutcome::classify(200, b""), DavOutcome::Success);
+        assert_eq!(DavOutcome::classify(207, b""), DavOutcome::Success);
+        assert_eq!(DavOutcome::classify(299, b""), DavOutcome::Success);
     }
 
     #[test]
     fn auth_status() {
-        assert_eq!(classify(401, b""), DavOutcome::Auth);
-        assert_eq!(classify(403, b""), DavOutcome::Auth);
+        assert_eq!(DavOutcome::classify(401, b""), DavOutcome::Auth);
+        assert_eq!(DavOutcome::classify(403, b""), DavOutcome::Auth);
     }
 
     #[test]
     fn vanished_status() {
-        assert_eq!(classify(404, b""), DavOutcome::Vanished);
-        assert_eq!(classify(410, b""), DavOutcome::Vanished);
+        assert_eq!(DavOutcome::classify(404, b""), DavOutcome::Vanished);
+        assert_eq!(DavOutcome::classify(410, b""), DavOutcome::Vanished);
     }
 
     #[test]
     fn locked_and_quota_are_retryable() {
-        assert_eq!(classify(423, b""), DavOutcome::Retryable);
-        assert_eq!(classify(429, b""), DavOutcome::Retryable);
-        assert_eq!(classify(503, b""), DavOutcome::Retryable);
-        assert_eq!(classify(507, b""), DavOutcome::Retryable);
+        assert_eq!(DavOutcome::classify(423, b""), DavOutcome::Retryable);
+        assert_eq!(DavOutcome::classify(429, b""), DavOutcome::Retryable);
+        assert_eq!(DavOutcome::classify(503, b""), DavOutcome::Retryable);
+        assert_eq!(DavOutcome::classify(507, b""), DavOutcome::Retryable);
     }
 
     #[test]
     fn google_usage_limit_403_is_retryable() {
         let body =
             br#"{"error":{"errors":[{"domain":"usageLimits","reason":"rateLimitExceeded"}]}}"#;
-        assert_eq!(classify(403, body), DavOutcome::Retryable);
+        assert_eq!(DavOutcome::classify(403, body), DavOutcome::Retryable);
     }
 
     #[test]
     fn non_google_403_is_auth() {
         let body = br#"{"error":{"errors":[{"domain":"global","reason":"forbidden"}]}}"#;
-        assert_eq!(classify(403, body), DavOutcome::Auth);
+        assert_eq!(DavOutcome::classify(403, body), DavOutcome::Auth);
     }
 
     #[test]
     fn fatal_4xx_other() {
-        assert_eq!(classify(400, b""), DavOutcome::Fatal);
-        assert_eq!(classify(405, b""), DavOutcome::Fatal);
-        assert_eq!(classify(412, b""), DavOutcome::Fatal);
+        assert_eq!(DavOutcome::classify(400, b""), DavOutcome::Fatal);
+        assert_eq!(DavOutcome::classify(405, b""), DavOutcome::Fatal);
+        assert_eq!(DavOutcome::classify(412, b""), DavOutcome::Fatal);
     }
 }

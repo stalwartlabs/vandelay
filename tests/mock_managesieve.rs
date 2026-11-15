@@ -4,55 +4,40 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+mod common;
+
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::thread;
-use std::time::Duration;
 
+use common::line_server::{LineServer, MockConn, Script};
 use rusqlite::Connection;
-use vandelay::logging::Logger;
-use vandelay::sync::CommonConfig;
-use vandelay::sync::import_managesieve::{ManageSieveAuth, ManageSieveImportConfig, run};
+use vandelay::archive::sources::SourceChange;
+use vandelay::import::managesieve::{ManageSieveImport, SaslAuth};
+use vandelay::logging::{Level, Logger};
+use vandelay::net::http::TlsPolicy;
+use vandelay::net::stream::Cleartext;
+use vandelay::sync::{RunMode, RunOptions};
+use vandelay::types::ObjectType;
 
-type Script = Box<dyn FnOnce(&mut MockConn) -> std::io::Result<()> + Send + 'static>;
+struct MockSieveServer(LineServer);
 
-struct MockSieveServer {
-    addr: String,
-    _thread: thread::JoinHandle<()>,
-}
+impl MockSieveServer {
+    fn start<H>(handler: H) -> MockSieveServer
+    where
+        H: FnOnce(&mut MockConn) -> std::io::Result<()> + Send + 'static,
+    {
+        Self::start_scripts(vec![Box::new(handler)])
+    }
 
-struct MockConn {
-    reader: BufReader<TcpStream>,
-    writer: TcpStream,
+    fn start_scripts(scripts: Vec<Script>) -> MockSieveServer {
+        MockSieveServer(LineServer::start(scripts, "BYE \"no script left\""))
+    }
+
+    fn url(&self) -> String {
+        self.0.url("sieve")
+    }
 }
 
 impl MockConn {
-    fn write_line(&mut self, s: &str) -> std::io::Result<()> {
-        self.writer.write_all(s.as_bytes())?;
-        self.writer.write_all(b"\r\n")?;
-        self.writer.flush()
-    }
-
-    fn write_raw(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.writer.write_all(bytes)?;
-        self.writer.flush()
-    }
-
-    fn read_line(&mut self) -> std::io::Result<String> {
-        let mut line = String::new();
-        let n = self.reader.read_line(&mut line)?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "client closed",
-            ));
-        }
-        Ok(line.trim_end_matches(['\r', '\n']).to_owned())
-    }
-
     fn write_capability(&mut self, sasl: &str, starttls: bool) -> std::io::Result<()> {
         self.write_line("\"IMPLEMENTATION\" \"Mock ManageSieve\"")?;
         self.write_line("\"VERSION\" \"1.0\"")?;
@@ -65,93 +50,28 @@ impl MockConn {
     }
 }
 
-impl MockSieveServer {
-    fn start<H>(handler: H) -> MockSieveServer
-    where
-        H: FnOnce(&mut MockConn) -> std::io::Result<()> + Send + 'static,
-    {
-        Self::start_scripts(vec![Box::new(handler)])
-    }
-
-    fn start_scripts(scripts: Vec<Script>) -> MockSieveServer {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("local_addr").port();
-        let addr = format!("127.0.0.1:{port}");
-        let queue: Mutex<Vec<Script>> = Mutex::new(scripts.into_iter().rev().collect());
-        let queue = std::sync::Arc::new(queue);
-        let thread = thread::spawn(move || {
-            for stream in listener.incoming() {
-                let stream = match stream {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-                let writer = stream.try_clone().expect("clone");
-                let reader = BufReader::new(stream);
-                let mut conn = MockConn { reader, writer };
-                let script = queue.lock().expect("queue").pop();
-                if let Some(script) = script {
-                    thread::spawn(move || {
-                        let _ = script(&mut conn);
-                    });
-                } else {
-                    let _ = conn.write_line("BYE \"no script left\"");
-                }
-            }
-        });
-        MockSieveServer {
-            addr,
-            _thread: thread,
-        }
-    }
-
-    fn url(&self) -> String {
-        format!("sieve://{}", self.addr)
-    }
-}
-
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-fn tempfile(label: &str) -> PathBuf {
-    let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "vandelay_mock_managesieve_{label}_{counter}.sqlite"
-    ));
-    if p.exists() {
-        let _ = std::fs::remove_file(&p);
-    }
-    p
-}
-
-fn count(conn: &Connection, table: &str) -> i64 {
-    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-        .unwrap_or(0)
-}
-
 fn run_basic(
     server: &MockSieveServer,
     archive: &Path,
 ) -> Result<vandelay::sync::Summary, vandelay::error::Error> {
-    let common = CommonConfig {
+    let common = RunOptions {
         archive: archive.to_path_buf(),
         threads: 1,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 1,
-        allow_invalid_certs: false,
-        logger: Logger::from_flags(true, 0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let config = ManageSieveImportConfig {
+    let config = ManageSieveImport {
         url: server.url(),
-        auth: ManageSieveAuth::Basic {
+        auth: SaslAuth::Basic {
             user: "alice".to_owned(),
             password: "p@ss".to_owned(),
         },
-        allow_cleartext: true,
-        allow_source_change: false,
+        cleartext: Cleartext::Allow,
+        source_change: SourceChange::Reject,
     };
-    run(common, config)
+    config.run(common).into_result()
 }
 
 #[test]
@@ -177,7 +97,7 @@ fn capability_after_auth_is_consumed_when_present() {
         conn.write_line("OK \"bye\"")?;
         Ok(())
     });
-    let archive = tempfile("caps_after_auth");
+    let archive = common::tmp_archive("caps_after_auth");
     let summary = run_basic(&server, &archive).expect("import");
     assert!(!summary.any_failed());
     let _ = std::fs::remove_file(&archive);
@@ -201,7 +121,7 @@ fn sasl_plain_succeeds_when_advertised() {
         conn.write_line("OK \"bye\"")?;
         Ok(())
     });
-    let archive = tempfile("plain");
+    let archive = common::tmp_archive("plain");
     let summary = run_basic(&server, &archive).expect("import");
     assert!(!summary.any_failed());
     let _ = std::fs::remove_file(&archive);
@@ -238,7 +158,7 @@ fn sasl_login_fallback_when_plain_rejected() {
         conn.write_line("OK \"bye\"")?;
         Ok(())
     });
-    let archive = tempfile("login_fallback");
+    let archive = common::tmp_archive("login_fallback");
     let summary = run_basic(&server, &archive).expect("import");
     assert!(!summary.any_failed());
     let _ = std::fs::remove_file(&archive);
@@ -253,7 +173,7 @@ fn auth_no_translates_to_connection_error() {
         conn.write_line("NO \"bad creds\"")?;
         Ok(())
     });
-    let archive = tempfile("auth_fail");
+    let archive = common::tmp_archive("auth_fail");
     let err = run_basic(&server, &archive).unwrap_err();
     match err {
         vandelay::error::Error::Connection(msg) => assert!(
@@ -272,7 +192,7 @@ fn server_lacking_plain_login_for_basic_is_refused() {
         conn.write_line("OK")?;
         Ok(())
     });
-    let archive = tempfile("no_basic_mech");
+    let archive = common::tmp_archive("no_basic_mech");
     let err = run_basic(&server, &archive).unwrap_err();
     assert!(matches!(err, vandelay::error::Error::Connection(_)));
     let _ = std::fs::remove_file(&archive);
@@ -305,11 +225,36 @@ fn empty_listscripts_imports_zero_rows() {
             Ok(())
         })
     });
-    let archive = tempfile("empty_list");
+    let archive = common::tmp_archive("empty_list");
     let summary = run_basic(&server, &archive).expect("import");
     assert!(!summary.any_failed());
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "sieve_scripts"), 0);
+    assert_eq!(common::count(&conn, "sieve_scripts"), 0);
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn malformed_listscripts_line_is_a_listscripts_parse_error() {
+    // a LISTSCRIPTS data line without a script name aborts with the parse text
+    let server = MockSieveServer::start(|conn| {
+        auth_then(conn, |c| {
+            let _ = c.read_line()?;
+            c.write_line("(\"x\")")?;
+            c.write_line("OK")?;
+            Ok(())
+        })
+    });
+    let archive = common::tmp_archive("listscripts_parse");
+    let err = run_basic(&server, &archive).unwrap_err();
+    match err {
+        vandelay::error::Error::Connection(msg) => assert!(
+            msg.starts_with(
+                "LISTSCRIPTS parse: response parse error: LISTSCRIPTS line missing name"
+            ),
+            "got {msg}"
+        ),
+        other => panic!("expected Connection, got {other:?}"),
+    }
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -338,11 +283,11 @@ fn listscripts_with_one_active_imports_with_active_flag() {
             Ok(())
         })
     });
-    let archive = tempfile("active");
+    let archive = common::tmp_archive("active");
     let summary = run_basic(&server, &archive).expect("import");
     assert!(!summary.any_failed(), "{summary:?}");
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "sieve_scripts"), 2);
+    assert_eq!(common::count(&conn, "sieve_scripts"), 2);
     let active_name: String = conn
         .query_row(
             "SELECT name FROM sieve_scripts WHERE is_active = 1",
@@ -367,7 +312,7 @@ fn getscript_quoted_body_is_imported_verbatim() {
             Ok(())
         })
     });
-    let archive = tempfile("quoted_body");
+    let archive = common::tmp_archive("quoted_body");
     let summary = run_basic(&server, &archive).expect("import");
     assert!(!summary.any_failed());
     let conn = Connection::open(&archive).unwrap();
@@ -400,11 +345,63 @@ fn getscript_nonexistent_is_skipped_and_counted() {
             Ok(())
         })
     });
-    let archive = tempfile("nonexistent");
+    let archive = common::tmp_archive("nonexistent");
     let summary = run_basic(&server, &archive).expect("import");
     assert!(summary.any_failed(), "expected at least one failure");
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "sieve_scripts"), 1);
+    assert_eq!(common::count(&conn, "sieve_scripts"), 1);
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn abort_after_a_skipped_script_keeps_the_counts() {
+    // R15: a referral after one counted failure aborts, and the outcome still carries the count.
+    let server = MockSieveServer::start(|conn| {
+        auth_then(conn, |c| {
+            let _ = c.read_line()?;
+            c.write_line("\"missing\"")?;
+            c.write_line("\"moved\"")?;
+            c.write_line("OK")?;
+
+            let _ = c.read_line()?;
+            c.write_line("NO (NONEXISTENT) \"vanished\"")?;
+
+            let _ = c.read_line()?;
+            c.write_line("NO (REFERRAL \"sieve://other.example/\") \"go\"")?;
+            Ok(())
+        })
+    });
+    let archive = common::tmp_archive("abort_counts");
+    let options = RunOptions {
+        archive: archive.clone(),
+        threads: 1,
+        mode: RunMode::Apply,
+        max_retries: 1,
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
+    };
+    let outcome = ManageSieveImport {
+        url: server.url(),
+        auth: SaslAuth::Basic {
+            user: "alice".to_owned(),
+            password: "p@ss".to_owned(),
+        },
+        cleartext: Cleartext::Allow,
+        source_change: SourceChange::Reject,
+    }
+    .run(options);
+    assert!(
+        matches!(&outcome.error, Some(vandelay::error::Error::Connection(msg)) if msg.contains("referral")),
+        "{:?}",
+        outcome.error
+    );
+    assert_eq!(
+        outcome
+            .summary
+            .get(ObjectType::SieveScript)
+            .map(|c| c.failed),
+        Some(1)
+    );
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -420,7 +417,7 @@ fn referral_aborts_run_with_connection_error() {
             Ok(())
         })
     });
-    let archive = tempfile("referral");
+    let archive = common::tmp_archive("referral");
     let err = run_basic(&server, &archive).unwrap_err();
     match err {
         vandelay::error::Error::Connection(msg) => assert!(msg.contains("referral"), "{msg}"),
@@ -431,7 +428,7 @@ fn referral_aborts_run_with_connection_error() {
 
 fn seed_then_run(seed: Script, second: Script) -> (MockSieveServer, PathBuf) {
     let server = MockSieveServer::start_scripts(vec![seed, second]);
-    let archive = tempfile("multi");
+    let archive = common::tmp_archive("multi");
     (server, archive)
 }
 
@@ -527,7 +524,7 @@ fn vanished_script_is_deleted_locally() {
     let (_, c) = &summary.per_type[0];
     assert_eq!(c.deleted, 1, "vanished script should be counted deleted");
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "sieve_scripts"), 0);
+    assert_eq!(common::count(&conn, "sieve_scripts"), 0);
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -650,7 +647,7 @@ fn second_run_is_convergent() {
 
 #[test]
 fn transient_no_on_getscript_retries_then_succeeds() {
-    let archive = tempfile("transient");
+    let archive = common::tmp_archive("transient");
     let server = MockSieveServer::start(|conn| {
         auth_then(conn, |c| {
             let _ = c.read_line()?;
@@ -666,27 +663,27 @@ fn transient_no_on_getscript_retries_then_succeeds() {
             Ok(())
         })
     });
-    let common = CommonConfig {
+    let common = RunOptions {
         archive: archive.to_path_buf(),
         threads: 1,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 3,
-        allow_invalid_certs: false,
-        logger: Logger::from_flags(true, 0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let config = ManageSieveImportConfig {
+    let config = ManageSieveImport {
         url: server.url(),
-        auth: ManageSieveAuth::Basic {
+        auth: SaslAuth::Basic {
             user: "alice".to_owned(),
             password: "p@ss".to_owned(),
         },
-        allow_cleartext: true,
-        allow_source_change: false,
+        cleartext: Cleartext::Allow,
+        source_change: SourceChange::Reject,
     };
-    let summary = run(common, config).expect("import");
+    let summary = config.run(common).into_result().expect("import");
     assert!(!summary.any_failed());
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "sieve_scripts"), 1);
+    assert_eq!(common::count(&conn, "sieve_scripts"), 1);
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -719,28 +716,28 @@ fn bye_mid_listscripts_reconnects_and_succeeds() {
         Ok(())
     });
     let server = MockSieveServer::start_scripts(vec![first, second]);
-    let archive = tempfile("bye_listscripts");
-    let common = CommonConfig {
+    let archive = common::tmp_archive("bye_listscripts");
+    let common = RunOptions {
         archive: archive.clone(),
         threads: 1,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 3,
-        allow_invalid_certs: false,
-        logger: Logger::from_flags(true, 0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let config = ManageSieveImportConfig {
+    let config = ManageSieveImport {
         url: server.url(),
-        auth: ManageSieveAuth::Basic {
+        auth: SaslAuth::Basic {
             user: "alice".to_owned(),
             password: "p@ss".to_owned(),
         },
-        allow_cleartext: true,
-        allow_source_change: false,
+        cleartext: Cleartext::Allow,
+        source_change: SourceChange::Reject,
     };
-    let summary = run(common, config).expect("import");
+    let summary = config.run(common).into_result().expect("import");
     assert!(!summary.any_failed(), "{summary:?}");
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "sieve_scripts"), 0);
+    assert_eq!(common::count(&conn, "sieve_scripts"), 0);
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -781,28 +778,28 @@ fn bye_mid_getscript_reconnects_and_completes_remaining_scripts() {
         Ok(())
     });
     let server = MockSieveServer::start_scripts(vec![first, second]);
-    let archive = tempfile("bye_getscript");
-    let common = CommonConfig {
+    let archive = common::tmp_archive("bye_getscript");
+    let common = RunOptions {
         archive: archive.clone(),
         threads: 1,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 3,
-        allow_invalid_certs: false,
-        logger: Logger::from_flags(true, 0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let config = ManageSieveImportConfig {
+    let config = ManageSieveImport {
         url: server.url(),
-        auth: ManageSieveAuth::Basic {
+        auth: SaslAuth::Basic {
             user: "alice".to_owned(),
             password: "p@ss".to_owned(),
         },
-        allow_cleartext: true,
-        allow_source_change: false,
+        cleartext: Cleartext::Allow,
+        source_change: SourceChange::Reject,
     };
-    let summary = run(common, config).expect("import");
+    let summary = config.run(common).into_result().expect("import");
     assert!(!summary.any_failed(), "{summary:?}");
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "sieve_scripts"), 2);
+    assert_eq!(common::count(&conn, "sieve_scripts"), 2);
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -824,7 +821,7 @@ fn post_auth_unsolicited_capability_is_consumed() {
         conn.write_line("OK \"bye\"")?;
         Ok(())
     });
-    let archive = tempfile("post_auth_caps");
+    let archive = common::tmp_archive("post_auth_caps");
     let summary = run_basic(&server, &archive).expect("import");
     assert!(!summary.any_failed());
     let _ = std::fs::remove_file(&archive);
@@ -843,29 +840,32 @@ fn dry_run_does_not_mutate_archive() {
             Ok(())
         })
     });
-    let archive = tempfile("dryrun");
-    let common = CommonConfig {
+    let archive = common::tmp_archive("dryrun");
+    let common = RunOptions {
         archive: archive.to_path_buf(),
         threads: 1,
-        dry_run: true,
+        mode: RunMode::DryRun,
         max_retries: 1,
-        allow_invalid_certs: false,
-        logger: Logger::from_flags(true, 0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let config = ManageSieveImportConfig {
+    let config = ManageSieveImport {
         url: server.url(),
-        auth: ManageSieveAuth::Basic {
+        auth: SaslAuth::Basic {
             user: "alice".to_owned(),
             password: "p@ss".to_owned(),
         },
-        allow_cleartext: true,
-        allow_source_change: false,
+        cleartext: Cleartext::Allow,
+        source_change: SourceChange::Reject,
     };
-    let summary = run(common, config).expect("dryrun");
-    let (_, c) = &summary.per_type[0];
-    assert_eq!(c.created, 1);
+    let mut summary = config.run(common).into_result().expect("dryrun");
+    assert_eq!(summary.plan(ObjectType::SieveScript).new, 1);
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "sieve_scripts"), 0, "dry-run must not write");
+    assert_eq!(
+        common::count(&conn, "sieve_scripts"),
+        0,
+        "dry-run must not write"
+    );
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -890,25 +890,25 @@ fn oauthbearer_authenticates_end_to_end_when_advertised() {
         conn.write_line("OK \"bye\"")?;
         Ok(())
     });
-    let archive = tempfile("oauthbearer");
-    let common = CommonConfig {
+    let archive = common::tmp_archive("oauthbearer");
+    let common = RunOptions {
         archive: archive.to_path_buf(),
         threads: 1,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 1,
-        allow_invalid_certs: false,
-        logger: Logger::from_flags(true, 0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let config = ManageSieveImportConfig {
+    let config = ManageSieveImport {
         url: server.url(),
-        auth: ManageSieveAuth::Bearer {
+        auth: SaslAuth::Bearer {
             user: "alice@example.com".to_owned(),
             token: "tok-xyz".to_owned(),
         },
-        allow_cleartext: true,
-        allow_source_change: false,
+        cleartext: Cleartext::Allow,
+        source_change: SourceChange::Reject,
     };
-    let summary = run(common, config).expect("import");
+    let summary = config.run(common).into_result().expect("import");
     assert!(!summary.any_failed(), "{summary:?}");
     let _ = std::fs::remove_file(&archive);
 }
@@ -932,7 +932,7 @@ fn plain_then_login_both_refused_aborts_run_with_combined_message() {
         conn.write_line("NO \"login refused too\"")?;
         Ok(())
     });
-    let archive = tempfile("plain_and_login_refused");
+    let archive = common::tmp_archive("plain_and_login_refused");
     let err = run_basic(&server, &archive).unwrap_err();
     match err {
         vandelay::error::Error::Connection(msg) => {
@@ -963,11 +963,11 @@ fn three_scripts_with_middle_active_lands_the_middle_active() {
             Ok(())
         })
     });
-    let archive = tempfile("middle_active");
+    let archive = common::tmp_archive("middle_active");
     let summary = run_basic(&server, &archive).expect("import");
     assert!(!summary.any_failed(), "{summary:?}");
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "sieve_scripts"), 3);
+    assert_eq!(common::count(&conn, "sieve_scripts"), 3);
     let active: String = conn
         .query_row(
             "SELECT name FROM sieve_scripts WHERE is_active = 1",
@@ -989,7 +989,7 @@ fn three_scripts_with_middle_active_lands_the_middle_active() {
 
 #[test]
 fn transient_no_exhausting_max_retries_skips_script_and_followup_picks_it_up() {
-    let archive = tempfile("retry_exhaustion");
+    let archive = common::tmp_archive("retry_exhaustion");
     let first = MockSieveServer::start(|conn| {
         auth_then(conn, |c| {
             let _ = c.read_line()?;
@@ -1003,24 +1003,27 @@ fn transient_no_exhausting_max_retries_skips_script_and_followup_picks_it_up() {
             Ok(())
         })
     });
-    let common = |archive: &Path| CommonConfig {
+    let common = |archive: &Path| RunOptions {
         archive: archive.to_path_buf(),
         threads: 1,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 2,
-        allow_invalid_certs: false,
-        logger: Logger::from_flags(true, 0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let cfg = |url: String| ManageSieveImportConfig {
+    let cfg = |url: String| ManageSieveImport {
         url,
-        auth: ManageSieveAuth::Basic {
+        auth: SaslAuth::Basic {
             user: "alice".to_owned(),
             password: "p@ss".to_owned(),
         },
-        allow_cleartext: true,
-        allow_source_change: false,
+        cleartext: Cleartext::Allow,
+        source_change: SourceChange::Reject,
     };
-    let summary = run(common(&archive), cfg(first.url())).expect("first run");
+    let summary = cfg(first.url())
+        .run(common(&archive))
+        .into_result()
+        .expect("first run");
     assert!(
         summary.any_failed(),
         "expected per-script failure to count toward exit 5: {summary:?}"
@@ -1029,7 +1032,7 @@ fn transient_no_exhausting_max_retries_skips_script_and_followup_picks_it_up() {
     assert_eq!(c.failed, 1, "exactly one failure recorded");
     let conn = Connection::open(&archive).unwrap();
     assert_eq!(
-        count(&conn, "sieve_scripts"),
+        common::count(&conn, "sieve_scripts"),
         0,
         "the script must NOT have landed locally"
     );
@@ -1047,12 +1050,15 @@ fn transient_no_exhausting_max_retries_skips_script_and_followup_picks_it_up() {
         })
     });
     let mut cfg2 = cfg(second.url());
-    cfg2.allow_source_change = true;
-    let summary2 = run(common(&archive), cfg2).expect("second run");
+    cfg2.source_change = SourceChange::Allow;
+    let summary2 = cfg2
+        .run(common(&archive))
+        .into_result()
+        .expect("second run");
     assert!(!summary2.any_failed(), "{summary2:?}");
     let (_, c2) = &summary2.per_type[0];
     assert_eq!(c2.created, 1);
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "sieve_scripts"), 1);
+    assert_eq!(common::count(&conn, "sieve_scripts"), 1);
     let _ = std::fs::remove_file(&archive);
 }

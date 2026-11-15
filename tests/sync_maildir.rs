@@ -6,6 +6,7 @@
 
 #![allow(dead_code, clippy::needless_borrows_for_generic_args)]
 
+mod common;
 mod integration;
 mod seeder;
 
@@ -19,46 +20,27 @@ use rusqlite::Connection;
 fn base_url() -> &'static str {
     shared_stalwart().base_url()
 }
+use vandelay::archive::sources::SourceChange;
+use vandelay::imap::automap::Automap;
+use vandelay::import::imap::DeletedMessages;
+use vandelay::import::jmap::JmapImport;
+use vandelay::import::maildir::MaildirImport;
 use vandelay::jmap::account::AccountSelector;
-use vandelay::jmap::http::Auth;
-use vandelay::logging::Logger;
-use vandelay::sync::import_maildir::{MaildirImportConfig, run as run_maildir};
-use vandelay::sync::{self, CommonConfig, ConnectConfig, ImportConfig};
+use vandelay::jmap::connect::ConnectConfig;
+use vandelay::logging::{Level, Logger};
+use vandelay::net::auth::Auth;
+use vandelay::net::http::TlsPolicy;
+use vandelay::sync::{RunMode, RunOptions};
 
-fn tmp_archive(tag: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "vandelay-sync-maildir-{tag}-{}-{}.sqlite",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_file(&p);
-    p
-}
-
-fn common(archive: &Path) -> CommonConfig {
-    CommonConfig {
-        archive: archive.to_path_buf(),
-        threads: 1,
-        dry_run: false,
-        max_retries: 1,
-        allow_invalid_certs: true,
-        logger: Logger::from_flags(true, 0),
-    }
-}
-
-fn base_cfg(root: &Path) -> MaildirImportConfig {
-    MaildirImportConfig {
+fn base_cfg(root: &Path) -> MaildirImport {
+    MaildirImport {
         maildir: root.to_path_buf(),
         include: Vec::new(),
         exclude: Vec::new(),
         folder: Vec::new(),
-        automap: true,
-        include_deleted: false,
-        allow_source_change: false,
+        automap: Automap::Enabled,
+        deleted: DeletedMessages::Skip,
+        source_change: SourceChange::Reject,
     }
 }
 
@@ -136,11 +118,6 @@ fn build_fixture(root: &Path) {
     );
 }
 
-fn count(conn: &Connection, table: &str) -> i64 {
-    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
-        .unwrap()
-}
-
 fn snapshot_hashes_by_folder(conn: &Connection) -> BTreeMap<String, BTreeMap<String, String>> {
     let mut stmt = conn
         .prepare(
@@ -180,15 +157,21 @@ fn hex(bytes: &[u8]) -> String {
 fn second_run_with_no_changes_creates_nothing_and_deletes_nothing() {
     let td = tempfile::TempDir::new().unwrap();
     build_fixture(td.path());
-    let archive = tmp_archive("idempotent");
-    let first = run_maildir(common(&archive), base_cfg(td.path())).expect("first");
+    let archive = common::tmp_archive("idempotent");
+    let first = base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("first");
     assert!(!first.any_failed());
     let (_, mbox_first) = &first.per_type[0];
     let (_, email_first) = &first.per_type[1];
     assert!(mbox_first.created >= 4);
     assert_eq!(email_first.created, 6);
 
-    let second = run_maildir(common(&archive), base_cfg(td.path())).expect("second");
+    let second = base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("second");
     let (_, mbox_second) = &second.per_type[0];
     let (_, email_second) = &second.per_type[1];
     assert_eq!(mbox_second.created, 0);
@@ -211,8 +194,11 @@ fn flag_change_between_runs_updates_keywords_only() {
         "1.M0.host:2,",
         &msg("flag-1", "subj", "body"),
     );
-    let archive = tmp_archive("flag-update");
-    run_maildir(common(&archive), base_cfg(td.path())).expect("first");
+    let archive = common::tmp_archive("flag-update");
+    base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("first");
     let conn = Connection::open(&archive).unwrap();
     let email_id: i64 = conn
         .query_row("SELECT id FROM emails LIMIT 1", [], |r| r.get(0))
@@ -236,7 +222,10 @@ fn flag_change_between_runs_updates_keywords_only() {
 
     fs::rename(&path, path.with_file_name("1.M0.host:2,S")).unwrap();
 
-    let summary = run_maildir(common(&archive), base_cfg(td.path())).expect("second");
+    let summary = base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("second");
     let (_, email_counts) = &summary.per_type[1];
     assert_eq!(email_counts.created, 0);
     assert_eq!(email_counts.deleted, 0);
@@ -278,23 +267,29 @@ fn delete_on_disk_removes_email_row_and_orphan_blob() {
         "2.M0.host:2,",
         &msg("del-2", "subj-2", "body-2"),
     );
-    let archive = tmp_archive("delete");
-    run_maildir(common(&archive), base_cfg(td.path())).expect("first");
+    let archive = common::tmp_archive("delete");
+    base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("first");
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "emails"), 2);
-    assert_eq!(count(&conn, "blobs"), 2);
+    assert_eq!(common::count(&conn, "emails"), 2);
+    assert_eq!(common::count(&conn, "blobs"), 2);
     drop(conn);
 
     fs::remove_file(&p1).unwrap();
-    let summary = run_maildir(common(&archive), base_cfg(td.path())).expect("second");
+    let summary = base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("second");
     let (_, email_counts) = &summary.per_type[1];
     assert_eq!(email_counts.deleted, 1);
     assert_eq!(email_counts.created, 0);
 
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "emails"), 1);
+    assert_eq!(common::count(&conn, "emails"), 1);
 
-    assert_eq!(count(&conn, "blobs"), 1);
+    assert_eq!(common::count(&conn, "blobs"), 1);
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -303,11 +298,17 @@ fn add_on_disk_inserts_one_new_email_only() {
     let td = tempfile::TempDir::new().unwrap();
     ensure_maildir(td.path());
     write(td.path(), "cur", "1.M0.host:2,", &msg("a-1", "1", "body"));
-    let archive = tmp_archive("add");
-    run_maildir(common(&archive), base_cfg(td.path())).expect("first");
+    let archive = common::tmp_archive("add");
+    base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("first");
 
     write(td.path(), "cur", "2.M0.host:2,", &msg("a-2", "2", "body2"));
-    let summary = run_maildir(common(&archive), base_cfg(td.path())).expect("second");
+    let summary = base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("second");
     let (_, email_counts) = &summary.per_type[1];
     assert_eq!(email_counts.created, 1);
     assert_eq!(email_counts.deleted, 0);
@@ -321,8 +322,11 @@ fn folder_delete_vanishes_emails_leaf_first() {
     ensure_subfolder(td.path(), ".Archive");
     let arch25 = ensure_subfolder(td.path(), ".Archive.2025");
     write(&arch25, "cur", "1.M0.host:2,", &msg("d-1", "del-1", "del"));
-    let archive = tmp_archive("folder-delete");
-    run_maildir(common(&archive), base_cfg(td.path())).expect("first");
+    let archive = common::tmp_archive("folder-delete");
+    base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("first");
 
     let conn = Connection::open(&archive).unwrap();
     assert!(
@@ -333,7 +337,10 @@ fn folder_delete_vanishes_emails_leaf_first() {
     drop(conn);
 
     fs::remove_dir_all(td.path().join(".Archive.2025")).unwrap();
-    let summary = run_maildir(common(&archive), base_cfg(td.path())).expect("second");
+    let summary = base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("second");
     let (_, mbox_counts) = &summary.per_type[0];
     let (_, email_counts) = &summary.per_type[1];
     assert_eq!(mbox_counts.deleted, 1);
@@ -366,11 +373,17 @@ fn folder_rename_vanishes_old_and_inserts_new() {
         "1.M0.host:2,",
         &msg("r-1", "to-rename", "body"),
     );
-    let archive = tmp_archive("folder-rename");
-    run_maildir(common(&archive), base_cfg(td.path())).expect("first");
+    let archive = common::tmp_archive("folder-rename");
+    base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("first");
 
     fs::rename(td.path().join(".Old"), td.path().join(".New")).unwrap();
-    let summary = run_maildir(common(&archive), base_cfg(td.path())).expect("second");
+    let summary = base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("second");
     let (_, mbox_counts) = &summary.per_type[0];
     let (_, email_counts) = &summary.per_type[1];
     assert_eq!(mbox_counts.deleted, 1);
@@ -379,7 +392,7 @@ fn folder_rename_vanishes_old_and_inserts_new() {
     assert_eq!(email_counts.deleted, 1);
     assert_eq!(email_counts.created, 1);
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "blobs"), 1, "blob retained via dedup");
+    assert_eq!(common::count(&conn, "blobs"), 1, "blob retained via dedup");
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -393,16 +406,19 @@ fn relative_path_resolves_to_same_canonical_source() {
     let _g = cwd_lock();
     let td = tempfile::TempDir::new().unwrap();
     build_fixture(td.path());
-    let archive = tmp_archive("canonical");
-    run_maildir(common(&archive), base_cfg(td.path())).expect("first import");
+    let archive = common::tmp_archive("canonical");
+    base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("first import");
 
     let parent = td.path().parent().unwrap();
     let dir_name = td.path().file_name().unwrap();
     let cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(parent).unwrap();
     let mut second = base_cfg(Path::new(dir_name));
-    second.allow_source_change = false;
-    let result = run_maildir(common(&archive), second);
+    second.source_change = SourceChange::Reject;
+    let result = second.run(common::live_options(&archive)).into_result();
     std::env::set_current_dir(cwd).unwrap();
     assert!(result.is_ok(), "{result:?}");
     let _ = std::fs::remove_file(&archive);
@@ -412,15 +428,18 @@ fn relative_path_resolves_to_same_canonical_source() {
 fn dry_run_then_real_run_produces_same_counts_for_new() {
     let td = tempfile::TempDir::new().unwrap();
     build_fixture(td.path());
-    let archive = tmp_archive("dry-then-real");
+    let archive = common::tmp_archive("dry-then-real");
 
-    let mut dry = common(&archive);
-    dry.dry_run = true;
-    let dry_summary = run_maildir(dry, base_cfg(td.path())).expect("dry");
-    let (_, dry_email) = &dry_summary.per_type[1];
-    let new_via_dry = dry_email.created;
+    let mut dry = common::live_options(&archive);
+    dry.mode = RunMode::DryRun;
+    let dry_summary = base_cfg(td.path()).run(dry).into_result().expect("dry");
+    let (_, dry_email) = &dry_summary.plan[1];
+    let new_via_dry = dry_email.new;
 
-    let real_summary = run_maildir(common(&archive), base_cfg(td.path())).expect("real run");
+    let real_summary = base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("real run");
     let (_, real_email) = &real_summary.per_type[1];
     assert_eq!(new_via_dry, real_email.created);
     let _ = std::fs::remove_file(&archive);
@@ -436,21 +455,27 @@ fn trashed_flag_added_between_runs_deletes_present_row() {
         "trash.M0.host:2,",
         &msg("t-1", "subj", "body"),
     );
-    let archive = tmp_archive("trash-on-present");
-    run_maildir(common(&archive), base_cfg(td.path())).expect("first");
+    let archive = common::tmp_archive("trash-on-present");
+    base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("first");
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "emails"), 1);
+    assert_eq!(common::count(&conn, "emails"), 1);
     drop(conn);
 
     fs::rename(&path, path.with_file_name("trash.M0.host:2,T")).unwrap();
-    let summary = run_maildir(common(&archive), base_cfg(td.path())).expect("second");
+    let summary = base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("second");
     let (_, email_counts) = &summary.per_type[1];
     assert_eq!(email_counts.deleted, 1, "T flag drops the present row");
     assert_eq!(email_counts.fetched, 0);
     assert_eq!(email_counts.created, 0);
 
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "emails"), 0);
+    assert_eq!(common::count(&conn, "emails"), 0);
 
     let _ = std::fs::remove_file(&archive);
 }
@@ -468,8 +493,11 @@ fn symlinked_subfolder_is_followed_and_appears_as_its_own_folder() {
         &msg("sym-1", "shared", "shared body"),
     );
     std::os::unix::fs::symlink(&real, td.path().join(".Shared")).unwrap();
-    let archive = tmp_archive("symlink");
-    let summary = run_maildir(common(&archive), base_cfg(td.path())).expect("import");
+    let archive = common::tmp_archive("symlink");
+    let summary = base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("import");
     assert!(!summary.any_failed(), "{summary:?}");
 
     let conn = Connection::open(&archive).unwrap();
@@ -488,8 +516,8 @@ fn symlinked_subfolder_is_followed_and_appears_as_its_own_folder() {
         "Shared (symlink) folder discovered"
     );
 
-    assert_eq!(count(&conn, "blobs"), 1);
-    assert_eq!(count(&conn, "emails"), 2);
+    assert_eq!(common::count(&conn, "blobs"), 1);
+    assert_eq!(common::count(&conn, "emails"), 2);
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -497,18 +525,27 @@ fn symlinked_subfolder_is_followed_and_appears_as_its_own_folder() {
 fn convergence_is_stable_across_three_runs() {
     let td = tempfile::TempDir::new().unwrap();
     build_fixture(td.path());
-    let archive = tmp_archive("triple-converge");
-    run_maildir(common(&archive), base_cfg(td.path())).expect("r1");
+    let archive = common::tmp_archive("triple-converge");
+    base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("r1");
     let snap1 = {
         let conn = Connection::open(&archive).unwrap();
         snapshot_hashes_by_folder(&conn)
     };
-    run_maildir(common(&archive), base_cfg(td.path())).expect("r2");
+    base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("r2");
     let snap2 = {
         let conn = Connection::open(&archive).unwrap();
         snapshot_hashes_by_folder(&conn)
     };
-    run_maildir(common(&archive), base_cfg(td.path())).expect("r3");
+    base_cfg(td.path())
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("r3");
     let snap3 = {
         let conn = Connection::open(&archive).unwrap();
         snapshot_hashes_by_folder(&conn)
@@ -536,12 +573,15 @@ fn maildir_and_jmap_imports_share_blob_bytes() {
     let td = tempfile::TempDir::new().unwrap();
     lay_seeder_mbox_as_maildir(td.path(), &corpus);
 
-    let md_archive = tmp_archive("parity-maildir");
-    let jmap_archive = tmp_archive("parity-jmap");
+    let md_archive = common::tmp_archive("parity-maildir");
+    let jmap_archive = common::tmp_archive("parity-jmap");
 
-    run_maildir(common(&md_archive), base_cfg(td.path())).expect("maildir import");
+    base_cfg(td.path())
+        .run(common::live_options(&md_archive))
+        .into_result()
+        .expect("maildir import");
 
-    let jmap_cfg = ImportConfig {
+    let jmap_cfg = JmapImport {
         connect: ConnectConfig {
             url: fx.base_url.clone(),
             auth: Auth::Basic {
@@ -550,21 +590,27 @@ fn maildir_and_jmap_imports_share_blob_bytes() {
             },
             account: AccountSelector::Id(acc.account_id.clone()),
         },
-        objects: Some(vec![
-            vandelay::types::ObjectType::Mailbox,
-            vandelay::types::ObjectType::Email,
-        ]),
-        allow_source_change: false,
+        objects: Some(
+            vec![
+                vandelay::types::ObjectType::Mailbox,
+                vandelay::types::ObjectType::Email,
+            ]
+            .into(),
+        ),
+        source_change: SourceChange::Reject,
     };
-    let jmap_common = CommonConfig {
+    let jmap_common = RunOptions {
         archive: jmap_archive.clone(),
         threads: 4,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 5,
-        allow_invalid_certs: true,
-        logger: Logger::from_flags(false, 0),
+        tls: TlsPolicy::AcceptInvalid,
+        logger: Logger::new(Level::Default),
     };
-    sync::import_jmap::run(jmap_common, jmap_cfg).expect("jmap import");
+    jmap_cfg
+        .run(jmap_common)
+        .into_result()
+        .expect("jmap import");
 
     let md_hashes = blob_hashes(&Connection::open(&md_archive).unwrap());
     let jmap_hashes = blob_hashes(&Connection::open(&jmap_archive).unwrap());
@@ -606,18 +652,21 @@ fn maildir_message_count_matches_jmap_for_same_corpus() {
     let td = tempfile::TempDir::new().unwrap();
     lay_seeder_mbox_as_maildir(td.path(), &corpus);
 
-    let md_archive = tmp_archive("count-maildir");
-    run_maildir(common(&md_archive), base_cfg(td.path())).expect("maildir import");
+    let md_archive = common::tmp_archive("count-maildir");
+    base_cfg(td.path())
+        .run(common::live_options(&md_archive))
+        .into_result()
+        .expect("maildir import");
     let md_conn = Connection::open(&md_archive).unwrap();
-    let md_count = count(&md_conn, "emails");
+    let md_count = common::count(&md_conn, "emails");
     assert_eq!(
         md_count as usize,
         corpus.len(),
         "all corpus messages imported"
     );
 
-    let jmap_archive = tmp_archive("count-jmap");
-    let jmap_cfg = ImportConfig {
+    let jmap_archive = common::tmp_archive("count-jmap");
+    let jmap_cfg = JmapImport {
         connect: ConnectConfig {
             url: fx.base_url.clone(),
             auth: Auth::Basic {
@@ -626,21 +675,27 @@ fn maildir_message_count_matches_jmap_for_same_corpus() {
             },
             account: AccountSelector::Id(acc.account_id.clone()),
         },
-        objects: Some(vec![
-            vandelay::types::ObjectType::Mailbox,
-            vandelay::types::ObjectType::Email,
-        ]),
-        allow_source_change: false,
+        objects: Some(
+            vec![
+                vandelay::types::ObjectType::Mailbox,
+                vandelay::types::ObjectType::Email,
+            ]
+            .into(),
+        ),
+        source_change: SourceChange::Reject,
     };
-    let jmap_common = CommonConfig {
+    let jmap_common = RunOptions {
         archive: jmap_archive.clone(),
         threads: 4,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 5,
-        allow_invalid_certs: true,
-        logger: Logger::from_flags(false, 0),
+        tls: TlsPolicy::AcceptInvalid,
+        logger: Logger::new(Level::Default),
     };
-    sync::import_jmap::run(jmap_common, jmap_cfg).expect("jmap import");
+    jmap_cfg
+        .run(jmap_common)
+        .into_result()
+        .expect("jmap import");
 
     let _ = std::fs::remove_file(&md_archive);
     let _ = std::fs::remove_file(&jmap_archive);

@@ -4,13 +4,17 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+use std::fmt;
+
 use indexmap::IndexMap;
 use serde::Deserialize;
 use serde_json::Value;
+use url::Url;
 
 use crate::error::Error;
 use crate::jmap::error::JmapError;
-use crate::jmap::http::HttpClient;
+use crate::jmap::http::JmapClient;
+use crate::net::encode::{Percent, SafeSet};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,83 +46,84 @@ pub struct Limits {
     pub max_size_upload: u64,
 }
 
-fn parse_session(body: &str) -> Option<Session> {
-    let value: Value = serde_json::from_str(body).ok()?;
-    let has_shape = value.get("apiUrl").is_some()
-        && value.get("accounts").is_some()
-        && value.get("capabilities").is_some();
-    if !has_shape {
-        return None;
-    }
-    serde_json::from_value(value).ok()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    Api,
+    Upload,
 }
 
-fn well_known_url(base: &str) -> String {
-    let trimmed = base.trim_end_matches('/');
-    format!("{trimmed}/.well-known/jmap")
+impl Limits {
+    pub fn workers(&self, requested: usize, lane: Lane) -> usize {
+        let server_cap = match lane {
+            Lane::Api => self.max_concurrent_requests,
+            Lane::Upload => self.max_concurrent_upload,
+        };
+        requested.clamp(1, usize::try_from(server_cap.max(1)).unwrap_or(usize::MAX))
+    }
 }
 
-fn scheme_end(url: &str) -> Option<usize> {
-    let bytes = url.as_bytes();
-    if !bytes.first()?.is_ascii_alphabetic() {
-        return None;
+#[derive(Debug, Clone, Copy)]
+pub struct SessionUrl<'a>(pub &'a str);
+
+impl<'a> SessionUrl<'a> {
+    fn split_scheme(self) -> Option<(&'a str, &'a str)> {
+        let (scheme, rest) = self.0.split_once(':')?;
+        let (first, tail) = scheme.as_bytes().split_first()?;
+        (first.is_ascii_alphabetic()
+            && tail
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')))
+        .then_some((scheme, rest))
     }
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        if byte == b':' {
-            return Some(index);
+
+    pub fn resolve(self, reference: &str) -> String {
+        let base = self.0;
+        if reference.is_empty() {
+            return base.to_owned();
         }
-        if !(byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')) {
-            return None;
+        if SessionUrl(reference).split_scheme().is_some() {
+            return reference.to_owned();
         }
-    }
-    None
-}
-
-pub fn resolve_reference(base: &str, reference: &str) -> String {
-    if reference.is_empty() {
-        return base.to_owned();
-    }
-    if scheme_end(reference).is_some() {
-        return reference.to_owned();
-    }
-    let Some(base_scheme_end) = scheme_end(base) else {
-        return reference.to_owned();
-    };
-    let scheme = &base[..=base_scheme_end];
-    let Some(authority_and_path) = base[base_scheme_end + 1..].strip_prefix("//") else {
-        return reference.to_owned();
-    };
-    let mut out = String::with_capacity(scheme.len() + 2 + base.len() + reference.len());
-    out.push_str(scheme);
-    out.push_str("//");
-    if let Some(rest) = reference.strip_prefix("//") {
-        out.push_str(rest);
-        return out;
-    }
-    let authority_len = authority_and_path
-        .find(['/', '?', '#'])
-        .unwrap_or(authority_and_path.len());
-    out.push_str(&authority_and_path[..authority_len]);
-    if reference.starts_with('/') {
+        let Some((scheme, after_scheme)) = self.split_scheme() else {
+            return reference.to_owned();
+        };
+        let Some(authority_and_path) = after_scheme.strip_prefix("//") else {
+            return reference.to_owned();
+        };
+        let mut out = String::with_capacity(scheme.len() + 3 + base.len() + reference.len());
+        out.push_str(scheme);
+        out.push_str("://");
+        if let Some(rest) = reference.strip_prefix("//") {
+            out.push_str(rest);
+            return out;
+        }
+        let authority = authority_and_path
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default();
+        out.push_str(authority);
+        if reference.starts_with('/') {
+            out.push_str(reference);
+            return out;
+        }
+        let path = authority_and_path
+            .strip_prefix(authority)
+            .unwrap_or_default()
+            .split(['?', '#'])
+            .next()
+            .unwrap_or_default();
+        if let Some((dir, _)) = path.rsplit_once('/') {
+            out.push_str(dir);
+        }
+        out.push('/');
         out.push_str(reference);
-        return out;
+        out
     }
-    let path = &authority_and_path[authority_len..];
-    let path = path.split(['?', '#']).next().unwrap_or("");
-    match path.rfind('/') {
-        Some(last) => out.push_str(&path[..=last]),
-        None => out.push('/'),
-    }
-    out.push_str(reference);
-    out
-}
 
-pub fn origin_of(url: &str) -> Option<String> {
-    let origin = url::Url::parse(url).ok()?.origin();
-    if !origin.is_tuple() {
-        return None;
+    pub fn origin(self) -> Option<String> {
+        let origin = Url::parse(self.0).ok()?.origin();
+        origin.is_tuple().then(|| origin.ascii_serialization())
     }
-    Some(origin.ascii_serialization())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,8 +133,8 @@ pub struct OriginMismatch {
     pub connect_origin: String,
 }
 
-impl std::fmt::Display for OriginMismatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for OriginMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("session advertises ")?;
         for (index, field) in self.fields.iter().enumerate() {
             if index > 0 {
@@ -147,20 +152,36 @@ impl std::fmt::Display for OriginMismatch {
 }
 
 impl Session {
-    pub fn discover(client: &HttpClient, url: &str) -> Result<Session, JmapError> {
+    fn parse(body: &str) -> Option<Session> {
+        let value: Value = serde_json::from_str(body).ok()?;
+        let has_shape = value.get("apiUrl").is_some()
+            && value.get("accounts").is_some()
+            && value.get("capabilities").is_some();
+        if !has_shape {
+            return None;
+        }
+        serde_json::from_value(value).ok()
+    }
+
+    fn well_known_url(base: &str) -> String {
+        let trimmed = base.trim_end_matches('/');
+        format!("{trimmed}/.well-known/jmap")
+    }
+
+    pub fn discover(client: &JmapClient, url: &str) -> Result<Session, JmapError> {
         match client.get(url) {
             Ok(direct) => {
-                if let Some(session) = parse_session(&direct) {
+                if let Some(session) = Session::parse(&direct) {
                     return session.rebased_on(url).ensure_authenticated();
                 }
             }
             Err(JmapError::Auth(m)) => return Err(JmapError::Auth(m)),
             Err(_) => {}
         }
-        let well_known = well_known_url(url);
+        let well_known = Session::well_known_url(url);
         match client.get(&well_known) {
             Ok(body) => {
-                if let Some(session) = parse_session(&body) {
+                if let Some(session) = Session::parse(&body) {
                     return session.rebased_on(&well_known).ensure_authenticated();
                 }
                 Err(JmapError::Connect(format!(
@@ -175,14 +196,14 @@ impl Session {
     }
 
     fn rebased_on(mut self, session_resource_url: &str) -> Session {
-        self.api_url = resolve_reference(session_resource_url, &self.api_url);
-        self.upload_url = resolve_reference(session_resource_url, &self.upload_url);
-        self.download_url = resolve_reference(session_resource_url, &self.download_url);
+        self.api_url = SessionUrl(session_resource_url).resolve(&self.api_url);
+        self.upload_url = SessionUrl(session_resource_url).resolve(&self.upload_url);
+        self.download_url = SessionUrl(session_resource_url).resolve(&self.download_url);
         self
     }
 
     pub fn origin_mismatches(&self, connect_url: &str) -> Vec<OriginMismatch> {
-        let Some(connect_origin) = origin_of(connect_url) else {
+        let Some(connect_origin) = SessionUrl(connect_url).origin() else {
             return Vec::new();
         };
         let mut mismatches: Vec<OriginMismatch> = Vec::new();
@@ -191,7 +212,7 @@ impl Session {
             ("uploadUrl", &self.upload_url),
             ("downloadUrl", &self.download_url),
         ] {
-            let Some(session_origin) = origin_of(value) else {
+            let Some(session_origin) = SessionUrl(value).origin() else {
                 continue;
             };
             if session_origin == connect_origin {
@@ -257,8 +278,10 @@ impl Session {
     }
 
     pub fn upload_url_for(&self, account_id: &str) -> String {
-        self.upload_url
-            .replace("{accountId}", &encode_segment(account_id))
+        self.upload_url.replace(
+            "{accountId}",
+            &Percent::encode(account_id, SafeSet::Unreserved),
+        )
     }
 
     pub fn download_url_for(
@@ -269,33 +292,36 @@ impl Session {
         name: &str,
     ) -> String {
         self.download_url
-            .replace("{accountId}", &encode_segment(account_id))
-            .replace("{blobId}", &encode_segment(blob_id))
-            .replace("{type}", &encode_segment(type_hint))
-            .replace("{name}", &encode_segment(name))
+            .replace(
+                "{accountId}",
+                &Percent::encode(account_id, SafeSet::Unreserved),
+            )
+            .replace("{blobId}", &Percent::encode(blob_id, SafeSet::Unreserved))
+            .replace("{type}", &Percent::encode(type_hint, SafeSet::Unreserved))
+            .replace("{name}", &Percent::encode(name, SafeSet::Unreserved))
     }
-}
-
-fn encode_segment(input: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(input.len());
-    for byte in input.as_bytes() {
-        let b = *byte;
-        let unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
-        if unreserved {
-            out.push(b as char);
-        } else {
-            out.push('%');
-            out.push(HEX[(b >> 4) as usize] as char);
-            out.push(HEX[(b & 0x0F) as usize] as char);
-        }
-    }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_count_is_clamped_to_server_limits() {
+        let l = Limits {
+            max_objects_in_get: 500,
+            max_objects_in_set: 500,
+            max_calls_in_request: 16,
+            max_concurrent_requests: 4,
+            max_concurrent_upload: 2,
+            max_size_request: 10_000_000,
+            max_size_upload: 50_000_000,
+        };
+        assert_eq!(l.workers(16, Lane::Api), 4);
+        assert_eq!(l.workers(16, Lane::Upload), 2);
+        assert_eq!(l.workers(1, Lane::Api), 1);
+        assert_eq!(l.workers(0, Lane::Api), 1);
+    }
 
     fn raw_session() -> &'static str {
         r#"{
@@ -324,7 +350,7 @@ mod tests {
 
     #[test]
     fn parses_a_session_and_reads_limits() {
-        let session = parse_session(raw_session()).unwrap();
+        let session = Session::parse(raw_session()).unwrap();
         let limits = session.core_limits().unwrap();
         assert_eq!(limits.max_objects_in_get, 500);
         assert_eq!(limits.max_size_upload, 50000000);
@@ -333,7 +359,7 @@ mod tests {
 
     #[test]
     fn capability_gate_reads_account_capabilities() {
-        let session = parse_session(raw_session()).unwrap();
+        let session = Session::parse(raw_session()).unwrap();
         assert!(session.supports("w", "urn:ietf:params:jmap:mail"));
         assert!(!session.supports("w", "urn:ietf:params:jmap:filenode"));
         assert!(!session.supports("missing", "urn:ietf:params:jmap:mail"));
@@ -342,7 +368,7 @@ mod tests {
     // Listed accounts use their own capabilities; unlisted ones fall back to the session's.
     #[test]
     fn may_support_falls_back_to_session_capabilities_for_unlisted_account() {
-        let session = parse_session(raw_session()).unwrap();
+        let session = Session::parse(raw_session()).unwrap();
         assert!(session.may_support("w", "urn:ietf:params:jmap:mail"));
         assert!(!session.may_support("w", "urn:ietf:params:jmap:core"));
         assert!(session.may_support("missing", "urn:ietf:params:jmap:core"));
@@ -351,7 +377,7 @@ mod tests {
 
     #[test]
     fn templates_upload_and_download_urls_with_encoding() {
-        let session = parse_session(raw_session()).unwrap();
+        let session = Session::parse(raw_session()).unwrap();
         assert_eq!(
             session.upload_url_for("a c"),
             "https://example.org/jmap/upload/a%20c/"
@@ -364,15 +390,15 @@ mod tests {
 
     #[test]
     fn rejects_body_that_is_not_a_session() {
-        assert!(parse_session("{\"hello\":true}").is_none());
-        assert!(parse_session("not json").is_none());
+        assert!(Session::parse("{\"hello\":true}").is_none());
+        assert!(Session::parse("not json").is_none());
     }
 
     #[test]
     fn anonymous_session_is_auth_failure() {
         let raw =
             r#"{"apiUrl":"x","uploadUrl":"u","downloadUrl":"d","capabilities":{},"accounts":{}}"#;
-        let session = parse_session(raw).unwrap();
+        let session = Session::parse(raw).unwrap();
         assert!(matches!(
             session.ensure_authenticated(),
             Err(JmapError::Auth(_))
@@ -382,21 +408,24 @@ mod tests {
     #[test]
     fn origin_treats_the_default_port_as_equivalent() {
         assert_eq!(
-            origin_of("https://mail.example/jmap"),
-            origin_of("https://mail.example:443/jmap")
+            SessionUrl("https://mail.example/jmap").origin(),
+            SessionUrl("https://mail.example:443/jmap").origin()
         );
         assert_eq!(
-            origin_of("http://mail.example/jmap"),
-            origin_of("http://mail.example:80/jmap")
+            SessionUrl("http://mail.example/jmap").origin(),
+            SessionUrl("http://mail.example:80/jmap").origin()
         );
     }
 
     #[test]
     fn origin_distinguishes_port_host_and_scheme() {
-        let base = origin_of("https://mail.example:10443/jmap");
-        assert_ne!(base, origin_of("https://mail.example/jmap"));
-        assert_ne!(base, origin_of("https://other.example:10443/jmap"));
-        assert_ne!(base, origin_of("http://mail.example:10443/jmap"));
+        let base = SessionUrl("https://mail.example:10443/jmap").origin();
+        assert_ne!(base, SessionUrl("https://mail.example/jmap").origin());
+        assert_ne!(
+            base,
+            SessionUrl("https://other.example:10443/jmap").origin()
+        );
+        assert_ne!(base, SessionUrl("http://mail.example:10443/jmap").origin());
     }
 
     fn session_on(base: &str) -> Session {
@@ -405,7 +434,7 @@ mod tests {
                 "downloadUrl":"{base}/jmap/dl/{{accountId}}/{{blobId}}/{{type}}/{{name}}",
                 "capabilities":{{}},"accounts":{{}}}}"#
         );
-        parse_session(&raw).expect("session")
+        Session::parse(&raw).expect("session")
     }
 
     #[test]
@@ -449,7 +478,7 @@ mod tests {
             "uploadUrl":"https://blobs.example/upload/{accountId}/",
             "downloadUrl":"https://blobs.example/dl/{accountId}/{blobId}/{type}/{name}",
             "capabilities":{},"accounts":{}}"#;
-        let session = parse_session(raw).expect("session");
+        let session = Session::parse(raw).expect("session");
         let mismatches = session.origin_mismatches("https://mail.example:10443");
         assert_eq!(mismatches.len(), 1);
         assert_eq!(mismatches[0].fields, vec!["uploadUrl", "downloadUrl"]);
@@ -459,10 +488,8 @@ mod tests {
     #[test]
     fn resolve_reference_keeps_absolute_urls_verbatim() {
         assert_eq!(
-            resolve_reference(
-                "https://h.example/.well-known/jmap",
-                "https://other.example:8443/jmap/api"
-            ),
+            SessionUrl("https://h.example/.well-known/jmap")
+                .resolve("https://other.example:8443/jmap/api"),
             "https://other.example:8443/jmap/api"
         );
     }
@@ -471,15 +498,15 @@ mod tests {
     fn resolve_reference_handles_scheme_relative_absolute_and_relative_paths() {
         let base = "https://h.example:10443/.well-known/jmap";
         assert_eq!(
-            resolve_reference(base, "//other.example/jmap/api"),
+            SessionUrl(base).resolve("//other.example/jmap/api"),
             "https://other.example/jmap/api"
         );
         assert_eq!(
-            resolve_reference(base, "/jmap/api"),
+            SessionUrl(base).resolve("/jmap/api"),
             "https://h.example:10443/jmap/api"
         );
         assert_eq!(
-            resolve_reference(base, "api"),
+            SessionUrl(base).resolve("api"),
             "https://h.example:10443/.well-known/api"
         );
     }
@@ -487,10 +514,7 @@ mod tests {
     #[test]
     fn resolve_reference_preserves_uri_template_braces() {
         assert_eq!(
-            resolve_reference(
-                "https://h.example/.well-known/jmap",
-                "/jmap/upload/{accountId}/"
-            ),
+            SessionUrl("https://h.example/.well-known/jmap").resolve("/jmap/upload/{accountId}/"),
             "https://h.example/jmap/upload/{accountId}/"
         );
     }
@@ -500,7 +524,7 @@ mod tests {
         let raw = r#"{"apiUrl":"/jmap/","uploadUrl":"/jmap/upload/{accountId}/",
             "downloadUrl":"/jmap/download/{accountId}/{blobId}/{type}/{name}",
             "capabilities":{},"accounts":{}}"#;
-        let session = parse_session(raw)
+        let session = Session::parse(raw)
             .expect("session")
             .rebased_on("https://h.example:10443/.well-known/jmap");
         assert_eq!(session.api_url, "https://h.example:10443/jmap/");
@@ -519,11 +543,11 @@ mod tests {
     #[test]
     fn well_known_appends_correctly() {
         assert_eq!(
-            well_known_url("https://h.example/"),
+            Session::well_known_url("https://h.example/"),
             "https://h.example/.well-known/jmap"
         );
         assert_eq!(
-            well_known_url("https://h.example"),
+            Session::well_known_url("https://h.example"),
             "https://h.example/.well-known/jmap"
         );
     }

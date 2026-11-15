@@ -4,14 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+mod common;
 mod integration;
 mod seeder;
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use integration::Account;
 use integration::dovecot::Dovecot;
+use integration::layouts::ImapSuite;
 use integration::stalwart::shared as shared_stalwart;
 use integration::validate::{emails_in_mailbox, mailbox_id_by_path, mailbox_path, open_archive};
 use rusqlite::Connection;
@@ -26,86 +27,53 @@ fn imaps_url() -> String {
     format!("imaps://{}:{}", s.host, s.imaps_port)
 }
 
+use vandelay::archive::sources::SourceChange;
+use vandelay::export::{Confirm, Export, Prune};
+use vandelay::imap::automap::Automap;
+use vandelay::imap::session::Compress;
+use vandelay::import::imap::DeletedMessages;
+use vandelay::import::imap::FolderScope;
+use vandelay::import::imap::MimeKeywords;
+use vandelay::import::imap::{ImapImport, SaslAuth};
+use vandelay::import::jmap::JmapImport;
 use vandelay::jmap::account::AccountSelector;
-use vandelay::jmap::http::Auth;
-use vandelay::logging::Logger;
-use vandelay::sync::import_imap::{ImapAuth, ImapImportConfig};
-use vandelay::sync::{self, CommonConfig, ConnectConfig, ExportConfig, ImportConfig};
+use vandelay::jmap::connect::ConnectConfig;
+use vandelay::logging::{Level, Logger};
+use vandelay::net::auth::Auth;
+use vandelay::net::http::TlsPolicy;
+use vandelay::net::stream::Cleartext;
+use vandelay::sync::{RunMode, RunOptions};
+use vandelay::types::ObjectType;
 
-fn tmp_archive(tag: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "vandelay-imap-{tag}-{}-{}.sqlite",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_file(&p);
-    p
-}
-
-fn common(archive: &Path) -> CommonConfig {
-    CommonConfig {
-        archive: archive.to_path_buf(),
+fn run_options(archive: &Path) -> RunOptions {
+    RunOptions {
         threads: 1,
-        dry_run: false,
         max_retries: 3,
-        allow_invalid_certs: true,
-        logger: Logger::from_flags(false, 0),
+        ..common::live_options(archive)
     }
 }
 
-fn imap_basic_config(localpart: &str) -> ImapImportConfig {
-    ImapImportConfig {
+fn imap_basic_config(localpart: &str) -> ImapImport {
+    ImapImport {
         url: imaps_url(),
-        auth: ImapAuth::Basic {
+        auth: SaslAuth::Basic {
             user: format!("{localpart}@{}", seeder::DOMAIN),
             password: seeder::USER_PASSWORD.to_owned(),
         },
-        allow_cleartext: false,
-        compress: false,
+        cleartext: Cleartext::Forbid,
+        compress: Compress::Off,
         include: Vec::new(),
         exclude: Vec::new(),
         exclude_special: Vec::new(),
         folder: Vec::new(),
-        subscribed_only: false,
-        automap: true,
-        include_deleted: false,
-        mime_keywords: false,
+        scope: FolderScope::All,
+        automap: Automap::Enabled,
+        deleted: DeletedMessages::Skip,
+        mime_keywords: MimeKeywords::Skip,
         fetch_batch: 256,
         imap_connections: 4,
-        allow_source_change: false,
+        source_change: SourceChange::Reject,
     }
-}
-
-fn dovecot_config(account: &Account, imap: &integration::Endpoint) -> ImapImportConfig {
-    ImapImportConfig {
-        url: format!("imap://{}:{}", imap.host, imap.port),
-        auth: ImapAuth::Basic {
-            user: account.username.clone(),
-            password: account.password.clone(),
-        },
-        allow_cleartext: false,
-        compress: false,
-        include: Vec::new(),
-        exclude: Vec::new(),
-        exclude_special: Vec::new(),
-        folder: Vec::new(),
-        subscribed_only: false,
-        automap: true,
-        include_deleted: false,
-        mime_keywords: false,
-        fetch_batch: 64,
-        imap_connections: 2,
-        allow_source_change: false,
-    }
-}
-
-fn count(conn: &Connection, table: &str) -> i64 {
-    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
-        .unwrap()
 }
 
 fn blob_hashes(conn: &Connection) -> HashSet<Vec<u8>> {
@@ -119,7 +87,7 @@ fn blob_hashes(conn: &Connection) -> HashSet<Vec<u8>> {
 fn imap_import_test1_lands_mailbox_tree_and_emails() {
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test1").expect("test1");
-    let archive = tmp_archive("test1");
+    let archive = common::tmp_archive("test1");
     assert_eq!(fx.domain, seeder::DOMAIN);
     assert!(!fx.domain_id.is_empty());
     assert_eq!(
@@ -154,14 +122,16 @@ fn imap_import_test1_lands_mailbox_tree_and_emails() {
         );
     }
 
-    let summary = sync::import_imap::run(common(&archive), imap_basic_config(&acc.localpart))
+    let summary = imap_basic_config(&acc.localpart)
+        .run(run_options(&archive))
+        .into_result()
         .expect("import");
     assert!(!summary.any_failed(), "import had failures: {summary:?}");
 
     let conn = Connection::open(&archive).unwrap();
-    let mailbox_count = count(&conn, "mailboxes") as usize;
-    let email_count = count(&conn, "emails") as usize;
-    let blob_count = count(&conn, "blobs") as usize;
+    let mailbox_count = common::count(&conn, "mailboxes") as usize;
+    let email_count = common::count(&conn, "emails") as usize;
+    let blob_count = common::count(&conn, "blobs") as usize;
 
     let seeded = acc.seeded.as_ref().expect("seed stats");
     assert!(
@@ -200,21 +170,25 @@ fn imap_import_test1_lands_mailbox_tree_and_emails() {
 fn imap_second_run_is_convergent() {
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test2").expect("test2");
-    let archive = tmp_archive("converge");
+    let archive = common::tmp_archive("converge");
 
-    sync::import_imap::run(common(&archive), imap_basic_config(&acc.localpart))
+    imap_basic_config(&acc.localpart)
+        .run(run_options(&archive))
+        .into_result()
         .expect("first import");
 
-    let summary = sync::import_imap::run(common(&archive), imap_basic_config(&acc.localpart))
+    let summary = imap_basic_config(&acc.localpart)
+        .run(run_options(&archive))
+        .into_result()
         .expect("second import");
     for (name, counts) in &summary.per_type {
         assert_eq!(
             counts.created, 0,
-            "{name}: convergent run should create nothing"
+            "{name:?}: convergent run should create nothing"
         );
         assert_eq!(
             counts.deleted, 0,
-            "{name}: convergent run should delete nothing"
+            "{name:?}: convergent run should delete nothing"
         );
     }
 
@@ -227,13 +201,15 @@ fn imap_second_run_is_convergent() {
 fn imap_and_jmap_imports_share_blob_set() {
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test1").expect("test1");
-    let imap_archive = tmp_archive("parity-imap");
-    let jmap_archive = tmp_archive("parity-jmap");
+    let imap_archive = common::tmp_archive("parity-imap");
+    let jmap_archive = common::tmp_archive("parity-jmap");
 
-    sync::import_imap::run(common(&imap_archive), imap_basic_config(&acc.localpart))
+    imap_basic_config(&acc.localpart)
+        .run(run_options(&imap_archive))
+        .into_result()
         .expect("imap import");
 
-    let jmap_cfg = ImportConfig {
+    let jmap_cfg = JmapImport {
         connect: ConnectConfig {
             url: fx.base_url.clone(),
             auth: Auth::Basic {
@@ -243,17 +219,20 @@ fn imap_and_jmap_imports_share_blob_set() {
             account: AccountSelector::Id(acc.account_id.clone()),
         },
         objects: None,
-        allow_source_change: false,
+        source_change: SourceChange::Reject,
     };
-    let jmap_common = CommonConfig {
+    let jmap_common = RunOptions {
         archive: jmap_archive.clone(),
         threads: 4,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 5,
-        allow_invalid_certs: true,
-        logger: Logger::from_flags(false, 0),
+        tls: TlsPolicy::AcceptInvalid,
+        logger: Logger::new(Level::Default),
     };
-    sync::import_jmap::run(jmap_common, jmap_cfg).expect("jmap import");
+    jmap_cfg
+        .run(jmap_common)
+        .into_result()
+        .expect("jmap import");
 
     let imap_conn = Connection::open(&imap_archive).unwrap();
     let jmap_conn = Connection::open(&jmap_archive).unwrap();
@@ -268,8 +247,8 @@ fn imap_and_jmap_imports_share_blob_set() {
         missing.len()
     );
 
-    let imap_emails = count(&imap_conn, "emails");
-    let jmap_emails = count(&jmap_conn, "emails");
+    let imap_emails = common::count(&imap_conn, "emails");
+    let jmap_emails = common::count(&jmap_conn, "emails");
     assert!(
         imap_emails >= jmap_emails,
         "IMAP saw fewer emails ({imap_emails}) than JMAP ({jmap_emails})"
@@ -285,15 +264,17 @@ fn imap_and_jmap_imports_share_blob_set() {
 fn imap_import_test3_lands_mailbox_tree_and_emails() {
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test3").expect("test3");
-    let archive = tmp_archive("test3");
+    let archive = common::tmp_archive("test3");
 
-    let summary = sync::import_imap::run(common(&archive), imap_basic_config(&acc.localpart))
+    let summary = imap_basic_config(&acc.localpart)
+        .run(run_options(&archive))
+        .into_result()
         .expect("import");
     assert!(!summary.any_failed(), "import had failures: {summary:?}");
 
     let conn = Connection::open(&archive).unwrap();
-    assert!(count(&conn, "mailboxes") > 0);
-    assert!(count(&conn, "blobs") >= 0);
+    assert!(common::count(&conn, "mailboxes") > 0);
+    assert!(common::count(&conn, "blobs") >= 0);
 
     let _ = std::fs::remove_file(&archive);
     seeder::teardown(base_url()).expect("teardown");
@@ -304,19 +285,25 @@ fn imap_import_test3_lands_mailbox_tree_and_emails() {
 fn imap_multi_chunk_metadata_fetch_converges() {
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test1").expect("test1");
-    let archive = tmp_archive("multi_chunk");
+    let archive = common::tmp_archive("multi_chunk");
 
     let mut cfg = imap_basic_config(&acc.localpart);
     cfg.fetch_batch = 5;
-    let summary = sync::import_imap::run(common(&archive), cfg).expect("import");
+    let summary = cfg
+        .run(run_options(&archive))
+        .into_result()
+        .expect("import");
     assert!(!summary.any_failed(), "import had failures: {summary:?}");
 
     let mut cfg2 = imap_basic_config(&acc.localpart);
     cfg2.fetch_batch = 5;
-    let second = sync::import_imap::run(common(&archive), cfg2).expect("second");
+    let second = cfg2
+        .run(run_options(&archive))
+        .into_result()
+        .expect("second");
     for (name, c) in &second.per_type {
-        assert_eq!(c.created, 0, "{name}: convergent run creates nothing");
-        assert_eq!(c.deleted, 0, "{name}: convergent run deletes nothing");
+        assert_eq!(c.created, 0, "{name:?}: convergent run creates nothing");
+        assert_eq!(c.deleted, 0, "{name:?}: convergent run deletes nothing");
     }
 
     let _ = std::fs::remove_file(&archive);
@@ -328,26 +315,32 @@ fn imap_multi_chunk_metadata_fetch_converges() {
 fn imap_dry_run_reports_new_diff_without_writing() {
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test2").expect("test2");
-    let archive = tmp_archive("dryrun");
+    let archive = common::tmp_archive("dryrun");
 
-    let mut common_cfg = common(&archive);
-    common_cfg.dry_run = true;
-    let summary =
-        sync::import_imap::run(common_cfg, imap_basic_config(&acc.localpart)).expect("dry-run");
+    let mut common_cfg = run_options(&archive);
+    common_cfg.mode = RunMode::DryRun;
+    let summary = imap_basic_config(&acc.localpart)
+        .run(common_cfg)
+        .into_result()
+        .expect("dry-run");
     let mailbox = summary
-        .per_type
+        .plan
         .iter()
-        .find(|(k, _)| *k == "mailbox")
-        .expect("mailbox counts");
-    assert!(mailbox.1.created > 0, "dry-run reports new mailboxes");
+        .find(|(k, _)| *k == ObjectType::Mailbox)
+        .expect("mailbox plan");
+    assert!(mailbox.1.new > 0, "dry-run reports new mailboxes");
 
     let conn = Connection::open(&archive).unwrap();
     assert_eq!(
-        count(&conn, "mailboxes"),
+        common::count(&conn, "mailboxes"),
         0,
         "dry-run must not persist mailboxes"
     );
-    assert_eq!(count(&conn, "emails"), 0, "dry-run must not persist emails");
+    assert_eq!(
+        common::count(&conn, "emails"),
+        0,
+        "dry-run must not persist emails"
+    );
     drop(conn);
 
     let _ = std::fs::remove_file(&archive);
@@ -360,20 +353,22 @@ fn imap_imported_archive_exports_via_jmap() {
     let fx = seeder::provision(base_url()).expect("provision");
     let src = fx.account("test1").expect("test1");
     let dst = fx.account("test4").expect("test4");
-    let archive = tmp_archive("roundtrip");
+    let archive = common::tmp_archive("roundtrip");
 
-    sync::import_imap::run(common(&archive), imap_basic_config(&src.localpart))
+    imap_basic_config(&src.localpart)
+        .run(run_options(&archive))
+        .into_result()
         .expect("imap import");
 
-    let export_common = CommonConfig {
+    let export_common = RunOptions {
         archive: archive.clone(),
         threads: 4,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 5,
-        allow_invalid_certs: true,
-        logger: Logger::from_flags(false, 0),
+        tls: TlsPolicy::AcceptInvalid,
+        logger: Logger::new(Level::Default),
     };
-    let export_cfg = ExportConfig {
+    let export_cfg = Export {
         connect: ConnectConfig {
             url: fx.base_url.clone(),
             auth: Auth::Basic {
@@ -383,21 +378,24 @@ fn imap_imported_archive_exports_via_jmap() {
             account: AccountSelector::Id(dst.account_id.clone()),
         },
         objects: None,
-        prune: false,
-        yes: false,
+        prune: Prune::Keep,
+        confirm: Confirm::Prompt,
     };
-    let first = sync::export::run(export_common, export_cfg).expect("first export");
+    let first = export_cfg
+        .run(export_common)
+        .into_result()
+        .expect("first export");
     assert!(!first.any_failed(), "first export had failures: {first:?}");
 
-    let export_common2 = CommonConfig {
+    let export_common2 = RunOptions {
         archive: archive.clone(),
         threads: 4,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 5,
-        allow_invalid_certs: true,
-        logger: Logger::from_flags(false, 0),
+        tls: TlsPolicy::AcceptInvalid,
+        logger: Logger::new(Level::Default),
     };
-    let export_cfg2 = ExportConfig {
+    let export_cfg2 = Export {
         connect: ConnectConfig {
             url: fx.base_url.clone(),
             auth: Auth::Basic {
@@ -407,14 +405,17 @@ fn imap_imported_archive_exports_via_jmap() {
             account: AccountSelector::Id(dst.account_id.clone()),
         },
         objects: None,
-        prune: false,
-        yes: false,
+        prune: Prune::Keep,
+        confirm: Confirm::Prompt,
     };
-    let second = sync::export::run(export_common2, export_cfg2).expect("second export");
+    let second = export_cfg2
+        .run(export_common2)
+        .into_result()
+        .expect("second export");
     for (name, counts) in &second.per_type {
         assert_eq!(
             counts.created, 0,
-            "{name}: round-trip second export should create nothing"
+            "{name:?}: round-trip second export should create nothing"
         );
     }
 
@@ -458,10 +459,17 @@ fn dovecot_noselect_parents_keep_the_tree_through_export() {
         );
     }
 
-    let archive = tmp_archive("dovecot-noselect");
+    let archive = common::tmp_archive("dovecot-noselect");
     for pass in 0..2 {
-        let summary = sync::import_imap::run(common(&archive), dovecot_config(&account, &d.imap))
-            .expect("imap import");
+        let summary = ImapSuite {
+            server: "dovecot",
+            imap: &d.imap,
+            cleartext: Cleartext::Forbid,
+        }
+        .config(&account)
+        .run(run_options(&archive))
+        .into_result()
+        .expect("imap import");
         assert!(!summary.any_failed(), "pass {pass}: {summary:?}");
     }
     let conn = open_archive(&archive);
@@ -482,29 +490,28 @@ fn dovecot_noselect_parents_keep_the_tree_through_export() {
 
     let fx = seeder::provision(base_url()).expect("provision");
     let dst = fx.account(seeder::SYNC_OUT[0]).expect("sync-out target");
-    let export = sync::export::run(
-        CommonConfig {
-            archive: archive.clone(),
-            threads: 4,
-            dry_run: false,
-            max_retries: 5,
-            allow_invalid_certs: true,
-            logger: Logger::from_flags(false, 0),
-        },
-        ExportConfig {
-            connect: ConnectConfig {
-                url: fx.base_url.clone(),
-                auth: Auth::Basic {
-                    user: dst.email.clone(),
-                    password: dst.password.clone(),
-                },
-                account: AccountSelector::Id(dst.account_id.clone()),
+    let export = (Export {
+        connect: ConnectConfig {
+            url: fx.base_url.clone(),
+            auth: Auth::Basic {
+                user: dst.email.clone(),
+                password: dst.password.clone(),
             },
-            objects: None,
-            prune: false,
-            yes: true,
+            account: AccountSelector::Id(dst.account_id.clone()),
         },
-    )
+        objects: None,
+        prune: Prune::Keep,
+        confirm: Confirm::Assume,
+    })
+    .run(RunOptions {
+        archive: archive.clone(),
+        threads: 4,
+        mode: RunMode::Apply,
+        max_retries: 5,
+        tls: TlsPolicy::AcceptInvalid,
+        logger: Logger::new(Level::Default),
+    })
+    .into_result()
     .expect("export");
     assert!(!export.any_failed(), "export reported failures: {export:?}");
 

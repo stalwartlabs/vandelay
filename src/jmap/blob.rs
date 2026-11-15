@@ -8,6 +8,7 @@ use encodify::base64::STANDARD;
 use serde_json::{Map, Value};
 
 use crate::jmap::error::JmapError;
+use crate::net::encode::{Percent, SafeSet};
 
 pub const SENTINEL_KEY: &str = "@blob";
 
@@ -30,149 +31,110 @@ impl InlineShape {
     }
 }
 
-pub fn import_blob_ids<F>(value: &mut Value, mut resolve: F) -> Result<(), BlobWalkError>
-where
-    F: FnMut(&str) -> Result<i64, BlobWalkError>,
-{
-    walk_import(value, &mut resolve)
-}
+pub struct BlobRefs<'a>(pub &'a mut Value);
 
-fn walk_import<F>(value: &mut Value, resolve: &mut F) -> Result<(), BlobWalkError>
-where
-    F: FnMut(&str) -> Result<i64, BlobWalkError>,
-{
-    match value {
-        Value::Object(map) => {
-            if let Some(Value::String(blob_id)) = map.remove("blobId") {
-                let local = resolve(&blob_id)?;
-                map.insert(SENTINEL_KEY.to_owned(), Value::from(local));
-            }
-            for child in map.values_mut() {
-                walk_import(child, resolve)?;
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                walk_import(item, resolve)?;
-            }
-        }
-        _ => {}
+impl BlobRefs<'_> {
+    pub fn to_sentinels<F>(self, mut resolve: F) -> Result<(), BlobWalkError>
+    where
+        F: FnMut(&str) -> Result<i64, BlobWalkError>,
+    {
+        BlobRefs::walk_import(self.0, &mut resolve)
     }
-    Ok(())
-}
 
-pub fn inline_blob_data_uris<F>(
-    value: &mut Value,
-    shape: InlineShape,
-    mut fetch: F,
-) -> Result<(), BlobWalkError>
-where
-    F: FnMut(i64) -> Result<Vec<u8>, BlobWalkError>,
-{
-    walk_inline(value, shape, &mut fetch)
-}
+    pub fn to_data_uris<F>(self, shape: InlineShape, mut fetch: F) -> Result<(), BlobWalkError>
+    where
+        F: FnMut(i64) -> Result<Vec<u8>, BlobWalkError>,
+    {
+        BlobRefs::walk_inline(self.0, shape, &mut fetch)
+    }
 
-fn walk_inline<F>(value: &mut Value, shape: InlineShape, fetch: &mut F) -> Result<(), BlobWalkError>
-where
-    F: FnMut(i64) -> Result<Vec<u8>, BlobWalkError>,
-{
-    match value {
-        Value::Object(map) => {
-            if let Some(sentinel) = map.remove(SENTINEL_KEY) {
-                let local_id = sentinel.as_i64().ok_or(BlobWalkError::MalformedSentinel)?;
-                let bytes = fetch(local_id)?;
-                let uri = data_uri(map, &bytes);
-                map.insert(shape.uri_key().to_owned(), Value::String(uri));
+    fn walk_import<F>(value: &mut Value, resolve: &mut F) -> Result<(), BlobWalkError>
+    where
+        F: FnMut(&str) -> Result<i64, BlobWalkError>,
+    {
+        match value {
+            Value::Object(map) => {
+                if let Some(Value::String(blob_id)) = map.remove("blobId") {
+                    let local = resolve(&blob_id)?;
+                    map.insert(SENTINEL_KEY.to_owned(), Value::from(local));
+                }
+                for child in map.values_mut() {
+                    BlobRefs::walk_import(child, resolve)?;
+                }
             }
-            for child in map.values_mut() {
-                walk_inline(child, shape, fetch)?;
+            Value::Array(items) => {
+                for item in items {
+                    BlobRefs::walk_import(item, resolve)?;
+                }
             }
+            _ => {}
         }
-        Value::Array(items) => {
-            for item in items {
-                walk_inline(item, shape, fetch)?;
+        Ok(())
+    }
+
+    fn walk_inline<F>(
+        value: &mut Value,
+        shape: InlineShape,
+        fetch: &mut F,
+    ) -> Result<(), BlobWalkError>
+    where
+        F: FnMut(i64) -> Result<Vec<u8>, BlobWalkError>,
+    {
+        match value {
+            Value::Object(map) => {
+                if let Some(sentinel) = map.remove(SENTINEL_KEY) {
+                    let local_id = sentinel.as_i64().ok_or(BlobWalkError::MalformedSentinel)?;
+                    let bytes = fetch(local_id)?;
+                    let uri = BlobRefs::data_uri(map, &bytes);
+                    map.insert(shape.uri_key().to_owned(), Value::String(uri));
+                }
+                for child in map.values_mut() {
+                    BlobRefs::walk_inline(child, shape, fetch)?;
+                }
             }
+            Value::Array(items) => {
+                for item in items {
+                    BlobRefs::walk_inline(item, shape, fetch)?;
+                }
+            }
+            _ => {}
         }
-        _ => {}
+        Ok(())
     }
-    Ok(())
-}
 
-fn data_uri(map: &Map<String, Value>, bytes: &[u8]) -> String {
-    let media_type = MEDIA_TYPE_KEYS
-        .iter()
-        .find_map(|k| map.get(*k).and_then(Value::as_str).and_then(uri_media_type))
-        .unwrap_or_else(|| DEFAULT_MEDIA_TYPE.to_owned());
-    let mut uri = String::with_capacity(
-        DATA_URI_OVERHEAD + media_type.len() + STANDARD.encoded_len(bytes.len()),
-    );
-    uri.push_str("data:");
-    uri.push_str(&media_type);
-    uri.push_str(";base64,");
-    STANDARD.encode_append(bytes, &mut uri);
-    uri
-}
-
-fn uri_media_type(raw: &str) -> Option<String> {
-    let mut parts = raw.split(';').map(str::trim);
-    let essence = parts.next()?;
-    let (ty, subtype) = essence.split_once('/')?;
-    if ty.is_empty() || subtype.is_empty() || subtype.contains('/') {
-        return None;
+    fn data_uri(map: &Map<String, Value>, bytes: &[u8]) -> String {
+        let media_type = MEDIA_TYPE_KEYS
+            .iter()
+            .find_map(|k| {
+                map.get(*k)
+                    .and_then(Value::as_str)
+                    .and_then(BlobRefs::uri_media_type)
+            })
+            .unwrap_or_else(|| DEFAULT_MEDIA_TYPE.to_owned());
+        let mut uri = String::with_capacity(
+            DATA_URI_OVERHEAD + media_type.len() + STANDARD.encoded_len(bytes.len()),
+        );
+        uri.push_str("data:");
+        uri.push_str(&media_type);
+        uri.push_str(";base64,");
+        STANDARD.encode_append(bytes, &mut uri);
+        uri
     }
-    let mut out = String::with_capacity(raw.len());
-    escape_into(&mut out, essence);
-    for parameter in parts.filter(|p| !p.is_empty()) {
-        out.push(';');
-        escape_into(&mut out, parameter);
-    }
-    Some(out)
-}
 
-fn escape_into(out: &mut String, part: &str) {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    for byte in part.bytes() {
-        if is_media_type_uri_byte(byte) {
-            out.push(byte as char);
-        } else {
-            out.push('%');
-            out.push(HEX[(byte >> 4) as usize] as char);
-            out.push(HEX[(byte & 0x0F) as usize] as char);
+    fn uri_media_type(raw: &str) -> Option<String> {
+        let mut parts = raw.split(';').map(str::trim);
+        let essence = parts.next()?;
+        let (ty, subtype) = essence.split_once('/')?;
+        if ty.is_empty() || subtype.is_empty() || subtype.contains('/') {
+            return None;
         }
-    }
-}
-
-fn is_media_type_uri_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric()
-        || matches!(
-            byte,
-            b'!' | b'$'
-                | b'&'
-                | b'\''
-                | b'('
-                | b')'
-                | b'*'
-                | b'+'
-                | b'-'
-                | b'.'
-                | b'/'
-                | b':'
-                | b'='
-                | b'@'
-                | b'_'
-                | b'~'
-        )
-}
-
-pub fn prepend_property(target: &mut Map<String, Value>, key: &str, value: Value) {
-    let existing: Vec<(String, Value)> =
-        target.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    target.clear();
-    target.insert(key.to_owned(), value);
-    for (k, v) in existing {
-        if k != key {
-            target.insert(k, v);
+        let mut out = String::with_capacity(raw.len());
+        Percent::encode_into(&mut out, essence, SafeSet::MediaTypeUri);
+        for parameter in parts.filter(|p| !p.is_empty()) {
+            out.push(';');
+            Percent::encode_into(&mut out, parameter, SafeSet::MediaTypeUri);
         }
+        Some(out)
     }
 }
 
@@ -200,6 +162,7 @@ impl BlobWalkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ExitStatus;
     use serde_json::json;
 
     fn fetch_ok(local_id: i64) -> Result<Vec<u8>, BlobWalkError> {
@@ -237,7 +200,7 @@ mod tests {
                 continue;
             }
             assert!(
-                is_media_type_uri_byte(b) || b == b';',
+                SafeSet::MediaTypeUri.contains(b) || b == b';',
                 "byte {b:#04x} is not allowed unescaped in {uri}"
             );
             i += 1;
@@ -273,7 +236,9 @@ mod tests {
                 "@blob": 7, "mediaType": "image/png"
             } }
         });
-        inline_blob_data_uris(&mut card, InlineShape::JsContactResource, fetch_ok).unwrap();
+        BlobRefs(&mut card)
+            .to_data_uris(InlineShape::JsContactResource, fetch_ok)
+            .unwrap();
         let photo = &card["media"]["photo"];
         assert_eq!(
             decode(photo["uri"].as_str().unwrap(), "image/png"),
@@ -293,7 +258,9 @@ mod tests {
                 "@blob": 3, "contentType": "text/plain", "title": "note.txt"
             } }
         });
-        inline_blob_data_uris(&mut event, InlineShape::JsCalendarLink, fetch_ok).unwrap();
+        BlobRefs(&mut event)
+            .to_data_uris(InlineShape::JsCalendarLink, fetch_ok)
+            .unwrap();
         let link = &event["links"]["1"];
         assert_eq!(
             decode(link["href"].as_str().unwrap(), "text/plain"),
@@ -311,7 +278,9 @@ mod tests {
             "@type": "Card",
             "links": { "l1": { "@type": "Link", "@blob": 1, "mediaType": "application/pdf" } }
         });
-        inline_blob_data_uris(&mut card, InlineShape::JsContactResource, fetch_ok).unwrap();
+        BlobRefs(&mut card)
+            .to_data_uris(InlineShape::JsContactResource, fetch_ok)
+            .unwrap();
         let link = &card["links"]["l1"];
         assert!(link.get("href").is_none(), "JSContact Link uses uri");
         assert_eq!(
@@ -323,7 +292,9 @@ mod tests {
     #[test]
     fn absent_media_type_defaults_to_octet_stream() {
         let mut card = json!({ "media": { "photo": { "@blob": 2 } } });
-        inline_blob_data_uris(&mut card, InlineShape::JsContactResource, fetch_ok).unwrap();
+        BlobRefs(&mut card)
+            .to_data_uris(InlineShape::JsContactResource, fetch_ok)
+            .unwrap();
         let uri = card["media"]["photo"]["uri"].as_str().unwrap();
         assert_eq!(decode(uri, DEFAULT_MEDIA_TYPE), b"bytes-2");
     }
@@ -331,7 +302,9 @@ mod tests {
     #[test]
     fn empty_media_type_defaults_to_octet_stream() {
         let mut event = json!({ "links": { "1": { "@blob": 4, "contentType": "" } } });
-        inline_blob_data_uris(&mut event, InlineShape::JsCalendarLink, fetch_ok).unwrap();
+        BlobRefs(&mut event)
+            .to_data_uris(InlineShape::JsCalendarLink, fetch_ok)
+            .unwrap();
         let uri = event["links"]["1"]["href"].as_str().unwrap();
         assert_eq!(decode(uri, DEFAULT_MEDIA_TYPE), b"bytes-4");
     }
@@ -341,7 +314,9 @@ mod tests {
         let mut card = json!({ "media": { "photo": {
             "@blob": 4, "mediaType": "", "contentType": "image/jpeg"
         } } });
-        inline_blob_data_uris(&mut card, InlineShape::JsContactResource, fetch_ok).unwrap();
+        BlobRefs(&mut card)
+            .to_data_uris(InlineShape::JsContactResource, fetch_ok)
+            .unwrap();
         let uri = card["media"]["photo"]["uri"].as_str().unwrap();
         assert_eq!(decode(uri, "image/jpeg"), b"bytes-4");
     }
@@ -351,7 +326,9 @@ mod tests {
         let mut event = json!({ "links": { "1": {
             "@blob": 4, "contentType": "text/plain; charset=utf-8"
         } } });
-        inline_blob_data_uris(&mut event, InlineShape::JsCalendarLink, fetch_ok).unwrap();
+        BlobRefs(&mut event)
+            .to_data_uris(InlineShape::JsCalendarLink, fetch_ok)
+            .unwrap();
         let uri = event["links"]["1"]["href"].as_str().unwrap();
         assert!(!uri.contains(' '), "{uri} carries a raw space");
         assert_eq!(decode(uri, "text/plain;charset=utf-8"), b"bytes-4");
@@ -362,7 +339,9 @@ mod tests {
         let mut event = json!({ "links": { "1": {
             "@blob": 4, "contentType": " text/plain ;; charset=utf-8 ; format=flowed "
         } } });
-        inline_blob_data_uris(&mut event, InlineShape::JsCalendarLink, fetch_ok).unwrap();
+        BlobRefs(&mut event)
+            .to_data_uris(InlineShape::JsCalendarLink, fetch_ok)
+            .unwrap();
         let uri = event["links"]["1"]["href"].as_str().unwrap();
         assert_eq!(
             decode(uri, "text/plain;charset=utf-8;format=flowed"),
@@ -375,7 +354,9 @@ mod tests {
         let mut event = json!({ "links": { "1": {
             "@blob": 4, "contentType": "text/plain; name=\"rep ort,v2#1\u{e9}.txt\""
         } } });
-        inline_blob_data_uris(&mut event, InlineShape::JsCalendarLink, fetch_ok).unwrap();
+        BlobRefs(&mut event)
+            .to_data_uris(InlineShape::JsCalendarLink, fetch_ok)
+            .unwrap();
         let uri = event["links"]["1"]["href"].as_str().unwrap();
         assert_eq!(
             decode(uri, "text/plain;name=%22rep%20ort%2Cv2%231%C3%A9.txt%22"),
@@ -388,7 +369,9 @@ mod tests {
         let mut card = json!({ "media": { "photo": {
             "@blob": 4, "mediaType": "image/png; note=100%"
         } } });
-        inline_blob_data_uris(&mut card, InlineShape::JsContactResource, fetch_ok).unwrap();
+        BlobRefs(&mut card)
+            .to_data_uris(InlineShape::JsContactResource, fetch_ok)
+            .unwrap();
         let uri = card["media"]["photo"]["uri"].as_str().unwrap();
         assert_eq!(decode(uri, "image/png;note=100%25"), b"bytes-4");
     }
@@ -397,7 +380,9 @@ mod tests {
     fn a_media_type_that_is_not_type_slash_subtype_defaults_to_octet_stream() {
         for bogus in ["png", "image/", "/png", "image/png/extra", ";charset=utf-8"] {
             let mut card = json!({ "media": { "photo": { "@blob": 4, "mediaType": bogus } } });
-            inline_blob_data_uris(&mut card, InlineShape::JsContactResource, fetch_ok).unwrap();
+            BlobRefs(&mut card)
+                .to_data_uris(InlineShape::JsContactResource, fetch_ok)
+                .unwrap();
             let uri = card["media"]["photo"]["uri"].as_str().unwrap();
             assert_eq!(decode(uri, DEFAULT_MEDIA_TYPE), b"bytes-4", "{bogus}");
         }
@@ -409,10 +394,9 @@ mod tests {
         let mut card = json!({ "media": { "photo": {
             "@blob": 1, "mediaType": "application/octet-stream; charset=binary"
         } } });
-        inline_blob_data_uris(&mut card, InlineShape::JsContactResource, |_| {
-            Ok(payload.clone())
-        })
-        .unwrap();
+        BlobRefs(&mut card)
+            .to_data_uris(InlineShape::JsContactResource, |_| Ok(payload.clone()))
+            .unwrap();
         let uri = card["media"]["photo"]["uri"].as_str().unwrap();
         assert_eq!(
             decode(uri, "application/octet-stream;charset=binary"),
@@ -429,7 +413,9 @@ mod tests {
             ] } },
             "links": { "top": { "@blob": 8, "contentType": "image/gif" } }
         });
-        inline_blob_data_uris(&mut value, InlineShape::JsCalendarLink, fetch_ok).unwrap();
+        BlobRefs(&mut value)
+            .to_data_uris(InlineShape::JsCalendarLink, fetch_ok)
+            .unwrap();
         let arr = value["locations"]["loc1"]["links"].as_array().unwrap();
         assert_eq!(
             decode(arr[0]["href"].as_str().unwrap(), "image/gif"),
@@ -449,7 +435,8 @@ mod tests {
     #[test]
     fn malformed_sentinel_is_rejected() {
         let mut value = json!({ "media": { "photo": { "@blob": "not-an-id" } } });
-        let err = inline_blob_data_uris(&mut value, InlineShape::JsContactResource, fetch_ok)
+        let err = BlobRefs(&mut value)
+            .to_data_uris(InlineShape::JsContactResource, fetch_ok)
             .expect_err("malformed sentinel");
         assert!(matches!(err, BlobWalkError::MalformedSentinel), "{err:?}");
     }
@@ -457,27 +444,29 @@ mod tests {
     #[test]
     fn resolver_failure_propagates() {
         let mut value = json!({ "media": { "photo": { "@blob": 9 } } });
-        let err = inline_blob_data_uris(&mut value, InlineShape::JsContactResource, |_| {
-            Err(BlobWalkError::resolver(JmapError::malformed("gone")))
-        })
-        .expect_err("resolver failure");
+        let err = BlobRefs(&mut value)
+            .to_data_uris(InlineShape::JsContactResource, |_| {
+                Err(BlobWalkError::resolver(JmapError::malformed("gone")))
+            })
+            .expect_err("resolver failure");
         assert!(matches!(err, BlobWalkError::Resolver(_)), "{err:?}");
     }
 
     #[test]
     fn the_resolver_error_kind_survives_the_walk() {
         let mut value = json!({ "media": { "photo": { "@blob": 9 } } });
-        let err = inline_blob_data_uris(&mut value, InlineShape::JsContactResource, |_| {
-            Err(BlobWalkError::resolver(JmapError::Sqlite(
-                rusqlite::Error::QueryReturnedNoRows,
-            )))
-        })
-        .expect_err("resolver failure")
-        .into_source();
+        let err = BlobRefs(&mut value)
+            .to_data_uris(InlineShape::JsContactResource, |_| {
+                Err(BlobWalkError::resolver(JmapError::Sqlite(
+                    rusqlite::Error::QueryReturnedNoRows,
+                )))
+            })
+            .expect_err("resolver failure")
+            .into_source();
         assert!(matches!(err, JmapError::Sqlite(_)), "{err:?}");
         let mapped = crate::error::Error::from(err);
         assert!(mapped.aborts_run(), "{mapped} must abort the run");
-        assert_eq!(mapped.exit_code(), 7);
+        assert_eq!(mapped.exit_status(), ExitStatus::Archive);
     }
 
     #[test]
@@ -487,7 +476,10 @@ mod tests {
             matches!(err, JmapError::Blob(BlobWalkError::MalformedSentinel)),
             "{err:?}"
         );
-        assert_eq!(crate::error::Error::from(err).exit_code(), 5);
+        assert_eq!(
+            crate::error::Error::from(err).exit_status(),
+            ExitStatus::Partial
+        );
     }
 
     #[test]
@@ -499,10 +491,11 @@ mod tests {
             "nickNames": { "n1": { "name": "Jay" } }
         });
         let mut value = original.clone();
-        inline_blob_data_uris(&mut value, InlineShape::JsContactResource, |_| {
-            panic!("fetch must not be called")
-        })
-        .unwrap();
+        BlobRefs(&mut value)
+            .to_data_uris(InlineShape::JsContactResource, |_| {
+                panic!("fetch must not be called")
+            })
+            .unwrap();
         assert_eq!(value, original);
     }
 
@@ -510,11 +503,12 @@ mod tests {
     fn import_walker_still_produces_the_sentinel() {
         let mut value =
             json!({ "media": { "photo": { "blobId": "B1", "mediaType": "image/png" } } });
-        import_blob_ids(&mut value, |id| {
-            assert_eq!(id, "B1");
-            Ok(11)
-        })
-        .unwrap();
+        BlobRefs(&mut value)
+            .to_sentinels(|id| {
+                assert_eq!(id, "B1");
+                Ok(11)
+            })
+            .unwrap();
         assert_eq!(value["media"]["photo"][SENTINEL_KEY], json!(11));
         assert!(value["media"]["photo"].get("blobId").is_none());
     }

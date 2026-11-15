@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+mod common;
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,34 +13,28 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 use tempfile::TempDir;
 
-use vandelay::logging::Logger;
-use vandelay::sync::CommonConfig;
-use vandelay::sync::import_takeout::{TakeoutImportConfig, run};
+use vandelay::archive::sources::SourceChange;
+use vandelay::error::ExitStatus;
+use vandelay::imap::automap::Automap;
+use vandelay::import::takeout::TakeoutImport;
+use vandelay::sync::{RunMode, RunOptions};
+use vandelay::types::ObjectType;
 
 const RESOURCES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/resources");
 
-fn common_for(archive: &Path) -> CommonConfig {
-    CommonConfig {
-        archive: archive.to_path_buf(),
-        threads: 1,
-        dry_run: false,
+fn common_for(archive: &Path) -> RunOptions {
+    RunOptions {
         max_retries: 0,
-        allow_invalid_certs: false,
-        logger: Logger::from_flags(true, 0),
+        ..common::options(archive)
     }
 }
 
-fn config_for(root: PathBuf) -> TakeoutImportConfig {
-    TakeoutImportConfig {
+fn config_for(root: PathBuf) -> TakeoutImport {
+    TakeoutImport {
         takeout_root: root,
-        allow_source_change: false,
-        automap: true,
+        source_change: SourceChange::Reject,
+        automap: Automap::Enabled,
     }
-}
-
-fn count(conn: &Connection, table: &str) -> i64 {
-    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-        .unwrap()
 }
 
 fn mailbox_names(conn: &Connection) -> HashSet<String> {
@@ -228,10 +224,13 @@ fn synthetic_vcards_with_and_without_uid() -> String {
 fn empty_directory_fails_with_usage() {
     let td = TempDir::new().unwrap();
     let archive = td.path().join("a.sqlite");
-    let err = run(common_for(&archive), config_for(td.path().to_path_buf())).unwrap_err();
+    let err = config_for(td.path().to_path_buf())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap_err();
     assert!(format!("{err}").contains("no .mbox"));
     assert!(matches!(err, vandelay::error::Error::Usage(_)));
-    assert_eq!(err.exit_code(), 1);
+    assert_eq!(err.exit_status(), ExitStatus::Usage);
 }
 
 #[test]
@@ -239,9 +238,12 @@ fn nonexistent_path_fails_with_usage() {
     let td = TempDir::new().unwrap();
     let archive = td.path().join("a.sqlite");
     let missing = td.path().join("does-not-exist");
-    let err = run(common_for(&archive), config_for(missing)).unwrap_err();
+    let err = config_for(missing)
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap_err();
     assert!(matches!(err, vandelay::error::Error::Usage(_)));
-    assert_eq!(err.exit_code(), 1);
+    assert_eq!(err.exit_status(), ExitStatus::Usage);
 }
 
 #[test]
@@ -249,21 +251,24 @@ fn synthetic_takeout_imports_expected_row_counts() {
     let td = TempDir::new().unwrap();
     SyntheticTakeout::build(td.path());
     let archive = td.path().join("a.sqlite");
-    let summary = run(common_for(&archive), config_for(td.path().to_path_buf())).unwrap();
+    let summary = config_for(td.path().to_path_buf())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
 
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "emails"), 9);
-    assert_eq!(count(&conn, "calendars"), 2);
-    assert!(count(&conn, "calendar_events") >= 2);
-    assert_eq!(count(&conn, "address_books"), 1);
+    assert_eq!(common::count(&conn, "emails"), 9);
+    assert_eq!(common::count(&conn, "calendars"), 2);
+    assert!(common::count(&conn, "calendar_events") >= 2);
+    assert_eq!(common::count(&conn, "address_books"), 1);
     assert_eq!(
-        count(&conn, "contact_cards"),
+        common::count(&conn, "contact_cards"),
         4,
         "2 UID-bearing cards dedup across the two .vcf files (=2); \
          2 UID-less cards dedup by content across the two files (=2); total 4"
     );
 
-    let by = |t: &str| {
+    let by = |t: ObjectType| {
         summary
             .per_type
             .iter()
@@ -272,11 +277,11 @@ fn synthetic_takeout_imports_expected_row_counts() {
             .1
             .clone()
     };
-    assert!(by("mailbox").created >= 6);
-    assert_eq!(by("email").created, 9);
-    assert_eq!(by("email").failed, 0);
-    assert_eq!(by("calendarevent").failed, 0);
-    assert_eq!(by("contactcard").failed, 0);
+    assert!(by(ObjectType::Mailbox).created >= 6);
+    assert_eq!(by(ObjectType::Email).created, 9);
+    assert_eq!(by(ObjectType::Email).failed, 0);
+    assert_eq!(by(ObjectType::CalendarEvent).failed, 0);
+    assert_eq!(by(ObjectType::ContactCard).failed, 0);
 }
 
 #[test]
@@ -284,7 +289,10 @@ fn label_mapping_produces_expected_mailbox_tree() {
     let td = TempDir::new().unwrap();
     SyntheticTakeout::build(td.path());
     let archive = td.path().join("a.sqlite");
-    run(common_for(&archive), config_for(td.path().to_path_buf())).unwrap();
+    config_for(td.path().to_path_buf())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
 
     let conn = Connection::open(&archive).unwrap();
     let names = mailbox_names(&conn);
@@ -337,7 +345,10 @@ fn system_roles_assigned_when_automap_on() {
     let td = TempDir::new().unwrap();
     SyntheticTakeout::build(td.path());
     let archive = td.path().join("a.sqlite");
-    run(common_for(&archive), config_for(td.path().to_path_buf())).unwrap();
+    config_for(td.path().to_path_buf())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
 
     let conn = Connection::open(&archive).unwrap();
     let expected = [
@@ -369,7 +380,10 @@ fn keyword_translation_matches_label_table() {
     let td = TempDir::new().unwrap();
     SyntheticTakeout::build(td.path());
     let archive = td.path().join("a.sqlite");
-    run(common_for(&archive), config_for(td.path().to_path_buf())).unwrap();
+    config_for(td.path().to_path_buf())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
 
     let conn = Connection::open(&archive).unwrap();
     let starred: i64 = conn
@@ -411,7 +425,10 @@ fn calendar_xwr_calname_honored_else_falls_back_to_imported() {
     let td = TempDir::new().unwrap();
     SyntheticTakeout::build(td.path());
     let archive = td.path().join("a.sqlite");
-    run(common_for(&archive), config_for(td.path().to_path_buf())).unwrap();
+    config_for(td.path().to_path_buf())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
 
     let conn = Connection::open(&archive).unwrap();
     let names: HashSet<String> = {
@@ -436,10 +453,13 @@ fn contacts_dedup_by_uid_across_two_vcf_files() {
     let td = TempDir::new().unwrap();
     SyntheticTakeout::build(td.path());
     let archive = td.path().join("a.sqlite");
-    run(common_for(&archive), config_for(td.path().to_path_buf())).unwrap();
+    config_for(td.path().to_path_buf())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
 
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "address_books"), 1);
+    assert_eq!(common::count(&conn, "address_books"), 1);
     let with_uid: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM contact_cards WHERE uid IN ('synthetic-uid-1', 'synthetic-uid-2')",
@@ -466,10 +486,21 @@ fn rerun_against_unchanged_source_is_idempotent() {
     let td = TempDir::new().unwrap();
     SyntheticTakeout::build(td.path());
     let archive = td.path().join("a.sqlite");
-    run(common_for(&archive), config_for(td.path().to_path_buf())).unwrap();
+    config_for(td.path().to_path_buf())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
 
-    let s2 = run(common_for(&archive), config_for(td.path().to_path_buf())).unwrap();
-    let email_counts = &s2.per_type.iter().find(|(n, _)| *n == "email").unwrap().1;
+    let s2 = config_for(td.path().to_path_buf())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
+    let email_counts = &s2
+        .per_type
+        .iter()
+        .find(|(n, _)| *n == ObjectType::Email)
+        .unwrap()
+        .1;
     assert_eq!(email_counts.created, 0);
     assert_eq!(email_counts.failed, 0);
     assert_eq!(email_counts.skipped, 9);
@@ -477,7 +508,7 @@ fn rerun_against_unchanged_source_is_idempotent() {
     let event_counts = &s2
         .per_type
         .iter()
-        .find(|(n, _)| *n == "calendarevent")
+        .find(|(n, _)| *n == ObjectType::CalendarEvent)
         .unwrap()
         .1;
     assert_eq!(event_counts.created, 0);
@@ -487,7 +518,7 @@ fn rerun_against_unchanged_source_is_idempotent() {
     let card_counts = &s2
         .per_type
         .iter()
-        .find(|(n, _)| *n == "contactcard")
+        .find(|(n, _)| *n == ObjectType::ContactCard)
         .unwrap()
         .1;
     assert_eq!(card_counts.created, 0);
@@ -506,7 +537,10 @@ fn message_without_xgmail_labels_lands_in_filename_mailbox() {
     )
     .unwrap();
     let archive = td.path().join("a.sqlite");
-    run(common_for(&archive), config_for(td.path().to_path_buf())).unwrap();
+    config_for(td.path().to_path_buf())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
     let conn = Connection::open(&archive).unwrap();
     assert!(mailbox_names(&conn).contains("ImportedFromThunderbird"));
 }
@@ -516,12 +550,15 @@ fn nonmatching_siblings_are_ignored_silently() {
     let td = TempDir::new().unwrap();
     SyntheticTakeout::build(td.path());
     let archive = td.path().join("a.sqlite");
-    let summary = run(common_for(&archive), config_for(td.path().to_path_buf())).unwrap();
+    let summary = config_for(td.path().to_path_buf())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
     assert_eq!(
         summary
             .per_type
             .iter()
-            .find(|(n, _)| *n == "email")
+            .find(|(n, _)| *n == ObjectType::Email)
             .unwrap()
             .1
             .failed,
@@ -541,13 +578,61 @@ fn source_change_protection_refuses_different_path() {
     SyntheticTakeout::build(&b);
 
     let archive = td.path().join("a.sqlite");
-    run(common_for(&archive), config_for(a.clone())).unwrap();
-    let err = run(common_for(&archive), config_for(b.clone())).unwrap_err();
+    config_for(a.clone())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
+    let err = config_for(b.clone())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap_err();
     assert!(matches!(err, vandelay::error::Error::SourceChange(_)));
 
     let mut cfg2 = config_for(b);
-    cfg2.allow_source_change = true;
-    run(common_for(&archive), cfg2).expect("--allow-source-change permits");
+    cfg2.source_change = SourceChange::Allow;
+    cfg2.run(common_for(&archive))
+        .into_result()
+        .expect("--allow-source-change permits");
+}
+
+// R3: a second takeout source in the same archive must not duplicate a mailbox role.
+#[test]
+fn second_source_with_the_same_system_labels_keeps_one_role_each() {
+    let td = TempDir::new().unwrap();
+    let a = td.path().join("a");
+    let b = td.path().join("b");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    SyntheticTakeout::build(&a);
+    SyntheticTakeout::build(&b);
+
+    let archive = td.path().join("a.sqlite");
+    config_for(a)
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
+    let mut cfg = config_for(b);
+    cfg.source_change = SourceChange::Allow;
+    cfg.run(common_for(&archive)).into_result().unwrap();
+
+    let c = Connection::open(&archive).unwrap();
+    let inboxes: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM mailboxes WHERE name = 'Inbox'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(inboxes, 2);
+    let duplicated: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM (SELECT role FROM mailboxes WHERE role IS NOT NULL \
+             GROUP BY role HAVING COUNT(*) > 1)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(duplicated, 0);
 }
 
 #[test]
@@ -555,18 +640,24 @@ fn re_extraction_to_same_canonical_path_converges() {
     let td = TempDir::new().unwrap();
     SyntheticTakeout::build(td.path());
     let archive = td.path().join("a.sqlite");
-    run(common_for(&archive), config_for(td.path().to_path_buf())).unwrap();
+    config_for(td.path().to_path_buf())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
     let initial: i64 = {
         let c = Connection::open(&archive).unwrap();
-        count(&c, "emails")
+        common::count(&c, "emails")
     };
 
     fs::remove_dir_all(td.path().join("Takeout")).unwrap();
     SyntheticTakeout::build(td.path());
 
-    run(common_for(&archive), config_for(td.path().to_path_buf())).unwrap();
+    config_for(td.path().to_path_buf())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
     let c = Connection::open(&archive).unwrap();
-    assert_eq!(count(&c, "emails"), initial);
+    assert_eq!(common::count(&c, "emails"), initial);
 }
 
 #[test]
@@ -575,8 +666,8 @@ fn noautomap_disables_role_assignment() {
     SyntheticTakeout::build(td.path());
     let archive = td.path().join("a.sqlite");
     let mut cfg = config_for(td.path().to_path_buf());
-    cfg.automap = false;
-    run(common_for(&archive), cfg).unwrap();
+    cfg.automap = Automap::Disabled;
+    cfg.run(common_for(&archive)).into_result().unwrap();
     let conn = Connection::open(&archive).unwrap();
     let with_role: i64 = conn
         .query_row(
@@ -630,17 +721,20 @@ fn dry_run_creates_no_object_rows_in_archive() {
     SyntheticTakeout::build(td.path());
     let archive = td.path().join("a.sqlite");
     let mut common = common_for(&archive);
-    common.dry_run = true;
-    let summary = run(common, config_for(td.path().to_path_buf())).unwrap();
+    common.mode = RunMode::DryRun;
+    let summary = config_for(td.path().to_path_buf())
+        .run(common)
+        .into_result()
+        .unwrap();
 
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "emails"), 0);
-    assert_eq!(count(&conn, "mailboxes"), 0);
-    assert_eq!(count(&conn, "calendars"), 0);
-    assert_eq!(count(&conn, "calendar_events"), 0);
-    assert_eq!(count(&conn, "address_books"), 0);
-    assert_eq!(count(&conn, "contact_cards"), 0);
-    assert_eq!(count(&conn, "blobs"), 0);
+    assert_eq!(common::count(&conn, "emails"), 0);
+    assert_eq!(common::count(&conn, "mailboxes"), 0);
+    assert_eq!(common::count(&conn, "calendars"), 0);
+    assert_eq!(common::count(&conn, "calendar_events"), 0);
+    assert_eq!(common::count(&conn, "address_books"), 0);
+    assert_eq!(common::count(&conn, "contact_cards"), 0);
+    assert_eq!(common::count(&conn, "blobs"), 0);
     for (_, counts) in &summary.per_type {
         assert_eq!(counts.created, 0);
         assert_eq!(counts.fetched, 0);
@@ -658,19 +752,22 @@ fn byte_identical_message_in_two_mbox_files_dedupes_to_one_row() {
     fs::write(mail_dir.join("Github.mbox"), &body).unwrap();
 
     let archive = td.path().join("a.sqlite");
-    let summary = run(common_for(&archive), config_for(td.path().to_path_buf())).unwrap();
+    let summary = config_for(td.path().to_path_buf())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
 
     let conn = Connection::open(&archive).unwrap();
     assert_eq!(
-        count(&conn, "emails"),
+        common::count(&conn, "emails"),
         1,
         "the same bytes across two .mbox files must dedupe to one emails row"
     );
-    assert_eq!(count(&conn, "blobs"), 1, "blob layer dedupes too");
+    assert_eq!(common::count(&conn, "blobs"), 1, "blob layer dedupes too");
     let email = &summary
         .per_type
         .iter()
-        .find(|(n, _)| *n == "email")
+        .find(|(n, _)| *n == ObjectType::Email)
         .unwrap()
         .1;
     assert_eq!(email.created, 1);
@@ -696,7 +793,10 @@ fn two_ics_files_without_calname_merge_into_single_imported_calendar() {
     )
     .unwrap();
     let archive = td.path().join("a.sqlite");
-    run(common_for(&archive), config_for(td.path().to_path_buf())).unwrap();
+    config_for(td.path().to_path_buf())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
 
     let conn = Connection::open(&archive).unwrap();
     let imported_count: i64 = conn
@@ -719,18 +819,21 @@ fn empty_mbox_file_imports_with_no_failures() {
     fs::create_dir_all(&mail_dir).unwrap();
     fs::write(mail_dir.join("Empty.mbox"), b"").unwrap();
     let archive = td.path().join("a.sqlite");
-    let summary = run(common_for(&archive), config_for(td.path().to_path_buf())).unwrap();
+    let summary = config_for(td.path().to_path_buf())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
     let email = &summary
         .per_type
         .iter()
-        .find(|(n, _)| *n == "email")
+        .find(|(n, _)| *n == ObjectType::Email)
         .unwrap()
         .1;
     assert_eq!(email.created, 0);
     assert_eq!(email.failed, 0);
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "emails"), 0);
-    assert_eq!(count(&conn, "mailboxes"), 0);
+    assert_eq!(common::count(&conn, "emails"), 0);
+    assert_eq!(common::count(&conn, "mailboxes"), 0);
 }
 
 #[test]
@@ -744,7 +847,10 @@ fn chat_label_creates_chat_mailbox_with_no_role() {
     )
     .unwrap();
     let archive = td.path().join("a.sqlite");
-    run(common_for(&archive), config_for(td.path().to_path_buf())).unwrap();
+    config_for(td.path().to_path_buf())
+        .run(common_for(&archive))
+        .into_result()
+        .unwrap();
     let conn = Connection::open(&archive).unwrap();
     assert!(mailbox_names(&conn).contains("Chat"));
     let role: Option<String> = conn
@@ -767,8 +873,8 @@ fn noautomap_leaves_nested_mailboxes_role_null() {
     .unwrap();
     let archive = td.path().join("a.sqlite");
     let mut cfg = config_for(td.path().to_path_buf());
-    cfg.automap = false;
-    run(common_for(&archive), cfg).unwrap();
+    cfg.automap = Automap::Disabled;
+    cfg.run(common_for(&archive)).into_result().unwrap();
     let conn = Connection::open(&archive).unwrap();
     let with_role: i64 = conn
         .query_row(

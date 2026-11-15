@@ -4,66 +4,37 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::thread;
-use std::time::Duration;
+use std::sync::atomic::Ordering;
 
+use common::line_server::{LineServer, MockConn, Script};
 use encodify::base64::STANDARD;
 use rusqlite::Connection;
-use vandelay::db;
-use vandelay::imap::client::{ConnectMode, ImapClient};
+use vandelay::archive::Archive;
+use vandelay::archive::sources::SourceChange;
+use vandelay::error::ExitStatus;
+use vandelay::imap::automap::Automap;
+use vandelay::imap::client::ImapClient;
+use vandelay::imap::command::Command;
 use vandelay::imap::error::ImapError;
-use vandelay::imap::transport::Connector;
-use vandelay::logging::Logger;
-use vandelay::sync::CommonConfig;
-use vandelay::sync::import_imap::{ImapAuth, ImapImportConfig, run};
+use vandelay::imap::session::Compress;
+use vandelay::import::imap::DeletedMessages;
+use vandelay::import::imap::FolderScope;
+use vandelay::import::imap::MimeKeywords;
+use vandelay::import::imap::{ImapImport, SaslAuth};
+use vandelay::logging::{Level, Logger};
+use vandelay::net::http::TlsPolicy;
+use vandelay::net::sasl::SaslPayload;
+use vandelay::net::stream::Cleartext;
+use vandelay::net::stream::ConnectMode;
+use vandelay::net::stream::Connector;
+use vandelay::sync::{RunMode, RunOptions};
+use vandelay::types::ObjectType;
 
-type Script = Box<dyn FnOnce(&mut MockConn) -> std::io::Result<()> + Send + 'static>;
-
-struct MockImap {
-    addr: String,
-    port: u16,
-    _thread: thread::JoinHandle<()>,
-}
-
-struct MockConn {
-    reader: BufReader<TcpStream>,
-    writer: TcpStream,
-}
-
-impl MockConn {
-    fn write_line(&mut self, s: &str) -> std::io::Result<()> {
-        self.writer.write_all(s.as_bytes())?;
-        self.writer.write_all(b"\r\n")?;
-        self.writer.flush()
-    }
-
-    fn write_raw(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.writer.write_all(bytes)?;
-        self.writer.flush()
-    }
-
-    fn read_command(&mut self) -> std::io::Result<(String, String)> {
-        let mut line = String::new();
-        let n = self.reader.read_line(&mut line)?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "client closed",
-            ));
-        }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        let (tag, rest) = trimmed
-            .split_once(' ')
-            .map(|(t, r)| (t.to_owned(), r.to_owned()))
-            .unwrap_or_else(|| (trimmed.to_owned(), String::new()));
-        Ok((tag, rest))
-    }
-}
+struct MockImap(LineServer);
 
 impl MockImap {
     fn start<H>(handler: H) -> MockImap
@@ -74,111 +45,84 @@ impl MockImap {
     }
 
     fn start_scripts(scripts: Vec<Script>) -> MockImap {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("local_addr").port();
-        let addr = format!("127.0.0.1:{port}");
-        let queue: Mutex<Vec<Script>> = Mutex::new(scripts.into_iter().rev().collect());
-        let queue = std::sync::Arc::new(queue);
-        let thread = thread::spawn(move || {
-            for stream in listener.incoming() {
-                let stream = match stream {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-                let writer = stream.try_clone().expect("clone");
-                let reader = BufReader::new(stream);
-                let mut conn = MockConn { reader, writer };
-                let script = queue.lock().expect("queue").pop();
-                if let Some(script) = script {
-                    thread::spawn(move || {
-                        let _ = script(&mut conn);
-                    });
-                } else {
-                    let _ = conn.write_line("* BYE no script left");
-                }
-            }
-        });
-        MockImap {
-            addr,
-            port,
-            _thread: thread,
-        }
+        MockImap(LineServer::start(scripts, "* BYE no script left"))
     }
 
     fn url(&self) -> String {
-        format!("imap://{}", self.addr)
+        self.0.url("imap")
+    }
+}
+
+impl MockConn {
+    fn read_command(&mut self) -> std::io::Result<(String, String)> {
+        let line = self.read_line()?;
+        Ok(match line.split_once(' ') {
+            Some((tag, rest)) => (tag.to_owned(), rest.to_owned()),
+            None => (line, String::new()),
+        })
     }
 }
 
 fn cleartext_connector() -> Connector {
-    Connector::new(true).expect("connector")
+    Connector::new(TlsPolicy::AcceptInvalid).expect("connector")
 }
 
 fn connect_mock(server: &MockImap) -> Result<ImapClient, ImapError> {
     ImapClient::connect(
         &cleartext_connector(),
         "127.0.0.1",
-        server.port,
+        server.0.port,
         ConnectMode::Plain,
-        Logger::from_flags(false, 0),
+        Logger::new(Level::Default),
     )
 }
-
-fn tempfile(label: &str) -> PathBuf {
-    let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let mut p = std::env::temp_dir();
-    p.push(format!("vandelay_mock_imap_{label}_{counter}.sqlite"));
-    if p.exists() {
-        let _ = std::fs::remove_file(&p);
-    }
-    p
-}
-
-static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 fn run_import(
     server: &MockImap,
     user: &str,
     archive: PathBuf,
-    config_tweak: impl FnOnce(&mut ImapImportConfig),
+    config_tweak: impl FnOnce(&mut ImapImport),
 ) -> Result<vandelay::sync::Summary, vandelay::error::Error> {
-    let common = CommonConfig {
+    run_import_in(server, user, archive, RunMode::Apply, config_tweak)
+}
+
+fn run_import_in(
+    server: &MockImap,
+    user: &str,
+    archive: PathBuf,
+    mode: RunMode,
+    config_tweak: impl FnOnce(&mut ImapImport),
+) -> Result<vandelay::sync::Summary, vandelay::error::Error> {
+    let common = RunOptions {
         archive: archive.clone(),
         threads: 1,
-        dry_run: false,
+        mode,
         max_retries: 1,
-        allow_invalid_certs: false,
-        logger: Logger::from_flags(true, 0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let mut config = ImapImportConfig {
+    let mut config = ImapImport {
         url: server.url(),
-        auth: ImapAuth::Basic {
+        auth: SaslAuth::Basic {
             user: user.to_owned(),
             password: "p@ss".to_owned(),
         },
-        allow_cleartext: true,
-        compress: false,
+        cleartext: Cleartext::Allow,
+        compress: Compress::Off,
         include: Vec::new(),
         exclude: Vec::new(),
         exclude_special: Vec::new(),
         folder: Vec::new(),
-        subscribed_only: false,
-        automap: true,
-        include_deleted: false,
-        mime_keywords: false,
+        scope: FolderScope::All,
+        automap: Automap::Enabled,
+        deleted: DeletedMessages::Skip,
+        mime_keywords: MimeKeywords::Skip,
         fetch_batch: 256,
         imap_connections: 1,
-        allow_source_change: false,
+        source_change: SourceChange::Reject,
     };
     config_tweak(&mut config);
-    run(common, config)
-}
-
-fn count(conn: &Connection, table: &str) -> i64 {
-    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-        .unwrap_or(0)
+    config.run(common).into_result()
 }
 
 fn folder_role(conn: &Connection, name: &str) -> Option<String> {
@@ -201,10 +145,10 @@ fn greeting_capabilities_are_picked_up() {
         Ok(())
     });
     let client = connect_mock(&server).expect("connect");
-    assert!(client.has_capability("IMAP4rev2"));
-    assert!(client.has_capability("AUTH=PLAIN"));
-    assert!(client.has_capability("LITERAL+"));
-    assert!(!client.has_capability("XOAUTH2"));
+    assert!(client.capabilities().contains("IMAP4rev2"));
+    assert!(client.capabilities().contains("AUTH=PLAIN"));
+    assert!(client.capabilities().contains("LITERAL+"));
+    assert!(!client.capabilities().contains("XOAUTH2"));
 }
 
 #[test]
@@ -226,7 +170,10 @@ fn authenticate_oauthbearer_sasl_ir() {
     });
     let mut client = connect_mock(&server).expect("connect");
     client
-        .authenticate_oauthbearer("alice@example.com", "ya29.token")
+        .authenticate(SaslPayload::OAuthBearer {
+            user: "alice@example.com",
+            token: "ya29.token",
+        })
         .expect("oauthbearer auth");
 }
 
@@ -240,9 +187,7 @@ fn authenticate_oauthbearer_continuation_payload_uses_gs2_header() {
         let (tag, cmd) = conn.read_command()?;
         assert_eq!(cmd, "AUTHENTICATE OAUTHBEARER");
         conn.write_line("+ ")?;
-        let mut line = String::new();
-        conn.reader.read_line(&mut line)?;
-        let payload = line.trim_end_matches(['\r', '\n']).to_owned();
+        let payload = conn.read_line()?;
         let decoded = STANDARD.decode(&payload).expect("base64");
         let text = std::str::from_utf8(&decoded).unwrap_or("");
         assert!(
@@ -263,7 +208,10 @@ fn authenticate_oauthbearer_continuation_payload_uses_gs2_header() {
     });
     let mut client = connect_mock(&server).expect("connect");
     client
-        .authenticate_oauthbearer("alice@example.com", "ya29.token")
+        .authenticate(SaslPayload::OAuthBearer {
+            user: "alice@example.com",
+            token: "ya29.token",
+        })
         .expect("oauthbearer auth");
 }
 
@@ -285,7 +233,12 @@ fn authenticate_plain_with_sasl_ir() {
         Ok(())
     });
     let mut client = connect_mock(&server).expect("connect");
-    client.authenticate_plain("alice", "p@ss").expect("auth");
+    client
+        .authenticate(SaslPayload::Plain {
+            authcid: "alice",
+            password: "p@ss",
+        })
+        .expect("auth");
 }
 
 #[test]
@@ -298,18 +251,19 @@ fn authenticate_plain_continuation_path() {
         let (tag, cmd) = conn.read_command()?;
         assert_eq!(cmd, "AUTHENTICATE PLAIN");
         conn.write_line("+ ")?;
-        let payload = {
-            let mut line = String::new();
-            conn.reader.read_line(&mut line)?;
-            line.trim_end_matches(['\r', '\n']).to_owned()
-        };
+        let payload = conn.read_line()?;
         assert!(!payload.is_empty(), "client should send the base64 payload");
         conn.write_line(&format!("{tag} OK welcome"))?;
         let _ = conn.read_command();
         Ok(())
     });
     let mut client = connect_mock(&server).expect("connect");
-    client.authenticate_plain("alice", "p@ss").expect("auth");
+    client
+        .authenticate(SaslPayload::Plain {
+            authcid: "alice",
+            password: "p@ss",
+        })
+        .expect("auth");
 }
 
 #[test]
@@ -326,7 +280,12 @@ fn authenticate_plain_refused_falls_back_to_login() {
         Ok(())
     });
     let mut client = connect_mock(&server).expect("connect");
-    let err = client.authenticate_plain("alice", "p@ss").unwrap_err();
+    let err = client
+        .authenticate(SaslPayload::Plain {
+            authcid: "alice",
+            password: "p@ss",
+        })
+        .unwrap_err();
     assert!(matches!(err, ImapError::AuthFailed(_)));
 }
 
@@ -362,7 +321,7 @@ fn run_collect_parses_fetch_with_literal_body() {
     });
     let mut client = connect_mock(&server).expect("connect");
     let r = client
-        .run_collect("UID FETCH 5 (UID BODY.PEEK[])")
+        .run_collect(&Command::Raw("UID FETCH 5 (UID BODY.PEEK[])"))
         .expect("fetch");
     let body = r.untagged.iter().find_map(|u| match u {
         vandelay::imap::response::Untagged::Fetch { items, .. } => Some(items.clone()),
@@ -570,27 +529,27 @@ fn coordinator_imports_one_folder_one_message() {
             vec![(1, 1, MSG_BODY)],
         ),
     ]);
-    let archive = tempfile("happy");
+    let archive = common::tmp_archive("happy");
     let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
     let mailbox = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "mailbox")
+        .find(|(k, _)| *k == ObjectType::Mailbox)
         .unwrap();
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert_eq!(mailbox.1.created, 1);
     assert_eq!(email.1.created, 1, "summary={summary:?}");
     assert_eq!(email.1.fetched, 1);
-    let conn = Connection::open(&archive).unwrap();
-    db::init::apply_schema(&conn).unwrap();
-    assert_eq!(count(&conn, "mailboxes"), 1);
-    assert_eq!(count(&conn, "emails"), 1);
-    assert_eq!(count(&conn, "blobs"), 1);
-    assert_eq!(folder_role(&conn, "INBOX"), Some("inbox".to_owned()));
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
+    assert_eq!(common::count(conn, "mailboxes"), 1);
+    assert_eq!(common::count(conn, "emails"), 1);
+    assert_eq!(common::count(conn, "blobs"), 1);
+    assert_eq!(folder_role(conn, "INBOX"), Some("inbox".to_owned()));
 }
 
 const DOVECOT_PRE_LOGIN_CAPS: &str =
@@ -637,17 +596,17 @@ fn coordinator_accepts_dovecot_post_login_capability_with_imapsieve_url() {
             vec![(1, 1, MSG_BODY)],
         ),
     ]);
-    let archive = tempfile("dovecot-imapsieve");
+    let archive = common::tmp_archive("dovecot-imapsieve");
     let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert_eq!(email.1.created, 1, "summary={summary:?}");
-    let conn = Connection::open(&archive).unwrap();
-    db::init::apply_schema(&conn).unwrap();
-    assert_eq!(count(&conn, "emails"), 1);
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
+    assert_eq!(common::count(conn, "emails"), 1);
 }
 
 #[test]
@@ -679,10 +638,10 @@ fn coordinator_uses_esearch_when_advertised() {
             vec![(1, 1, MSG_BODY), (2, 2, MSG_BODY), (3, 3, MSG_BODY)],
         ),
     ]);
-    let archive = tempfile("esearch");
+    let archive = common::tmp_archive("esearch");
     let _ = run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
     let conn = Connection::open(&archive).unwrap();
-    assert!(count(&conn, "emails") >= 1);
+    assert!(common::count(&conn, "emails") >= 1);
 }
 
 #[test]
@@ -717,12 +676,12 @@ fn coordinator_falls_back_when_esearch_returns_bad() {
             vec![(1, 1, MSG_BODY)],
         ),
     ]);
-    let archive = tempfile("esearch_fallback");
+    let archive = common::tmp_archive("esearch_fallback");
     let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert_eq!(
         email.1.created, 1,
@@ -762,12 +721,12 @@ fn coordinator_falls_back_to_uid_fetch_when_search_all_bad() {
             vec![(1, 1, MSG_BODY)],
         ),
     ]);
-    let archive = tempfile("search_fallback");
+    let archive = common::tmp_archive("search_fallback");
     let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert_eq!(email.1.created, 1);
 }
@@ -793,17 +752,17 @@ fn coordinator_imports_message_despite_size_mismatch() {
         Ok(())
     });
     let server = MockImap::start_scripts(vec![control, worker]);
-    let archive = tempfile("size_mismatch");
+    let archive = common::tmp_archive("size_mismatch");
     let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert_eq!(email.1.skipped, 0);
     assert_eq!(email.1.created, 1);
     let dbc = Connection::open(&archive).unwrap();
-    assert_eq!(count(&dbc, "emails"), 1);
+    assert_eq!(common::count(&dbc, "emails"), 1);
 }
 
 fn single_inbox_scripts(uidvalidity: u32, uidnext: u32, body: &'static [u8]) -> Vec<Script> {
@@ -826,16 +785,16 @@ fn coordinator_uidvalidity_change_wipes_folder_emails() {
     scripts.extend(single_inbox_scripts(100, 2, MSG_BODY));
     scripts.extend(single_inbox_scripts(999, 2, MSG_BODY));
     let server = MockImap::start_scripts(scripts);
-    let archive = tempfile("uidvalidity");
+    let archive = common::tmp_archive("uidvalidity");
     run_import(&server, "alice", archive.clone(), |_| {}).expect("first import");
     let dbc = Connection::open(&archive).unwrap();
-    assert_eq!(count(&dbc, "emails"), 1);
+    assert_eq!(common::count(&dbc, "emails"), 1);
     drop(dbc);
 
     let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("second import");
     let dbc = Connection::open(&archive).unwrap();
-    assert_eq!(count(&dbc, "emails"), 1);
-    assert_eq!(count(&dbc, "blobs"), 1);
+    assert_eq!(common::count(&dbc, "emails"), 1);
+    assert_eq!(common::count(&dbc, "blobs"), 1);
     let new_uv: u32 = dbc
         .query_row(
             "SELECT uidvalidity FROM imap_folder_state WHERE folder = 'INBOX'",
@@ -847,12 +806,47 @@ fn coordinator_uidvalidity_change_wipes_folder_emails() {
     let email_after = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap()
         .1
         .clone();
     assert_eq!(email_after.deleted, 1, "stale UV emails wiped");
     assert_eq!(email_after.created, 1, "re-imported under new UV");
+}
+
+#[test]
+fn coordinator_vanished_message_leaves_no_orphan_blob() {
+    // R14: the IMAP importer runs blob GC after a clean run
+    let mut scripts: Vec<Script> = Vec::new();
+    scripts.extend(single_inbox_scripts(100, 2, MSG_BODY));
+    scripts.push(control_script_one_folder(100, 2, &[]));
+    scripts.push(worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"));
+    let server = MockImap::start_scripts(scripts);
+    let archive = common::tmp_archive("orphan_blob");
+    run_import(&server, "alice", archive.clone(), |_| {}).expect("first import");
+    let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("second import");
+    assert_eq!(summary.get(ObjectType::Email).unwrap().deleted, 1);
+    let dbc = Connection::open(&archive).unwrap();
+    assert_eq!(common::count(&dbc, "emails"), 0);
+    assert_eq!(common::count(&dbc, "blobs"), 0);
+}
+
+#[test]
+fn coordinator_dry_run_after_import_predicts_nothing_new() {
+    // R7: a dry run diffs against the registered source, not an empty one
+    let mut scripts: Vec<Script> = Vec::new();
+    scripts.extend(single_inbox_scripts(100, 2, MSG_BODY));
+    scripts.push(control_script_one_folder(100, 2, &[1]));
+    let server = MockImap::start_scripts(scripts);
+    let archive = common::tmp_archive("dry_after_import");
+    run_import(&server, "alice", archive.clone(), |_| {}).expect("first import");
+    let summary =
+        run_import_in(&server, "alice", archive.clone(), RunMode::DryRun, |_| {}).expect("dry run");
+    let mut summary = summary;
+    let mailbox = *summary.plan(ObjectType::Mailbox);
+    let email = *summary.plan(ObjectType::Email);
+    assert_eq!((mailbox.new, mailbox.vanished, mailbox.present), (0, 0, 1));
+    assert_eq!((email.new, email.vanished, email.present), (0, 0, 1));
 }
 
 #[test]
@@ -863,23 +857,165 @@ fn coordinator_present_run_is_convergent() {
     scripts.push(control_script_present_flags(100, 2, &[1], &[(1, "\\Seen")]));
     scripts.push(worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"));
     let server = MockImap::start_scripts(scripts);
-    let archive = tempfile("converge");
+    let archive = common::tmp_archive("converge");
     run_import(&server, "alice", archive.clone(), |_| {}).expect("first import");
     let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("second import");
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert_eq!(email.1.created, 0, "convergent run creates nothing");
     assert_eq!(email.1.deleted, 0, "convergent run deletes nothing");
     assert_eq!(email.1.updated, 0, "unchanged flags update nothing");
     let dbc = Connection::open(&archive).unwrap();
     assert_eq!(
-        count(&dbc, "blobs"),
+        common::count(&dbc, "blobs"),
         1,
         "no body re-fetched on a present-only run"
     );
+}
+
+#[test]
+fn coordinator_deletes_only_the_folders_the_server_no_longer_lists() {
+    // a mapped folder absent from LIST is swept; listed folders stay
+    let mut scripts: Vec<Script> = Vec::new();
+    scripts.extend(single_inbox_scripts(100, 2, MSG_BODY));
+    scripts.push(control_script_present_flags(100, 2, &[1], &[(1, "\\Seen")]));
+    scripts.push(worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"));
+    let server = MockImap::start_scripts(scripts);
+    let archive = common::tmp_archive("vanished_folder");
+    run_import(&server, "alice", archive.clone(), |_| {}).expect("first import");
+    let dbc = Connection::open(&archive).unwrap();
+    dbc.execute_batch(
+        "INSERT INTO mailboxes (id, name) VALUES (900, 'Old');
+         INSERT INTO sync_id_imap (source_id, type_name, folder, uidvalidity, uid, local_id)
+         SELECT id, 'mailbox', 'Old', 0, 0, 900 FROM sources;",
+    )
+    .unwrap();
+    drop(dbc);
+
+    let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("second import");
+    let dbc = Connection::open(&archive).unwrap();
+    let names: Vec<String> = dbc
+        .prepare("SELECT name FROM mailboxes ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(names, ["INBOX"]);
+    assert_eq!(summary.get(ObjectType::Mailbox).unwrap().deleted, 1);
+    assert_eq!(common::count(&dbc, "emails"), 1);
+}
+
+#[test]
+fn coordinator_treats_a_zero_fetch_batch_as_one() {
+    // --fetch-batch 0 is clamped to 1 instead of panicking in the chunker
+    let server = MockImap::start_scripts(single_inbox_scripts(100, 2, MSG_BODY));
+    let archive = common::tmp_archive("fetch_batch_zero");
+    let summary =
+        run_import(&server, "alice", archive.clone(), |c| c.fetch_batch = 0).expect("import");
+    assert_eq!(summary.get(ObjectType::Email).unwrap().created, 1);
+}
+
+#[test]
+fn coordinator_fetches_new_uids_in_fetch_batch_sized_chunks() {
+    // ten new UIDs with --fetch-batch 3 go out as 1:3, 4:6, 7:9 and 10
+    static SETS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    SETS.lock().unwrap().clear();
+    let worker: Script = Box::new(|conn: &mut MockConn| -> std::io::Result<()> {
+        auth_preamble(conn, "IMAP4rev2 LITERAL+ AUTH=PLAIN")?;
+        loop {
+            let Ok((tag, cmd)) = conn.read_command() else {
+                return Ok(());
+            };
+            if cmd.starts_with("SELECT") {
+                write_select(conn, &tag, 100, 11, 10)?;
+            } else if let Some(rest) = cmd.strip_prefix("UID FETCH ") {
+                let set = rest.split_whitespace().next().unwrap_or("");
+                SETS.lock().unwrap().push(set.to_owned());
+                for (seq, uid) in parse_uid_set(set).into_iter().enumerate() {
+                    write_fetch_message(conn, seq as u32 + 1, uid, MSG_BODY)?;
+                }
+                conn.write_line(&format!("{tag} OK"))?;
+            } else if cmd.starts_with("LOGOUT") {
+                conn.write_line("* BYE")?;
+                conn.write_line(&format!("{tag} OK"))?;
+                return Ok(());
+            } else {
+                conn.write_line(&format!("{tag} OK"))?;
+            }
+        }
+    });
+    let server = MockImap::start_scripts(vec![
+        control_script_one_folder(100, 11, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+        worker,
+    ]);
+    let archive = common::tmp_archive("fetch_batch_chunks");
+    let summary =
+        run_import(&server, "alice", archive.clone(), |c| c.fetch_batch = 3).expect("import");
+    assert_eq!(summary.get(ObjectType::Email).unwrap().created, 10);
+    assert_eq!(*SETS.lock().unwrap(), ["1:3", "4:6", "7:9", "10"]);
+}
+
+#[test]
+fn coordinator_counts_no_flag_updates_when_a_later_flag_batch_fails() {
+    // a BAD on the second flag batch rolls back the first, so nothing counts as updated
+    let mut scripts: Vec<Script> = vec![
+        control_script_one_folder(100, 3, &[1, 2]),
+        worker_fetch_script(
+            "IMAP4rev2 LITERAL+ AUTH=PLAIN",
+            "INBOX",
+            100,
+            3,
+            2,
+            vec![(1, 1, MSG_BODY), (2, 2, MSG_BODY_KEYWORDS)],
+        ),
+    ];
+    scripts.push(Box::new(|conn: &mut MockConn| -> std::io::Result<()> {
+        auth_preamble(conn, "IMAP4rev2 LITERAL+ AUTH=PLAIN")?;
+        let (tag, _) = conn.read_command()?;
+        conn.write_line("* LIST () \"/\" \"INBOX\"")?;
+        conn.write_line(&format!("{tag} OK LIST done"))?;
+        let (tag, _) = conn.read_command()?;
+        conn.write_line(&format!("{tag} OK LSUB done"))?;
+        let (tag, _) = conn.read_command()?;
+        write_select(conn, &tag, 100, 3, 2)?;
+        let (tag, _) = conn.read_command()?;
+        conn.write_line("* SEARCH 1 2")?;
+        conn.write_line(&format!("{tag} OK SEARCH done"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert!(cmd.starts_with("UID FETCH 1 "), "got {cmd}");
+        conn.write_line("* 1 FETCH (UID 1 FLAGS (\\Seen \\Flagged))")?;
+        conn.write_line(&format!("{tag} OK FETCH done"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert!(cmd.starts_with("UID FETCH 2 "), "got {cmd}");
+        conn.write_line(&format!("{tag} BAD flags unavailable"))?;
+        drain_until_close(conn);
+        Ok(())
+    }));
+    scripts.push(worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"));
+    let server = MockImap::start_scripts(scripts);
+    let archive = common::tmp_archive("flag_batch_fails");
+    run_import(&server, "alice", archive.clone(), |_| {}).expect("first import");
+    let result = run_import(&server, "alice", archive.clone(), |c| c.fetch_batch = 1);
+    let summary = match result {
+        Ok(summary) => summary,
+        Err(e) => panic!("a failed flag batch is per folder: {e:?}"),
+    };
+    let email = summary.get(ObjectType::Email).unwrap();
+    assert_eq!(email.updated, 0, "{summary:?}");
+    assert!(summary.any_failed());
+    let dbc = Connection::open(&archive).unwrap();
+    let flagged: i64 = dbc
+        .query_row(
+            "SELECT count(*) FROM emails WHERE keywords LIKE '%$flagged%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(flagged, 0, "batch 1 was rolled back");
 }
 
 #[test]
@@ -894,13 +1030,13 @@ fn coordinator_present_flag_change_updates_keywords() {
     ));
     scripts.push(worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"));
     let server = MockImap::start_scripts(scripts);
-    let archive = tempfile("flagupdate");
+    let archive = common::tmp_archive("flagupdate");
     run_import(&server, "alice", archive.clone(), |_| {}).expect("first import");
     let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("second import");
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert_eq!(
         email.1.updated, 1,
@@ -909,7 +1045,7 @@ fn coordinator_present_flag_change_updates_keywords() {
     assert_eq!(email.1.created, 0, "present message is not re-created");
     assert_eq!(email.1.fetched, 0, "no body fetched on a present-only run");
     let dbc = Connection::open(&archive).unwrap();
-    assert_eq!(count(&dbc, "blobs"), 1, "body not re-fetched");
+    assert_eq!(common::count(&dbc, "blobs"), 1, "body not re-fetched");
     let kw: String = dbc
         .query_row("SELECT keywords FROM emails LIMIT 1", [], |r| r.get(0))
         .unwrap();
@@ -944,9 +1080,9 @@ fn coordinator_mime_keywords_imported_and_kept_on_flag_refresh() {
     ));
     scripts.push(worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"));
     let server = MockImap::start_scripts(scripts);
-    let archive = tempfile("mime_keywords");
+    let archive = common::tmp_archive("mime_keywords");
     run_import(&server, "alice", archive.clone(), |c| {
-        c.mime_keywords = true
+        c.mime_keywords = MimeKeywords::Extract
     })
     .expect("first import");
     let first = stored_keywords(&archive);
@@ -955,13 +1091,13 @@ fn coordinator_mime_keywords_imported_and_kept_on_flag_refresh() {
         "{first:?}"
     );
     let summary = run_import(&server, "alice", archive.clone(), |c| {
-        c.mime_keywords = true
+        c.mime_keywords = MimeKeywords::Extract
     })
     .expect("second import");
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert_eq!(email.1.created, 0);
     assert_eq!(email.1.updated, 1);
@@ -975,7 +1111,7 @@ fn coordinator_mime_keywords_imported_and_kept_on_flag_refresh() {
 #[test]
 fn coordinator_ignores_mime_keywords_by_default() {
     let server = MockImap::start_scripts(single_inbox_scripts(100, 2, MSG_BODY_KEYWORDS));
-    let archive = tempfile("mime_keywords_off");
+    let archive = common::tmp_archive("mime_keywords_off");
     run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
     let kws = stored_keywords(&archive);
     assert!(
@@ -996,13 +1132,13 @@ fn coordinator_present_newly_deleted_is_left_intact() {
     ));
     scripts.push(worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"));
     let server = MockImap::start_scripts(scripts);
-    let archive = tempfile("presentdeleted");
+    let archive = common::tmp_archive("presentdeleted");
     run_import(&server, "alice", archive.clone(), |_| {}).expect("first import");
     let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("second import");
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert_eq!(
         email.1.updated, 0,
@@ -1010,7 +1146,7 @@ fn coordinator_present_newly_deleted_is_left_intact() {
     );
     let dbc = Connection::open(&archive).unwrap();
     assert_eq!(
-        count(&dbc, "emails"),
+        common::count(&dbc, "emails"),
         1,
         "the archived message is preserved"
     );
@@ -1050,7 +1186,7 @@ fn coordinator_special_use_drives_role() {
         control,
         worker_idle_script("IMAP4rev2 LIST-EXTENDED SPECIAL-USE LITERAL+"),
     ]);
-    let archive = tempfile("specialuse");
+    let archive = common::tmp_archive("specialuse");
     run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
     let conn = Connection::open(&archive).unwrap();
     assert_eq!(folder_role(&conn, "INBOX"), Some("inbox".to_owned()));
@@ -1086,7 +1222,7 @@ fn coordinator_omits_special_use_when_unadvertised() {
         control,
         worker_idle_script("IMAP4rev2 LIST-EXTENDED LIST-STATUS LITERAL+"),
     ]);
-    let archive = tempfile("nospecialuse");
+    let archive = common::tmp_archive("nospecialuse");
     run_import(&server, "alice", archive.clone(), |_| {})
         .expect("import must not send unadvertised SPECIAL-USE");
     let conn = Connection::open(&archive).unwrap();
@@ -1123,12 +1259,12 @@ fn coordinator_skips_deleted_messages_by_default() {
         Ok(())
     });
     let server = MockImap::start_scripts(vec![control, worker]);
-    let archive = tempfile("deleted");
+    let archive = common::tmp_archive("deleted");
     let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert_eq!(email.1.created, 1, "only live message imported");
     assert_eq!(email.1.skipped, 1, "deleted skipped by default");
@@ -1149,7 +1285,7 @@ fn coordinator_source_change_detected_on_different_url() {
         control1,
         worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"),
     ]);
-    let archive = tempfile("srcchange");
+    let archive = common::tmp_archive("srcchange");
     run_import(&server1, "alice", archive.clone(), |_| {}).expect("first");
 
     let control2: Script = Box::new(|conn: &mut MockConn| -> std::io::Result<()> {
@@ -1279,7 +1415,7 @@ fn coordinator_dispatches_to_multiple_worker_connections() {
     };
     let server =
         MockImap::start_scripts(vec![control, make_worker(), make_worker(), make_worker()]);
-    let archive = tempfile("parallel");
+    let archive = common::tmp_archive("parallel");
     let summary = run_import(&server, "alice", archive.clone(), |c| {
         c.imap_connections = 3;
         c.fetch_batch = 3;
@@ -1288,7 +1424,7 @@ fn coordinator_dispatches_to_multiple_worker_connections() {
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert_eq!(email.1.created, 8, "all 8 messages imported");
 
@@ -1373,7 +1509,7 @@ fn coordinator_uses_list_status_to_skip_empty_folder_select() {
             vec![(1, 1, MSG_BODY)],
         ),
     ]);
-    let archive = tempfile("liststatus");
+    let archive = common::tmp_archive("liststatus");
     let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
 
     let n = SELECTS.load(Ordering::SeqCst);
@@ -1381,7 +1517,7 @@ fn coordinator_uses_list_status_to_skip_empty_folder_select() {
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert_eq!(email.1.created, 1);
 }
@@ -1430,7 +1566,7 @@ fn coordinator_noops_between_folders() {
         control,
         worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"),
     ]);
-    let archive = tempfile("noop");
+    let archive = common::tmp_archive("noop");
     let _ = run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
     assert_eq!(
         NOOPS.load(Ordering::SeqCst),
@@ -1477,13 +1613,13 @@ fn coordinator_retries_transient_no_on_uid_search() {
             vec![(1, 1, MSG_BODY)],
         ),
     ]);
-    let archive = tempfile("retry");
+    let archive = common::tmp_archive("retry");
     let summary =
         run_import(&server, "alice", archive.clone(), |_| {}).expect("import succeeds via retry");
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert_eq!(email.1.created, 1);
     assert_eq!(
@@ -1526,7 +1662,7 @@ fn coordinator_auth_plain_refused_then_login_succeeds() {
         control,
         worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"),
     ]);
-    let archive = tempfile("plain_to_login");
+    let archive = common::tmp_archive("plain_to_login");
     let summary = run_import(&server, "alice", archive, |_| {}).expect("import");
     assert!(!summary.any_failed());
 }
@@ -1547,10 +1683,10 @@ fn coordinator_auth_plain_and_login_both_refused_aborts_run() {
         let _ = conn.read_command();
         Ok(())
     });
-    let archive = tempfile("dual_refuse");
+    let archive = common::tmp_archive("dual_refuse");
     let err = run_import(&server, "alice", archive, |_| {}).unwrap_err();
     assert!(matches!(err, vandelay::error::Error::Connection(_)));
-    assert_eq!(err.exit_code(), 2);
+    assert_eq!(err.exit_status(), ExitStatus::Connection);
 }
 
 #[test]
@@ -1583,12 +1719,12 @@ fn coordinator_skips_folder_on_select_no() {
         control,
         worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"),
     ]);
-    let archive = tempfile("select_no");
+    let archive = common::tmp_archive("select_no");
     let summary = run_import(&server, "alice", archive, |_| {}).expect("import");
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert!(email.1.failed >= 1);
 }
@@ -1615,15 +1751,15 @@ fn coordinator_include_deleted_imports_with_dollar_deleted_keyword() {
         Ok(())
     });
     let server = MockImap::start_scripts(vec![control, worker]);
-    let archive = tempfile("include_deleted");
+    let archive = common::tmp_archive("include_deleted");
     let summary = run_import(&server, "alice", archive.clone(), |c| {
-        c.include_deleted = true;
+        c.deleted = DeletedMessages::Keep;
     })
     .expect("import");
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert_eq!(email.1.created, 1);
     let conn = Connection::open(&archive).unwrap();
@@ -1654,9 +1790,9 @@ fn coordinator_noautomap_leaves_role_null_on_heuristic_match() {
         control,
         worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"),
     ]);
-    let archive = tempfile("noautomap");
+    let archive = common::tmp_archive("noautomap");
     run_import(&server, "alice", archive.clone(), |c| {
-        c.automap = false;
+        c.automap = Automap::Disabled;
     })
     .expect("import");
     let conn = Connection::open(&archive).unwrap();
@@ -1696,13 +1832,13 @@ fn coordinator_subscribed_only_excludes_unsubscribed() {
         control,
         worker_idle_script("IMAP4rev2 LIST-EXTENDED SPECIAL-USE LITERAL+ AUTH=PLAIN"),
     ]);
-    let archive = tempfile("subscribed_only");
+    let archive = common::tmp_archive("subscribed_only");
     run_import(&server, "alice", archive.clone(), |c| {
-        c.subscribed_only = true;
+        c.scope = FolderScope::Subscribed;
     })
     .expect("import");
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "mailboxes"), 1);
+    assert_eq!(common::count(&conn, "mailboxes"), 1);
     let n: String = conn
         .query_row("SELECT name FROM mailboxes LIMIT 1", [], |r| r.get(0))
         .unwrap();
@@ -1730,7 +1866,7 @@ fn coordinator_imap4rev1_only_works() {
         control,
         worker_idle_script("IMAP4rev1 LITERAL+ AUTH=PLAIN"),
     ]);
-    let archive = tempfile("imap4rev1");
+    let archive = common::tmp_archive("imap4rev1");
     let summary = run_import(&server, "alice", archive, |_| {}).expect("import");
     assert!(!summary.any_failed());
 }
@@ -1774,7 +1910,7 @@ fn coordinator_enables_utf8_accept_when_advertised() {
         control,
         worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN ENABLE UTF8=ACCEPT"),
     ]);
-    let archive = tempfile("utf8accept");
+    let archive = common::tmp_archive("utf8accept");
     run_import(&server, "alice", archive, |_| {}).expect("import");
     assert!(SAW_ENABLE.load(Ordering::SeqCst), "ENABLE was issued");
 }
@@ -1821,7 +1957,7 @@ fn coordinator_skips_enable_when_utf8_accept_absent() {
         control,
         worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"),
     ]);
-    let archive = tempfile("noutf8");
+    let archive = common::tmp_archive("noutf8");
     run_import(&server, "alice", archive, |_| {}).expect("import");
     assert!(
         !SAW_ENABLE.load(Ordering::SeqCst),
@@ -1850,7 +1986,7 @@ fn coordinator_inbox_casefold_lowercase_input() {
         control,
         worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"),
     ]);
-    let archive = tempfile("inbox_casefold");
+    let archive = common::tmp_archive("inbox_casefold");
     run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
     let conn = Connection::open(&archive).unwrap();
     assert_eq!(folder_role(&conn, "INBOX"), Some("inbox".to_owned()));
@@ -1876,10 +2012,10 @@ fn coordinator_authenticationfailed_yields_exit2_connection_error() {
         let _ = conn.read_command();
         Ok(())
     });
-    let archive = tempfile("authfail");
+    let archive = common::tmp_archive("authfail");
     let err = run_import(&server, "alice", archive, |_| {}).unwrap_err();
     assert!(matches!(err, vandelay::error::Error::Connection(_)));
-    assert_eq!(err.exit_code(), 2);
+    assert_eq!(err.exit_status(), ExitStatus::Connection);
 }
 
 fn read_select_mailbox(conn: &mut MockConn) -> std::io::Result<(String, String)> {
@@ -1888,9 +2024,7 @@ fn read_select_mailbox(conn: &mut MockConn) -> std::io::Result<(String, String)>
         .strip_prefix("SELECT ")
         .unwrap_or_else(|| panic!("expected SELECT, got {cmd}"));
     if arg.starts_with('{') {
-        let mut line = String::new();
-        conn.reader.read_line(&mut line)?;
-        Ok((tag, line.trim_end_matches(['\r', '\n']).to_owned()))
+        Ok((tag, conn.read_line()?))
     } else {
         Ok((tag, arg.trim_matches('"').to_owned()))
     }
@@ -1939,12 +2073,12 @@ fn utf8_accept_server_gets_the_folder_name_back_as_utf8() {
     });
 
     let server = MockImap::start_scripts(vec![control, worker]);
-    let archive = tempfile("utf8_accept_name");
+    let archive = common::tmp_archive("utf8_accept_name");
     let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert_eq!(email.1.failed, 0, "summary={summary:?}");
     assert_eq!(email.1.created, 1);
@@ -1983,12 +2117,12 @@ fn mutf7_server_gets_the_folder_name_back_as_mutf7() {
     });
 
     let server = MockImap::start_scripts(vec![control, worker_idle_script("IMAP4rev2 LITERAL+")]);
-    let archive = tempfile("mutf7_name");
+    let archive = common::tmp_archive("mutf7_name");
     let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert_eq!(email.1.failed, 0, "summary={summary:?}");
     let conn = Connection::open(&archive).unwrap();
@@ -2053,12 +2187,12 @@ fn assert_name_selected_as_listed(listed: &'static str, stored: &str, archive_na
     });
 
     let server = MockImap::start_scripts(vec![control, worker]);
-    let archive = tempfile(archive_name);
+    let archive = common::tmp_archive(archive_name);
     let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
     let email = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "email")
+        .find(|(k, _)| *k == ObjectType::Email)
         .unwrap();
     assert_eq!(email.1.failed, 0, "summary={summary:?}");
     assert_eq!(email.1.created, 1);
@@ -2194,12 +2328,12 @@ fn coordinator_keeps_noselect_ancestors_and_never_selects_them() {
         noselect_control_script(first.clone()),
         noselect_control_script(second.clone()),
     ]);
-    let archive = tempfile("noselect");
+    let archive = common::tmp_archive("noselect");
     let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
     let mailbox = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "mailbox")
+        .find(|(k, _)| *k == ObjectType::Mailbox)
         .unwrap();
     assert_eq!(mailbox.1.created, 10);
     assert_eq!(mailbox.1.failed, 0);
@@ -2214,7 +2348,7 @@ fn coordinator_keeps_noselect_ancestors_and_never_selects_them() {
     let mailbox = summary
         .per_type
         .iter()
-        .find(|(k, _)| *k == "mailbox")
+        .find(|(k, _)| *k == ObjectType::Mailbox)
         .unwrap();
     assert_eq!((mailbox.1.created, mailbox.1.deleted), (0, 0));
     assert_only_selectable_selected(&second);
@@ -2230,7 +2364,7 @@ fn coordinator_heals_archive_missing_noselect_parents() {
         noselect_control_script(first),
         noselect_control_script(second),
     ]);
-    let archive = tempfile("noselect_heal");
+    let archive = common::tmp_archive("noselect_heal");
     run_import(&server, "alice", archive.clone(), |_| {}).expect("import");
     let child_id = {
         let conn = Connection::open(&archive).unwrap();
@@ -2277,41 +2411,36 @@ fn coordinator_heals_archive_missing_noselect_parents() {
 fn dry_run_never_selects_noselect_ancestors() {
     let selected = std::sync::Arc::new(Mutex::new(Vec::new()));
     let server = MockImap::start_scripts(vec![noselect_control_script(selected.clone())]);
-    let archive = tempfile("noselect_dry");
-    let common = CommonConfig {
+    let archive = common::tmp_archive("noselect_dry");
+    let common = RunOptions {
         archive: archive.clone(),
         threads: 1,
-        dry_run: true,
+        mode: RunMode::DryRun,
         max_retries: 1,
-        allow_invalid_certs: false,
-        logger: Logger::from_flags(true, 0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let config = ImapImportConfig {
+    let config = ImapImport {
         url: server.url(),
-        auth: ImapAuth::Basic {
+        auth: SaslAuth::Basic {
             user: "alice".to_owned(),
             password: "p@ss".to_owned(),
         },
-        allow_cleartext: true,
-        compress: false,
+        cleartext: Cleartext::Allow,
+        compress: Compress::Off,
         include: Vec::new(),
         exclude: Vec::new(),
         exclude_special: Vec::new(),
         folder: Vec::new(),
-        subscribed_only: false,
-        automap: true,
-        include_deleted: false,
-        mime_keywords: false,
+        scope: FolderScope::All,
+        automap: Automap::Enabled,
+        deleted: DeletedMessages::Skip,
+        mime_keywords: MimeKeywords::Skip,
         fetch_batch: 256,
         imap_connections: 1,
-        allow_source_change: false,
+        source_change: SourceChange::Reject,
     };
-    let summary = run(common, config).expect("dry run");
-    let mailbox = summary
-        .per_type
-        .iter()
-        .find(|(k, _)| *k == "mailbox")
-        .unwrap();
-    assert_eq!(mailbox.1.created, 10);
+    let mut summary = config.run(common).into_result().expect("dry run");
+    assert_eq!(summary.plan(ObjectType::Mailbox).new, 10);
     assert_only_selectable_selected(&selected);
 }

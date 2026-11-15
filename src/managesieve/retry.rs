@@ -4,54 +4,35 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+use crate::net::backoff::{Fault, Retryable};
+
 use super::error::SieveError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Disposition {
-    TransportDrop,
-    Transient,
-    Permanent,
-    PerScriptRecoverable,
-    FeatureNegotiation,
-    Referral,
-}
+impl SieveError {
+    pub fn is_referral(&self) -> bool {
+        match self {
+            SieveError::No(no) => no.is_referral(),
+            SieveError::Referral(_) => true,
+            _ => false,
+        }
+    }
 
-pub fn classify(err: &SieveError) -> Disposition {
-    match err {
-        SieveError::Io(_) => Disposition::TransportDrop,
-        SieveError::Tls(_) => Disposition::Permanent,
-        SieveError::Bye(_) => Disposition::TransportDrop,
-        SieveError::No(no) => {
-            if no.is_referral() {
-                Disposition::Referral
-            } else if no.is_transient() {
-                Disposition::Transient
-            } else {
-                Disposition::Permanent
-            }
+    pub fn is_negotiation_failure(&self) -> bool {
+        match self {
+            SieveError::No(no) => !no.is_transient() && !no.is_referral(),
+            SieveError::Unsupported(_) => true,
+            _ => false,
         }
-        SieveError::Protocol(_) | SieveError::Parse(_) | SieveError::Unsupported(_) => {
-            Disposition::Permanent
-        }
-        SieveError::Referral(_) => Disposition::Referral,
     }
 }
 
-pub fn is_negotiation_failure(err: &SieveError) -> bool {
-    match err {
-        SieveError::No(no) => !no.is_transient() && !no.is_referral(),
-        SieveError::Unsupported(_) => true,
-        _ => false,
-    }
-}
-
-pub fn script_disposition(err: &SieveError) -> Disposition {
-    let base = classify(err);
-    match base {
-        Disposition::Permanent | Disposition::FeatureNegotiation => {
-            Disposition::PerScriptRecoverable
+impl Retryable for SieveError {
+    fn fault(&self) -> Fault {
+        match self {
+            SieveError::Io(_) | SieveError::Bye(_) => Fault::TransportDrop,
+            SieveError::No(no) if !no.is_referral() && no.is_transient() => Fault::Transient,
+            _ => Fault::Fatal,
         }
-        other => other,
     }
 }
 
@@ -71,57 +52,52 @@ mod tests {
             ErrorKind::TimedOut,
         ] {
             let e = SieveError::Io(io::Error::new(k, "x"));
-            assert_eq!(classify(&e), Disposition::TransportDrop, "{k:?}");
+            assert_eq!(e.fault(), Fault::TransportDrop, "{k:?}");
         }
     }
 
     #[test]
     fn bye_is_transport_drop() {
         assert_eq!(
-            classify(&SieveError::Bye("going away".into())),
-            Disposition::TransportDrop
+            SieveError::Bye("going away".into()).fault(),
+            Fault::TransportDrop
         );
     }
 
     #[test]
     fn transient_no_text_marked_transient() {
         let e = SieveError::No(NoError::new("Try again later", None));
-        assert_eq!(classify(&e), Disposition::Transient);
+        assert_eq!(e.fault(), Fault::Transient);
     }
 
     #[test]
     fn trylater_code_marked_transient() {
         let e = SieveError::No(NoError::new("x", Some("TRYLATER".into())));
-        assert_eq!(classify(&e), Disposition::Transient);
+        assert_eq!(e.fault(), Fault::Transient);
     }
 
     #[test]
-    fn referral_code_classified_as_referral() {
-        let e = SieveError::No(NoError::new("x", Some("REFERRAL".into())));
-        assert_eq!(classify(&e), Disposition::Referral);
+    fn referral_is_fatal_and_flagged() {
+        let e = SieveError::No(NoError::new("temp", Some("REFERRAL".into())));
+        assert_eq!(e.fault(), Fault::Fatal);
+        assert!(e.is_referral());
+        assert!(SieveError::Referral("x".into()).is_referral());
     }
 
     #[test]
-    fn nonexistent_no_is_permanent_but_per_script_demotes_it() {
+    fn nonexistent_no_and_tls_are_fatal() {
         let e = SieveError::No(NoError::new("no such script", Some("NONEXISTENT".into())));
-        assert_eq!(classify(&e), Disposition::Permanent);
-        assert_eq!(script_disposition(&e), Disposition::PerScriptRecoverable);
+        assert_eq!(e.fault(), Fault::Fatal);
+        assert_eq!(SieveError::Tls("x".into()).fault(), Fault::Fatal);
     }
 
     #[test]
     fn negotiation_failure_matches_non_transient_no_and_unsupported() {
-        assert!(is_negotiation_failure(&SieveError::Unsupported("x".into())));
-        assert!(is_negotiation_failure(&SieveError::No(NoError::new(
-            "no such mech",
-            None
-        ))));
-        assert!(!is_negotiation_failure(&SieveError::No(NoError::new(
-            "try again",
-            None
-        ))));
-        assert!(!is_negotiation_failure(&SieveError::No(NoError::new(
-            "x",
-            Some("REFERRAL".into())
-        ))));
+        assert!(SieveError::Unsupported("x".into()).is_negotiation_failure());
+        assert!(SieveError::No(NoError::new("no such mech", None)).is_negotiation_failure());
+        assert!(!SieveError::No(NoError::new("try again", None)).is_negotiation_failure());
+        assert!(
+            !SieveError::No(NoError::new("x", Some("REFERRAL".into()))).is_negotiation_failure()
+        );
     }
 }

@@ -4,9 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use crate::db::init::OpenError;
+use crate::archive::ArchiveError;
 use crate::error::Error;
 use crate::jmap::blob::BlobWalkError;
+use crate::net::http::TransportError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JmapError {
@@ -60,6 +61,16 @@ pub enum JmapError {
     Blob(#[from] BlobWalkError),
 }
 
+impl From<TransportError> for JmapError {
+    fn from(e: TransportError) -> JmapError {
+        if e.is_connect() {
+            JmapError::Connect(e.to_string())
+        } else {
+            JmapError::Transport(e.to_string())
+        }
+    }
+}
+
 impl JmapError {
     pub fn malformed(context: impl Into<String>) -> JmapError {
         JmapError::Malformed(context.into())
@@ -71,7 +82,7 @@ impl From<JmapError> for Error {
         match value {
             JmapError::Connect(m) | JmapError::Transport(m) => Error::Connection(m),
             JmapError::Auth(m) => Error::Connection(format!("authentication rejected: {m}")),
-            JmapError::Sqlite(e) => Error::Db(OpenError::Sqlite(e)),
+            JmapError::Sqlite(e) => Error::Db(ArchiveError::Sqlite(e)),
             reached @ (JmapError::HttpStatus { .. } | JmapError::RetriesExhausted(_)) => {
                 Error::Connection(reached.to_string())
             }
@@ -83,6 +94,19 @@ impl From<JmapError> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ExitStatus;
+
+    // the -vv transport log line and the error keep the transport or connection prefix
+    #[test]
+    fn transport_errors_keep_their_prefix() {
+        let io = TransportError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        let io_text = JmapError::from(io).to_string();
+        assert!(io_text.starts_with("transport failure: io: "), "{io_text}");
+        assert_eq!(
+            JmapError::from(TransportError::TooManyRedirects).to_string(),
+            format!("connection failure: {}", TransportError::TooManyRedirects)
+        );
+    }
 
     #[test]
     fn unreachable_endpoint_aborts_the_run() {
@@ -98,7 +122,7 @@ mod tests {
         ] {
             let mapped = Error::from(e);
             assert!(mapped.aborts_run(), "{mapped} must abort the run");
-            assert_eq!(mapped.exit_code(), 2);
+            assert_eq!(mapped.exit_status(), ExitStatus::Connection);
         }
     }
 
@@ -119,7 +143,7 @@ mod tests {
         ] {
             let mapped = Error::from(e);
             assert!(!mapped.aborts_run(), "{mapped} must not abort the run");
-            assert_eq!(mapped.exit_code(), 5);
+            assert_eq!(mapped.exit_status(), ExitStatus::Partial);
         }
     }
 
@@ -127,6 +151,6 @@ mod tests {
     fn archive_failures_are_local_io() {
         let mapped = Error::from(JmapError::Sqlite(rusqlite::Error::QueryReturnedNoRows));
         assert!(mapped.aborts_run());
-        assert_eq!(mapped.exit_code(), 7);
+        assert_eq!(mapped.exit_status(), ExitStatus::Archive);
     }
 }

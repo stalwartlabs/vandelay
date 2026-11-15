@@ -4,10 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+mod common;
 mod integration;
 mod seeder;
-
-use std::path::{Path, PathBuf};
 
 use integration::stalwart::shared as shared_stalwart;
 use rusqlite::Connection;
@@ -25,52 +24,29 @@ fn sieves_url() -> String {
     let s = shared_stalwart();
     format!("sieves://{}:{}", s.host, s.sieve_port)
 }
+use vandelay::archive::sources::SourceChange;
+use vandelay::export::{Confirm, Prune};
+use vandelay::import::jmap::JmapImport;
+use vandelay::import::managesieve::{ManageSieveImport, SaslAuth};
 use vandelay::jmap::account::AccountSelector;
-use vandelay::jmap::http::Auth;
-use vandelay::logging::Logger;
-use vandelay::sync::import_managesieve::{ManageSieveAuth, ManageSieveImportConfig};
-use vandelay::sync::{self, CommonConfig, ConnectConfig, ImportConfig};
+use vandelay::jmap::connect::ConnectConfig;
+use vandelay::logging::{Level, Logger};
+use vandelay::net::auth::Auth;
+use vandelay::net::http::TlsPolicy;
+use vandelay::net::stream::Cleartext;
+use vandelay::sync::{RunMode, RunOptions};
+use vandelay::types::ObjectType;
 
-fn tmp_archive(tag: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "vandelay-managesieve-{tag}-{}-{}.sqlite",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_file(&p);
-    p
-}
-
-fn common(archive: &Path) -> CommonConfig {
-    CommonConfig {
-        archive: archive.to_path_buf(),
-        threads: 1,
-        dry_run: false,
-        max_retries: 3,
-        allow_invalid_certs: true,
-        logger: Logger::from_flags(false, 0),
-    }
-}
-
-fn basic_config(localpart: &str) -> ManageSieveImportConfig {
-    ManageSieveImportConfig {
+fn basic_config(localpart: &str) -> ManageSieveImport {
+    ManageSieveImport {
         url: sieve_url(),
-        auth: ManageSieveAuth::Basic {
+        auth: SaslAuth::Basic {
             user: format!("{localpart}@{}", seeder::DOMAIN),
             password: seeder::USER_PASSWORD.to_owned(),
         },
-        allow_cleartext: false,
-        allow_source_change: false,
+        cleartext: Cleartext::Forbid,
+        source_change: SourceChange::Reject,
     }
-}
-
-fn count(conn: &Connection, table: &str) -> i64 {
-    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
-        .unwrap()
 }
 
 #[test]
@@ -78,7 +54,7 @@ fn count(conn: &Connection, table: &str) -> i64 {
 fn managesieve_import_test1_lands_active_sieve_script() {
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test1").expect("test1");
-    let archive = tmp_archive("test1");
+    let archive = common::tmp_archive("test1");
 
     assert_eq!(fx.domain, seeder::DOMAIN);
     assert!(!fx.domain_id.is_empty(), "domain id resolved");
@@ -110,12 +86,14 @@ fn managesieve_import_test1_lands_active_sieve_script() {
     }
     assert_eq!(acc.password, seeder::USER_PASSWORD);
 
-    let summary = sync::import_managesieve::run(common(&archive), basic_config(&acc.localpart))
+    let summary = basic_config(&acc.localpart)
+        .run(common::live_options(&archive))
+        .into_result()
         .expect("import");
     assert!(!summary.any_failed(), "import had failures: {summary:?}");
 
     let conn = Connection::open(&archive).unwrap();
-    let scripts = count(&conn, "sieve_scripts");
+    let scripts = common::count(&conn, "sieve_scripts");
     assert!(scripts >= 2, "test1 layout seeds two scripts");
 
     let active: i64 = conn
@@ -127,7 +105,7 @@ fn managesieve_import_test1_lands_active_sieve_script() {
         .unwrap();
     assert_eq!(active, 1, "exactly one of test1's two scripts is active");
 
-    let blob_count = count(&conn, "blobs");
+    let blob_count = common::count(&conn, "blobs");
     assert!(blob_count >= 1, "blob interned for the script body");
 
     let _ = std::fs::remove_file(&archive);
@@ -139,14 +117,16 @@ fn managesieve_import_test1_lands_active_sieve_script() {
 fn managesieve_import_test2_lands_inactive_sieve_script() {
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test2").expect("test2");
-    let archive = tmp_archive("test2");
+    let archive = common::tmp_archive("test2");
 
-    let summary = sync::import_managesieve::run(common(&archive), basic_config(&acc.localpart))
+    let summary = basic_config(&acc.localpart)
+        .run(common::live_options(&archive))
+        .into_result()
         .expect("import");
     assert!(!summary.any_failed(), "import had failures: {summary:?}");
 
     let conn = Connection::open(&archive).unwrap();
-    let scripts = count(&conn, "sieve_scripts");
+    let scripts = common::count(&conn, "sieve_scripts");
     assert!(scripts >= 1, "expected at least one sieve script for test2");
     let active: i64 = conn
         .query_row(
@@ -166,14 +146,16 @@ fn managesieve_import_test2_lands_inactive_sieve_script() {
 fn managesieve_import_test3_has_no_scripts() {
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test3").expect("test3");
-    let archive = tmp_archive("test3");
+    let archive = common::tmp_archive("test3");
 
-    let summary = sync::import_managesieve::run(common(&archive), basic_config(&acc.localpart))
+    let summary = basic_config(&acc.localpart)
+        .run(common::live_options(&archive))
+        .into_result()
         .expect("import");
     assert!(!summary.any_failed(), "import had failures: {summary:?}");
 
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "sieve_scripts"), 0);
+    assert_eq!(common::count(&conn, "sieve_scripts"), 0);
 
     let _ = std::fs::remove_file(&archive);
     seeder::teardown(base_url()).expect("teardown");
@@ -184,9 +166,11 @@ fn managesieve_import_test3_has_no_scripts() {
 fn managesieve_second_run_is_convergent() {
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test1").expect("test1");
-    let archive = tmp_archive("converge");
+    let archive = common::tmp_archive("converge");
 
-    let first = sync::import_managesieve::run(common(&archive), basic_config(&acc.localpart))
+    let first = basic_config(&acc.localpart)
+        .run(common::live_options(&archive))
+        .into_result()
         .expect("first import");
     let (_, c1) = &first.per_type[0];
     assert!(
@@ -194,7 +178,9 @@ fn managesieve_second_run_is_convergent() {
         "test1 seeds two scripts, both new on first run"
     );
 
-    let summary = sync::import_managesieve::run(common(&archive), basic_config(&acc.localpart))
+    let summary = basic_config(&acc.localpart)
+        .run(common::live_options(&archive))
+        .into_result()
         .expect("second import");
     let (_, c) = &summary.per_type[0];
     assert_eq!(c.created, 0, "convergent run should create nothing");
@@ -211,13 +197,15 @@ fn managesieve_second_run_is_convergent() {
 fn managesieve_and_jmap_imports_share_blob_bytes() {
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test1").expect("test1");
-    let msieve_archive = tmp_archive("parity-msieve");
-    let jmap_archive = tmp_archive("parity-jmap");
+    let msieve_archive = common::tmp_archive("parity-msieve");
+    let jmap_archive = common::tmp_archive("parity-jmap");
 
-    sync::import_managesieve::run(common(&msieve_archive), basic_config(&acc.localpart))
+    basic_config(&acc.localpart)
+        .run(common::live_options(&msieve_archive))
+        .into_result()
         .expect("managesieve import");
 
-    let jmap_cfg = ImportConfig {
+    let jmap_cfg = JmapImport {
         connect: ConnectConfig {
             url: fx.base_url.clone(),
             auth: Auth::Basic {
@@ -226,18 +214,21 @@ fn managesieve_and_jmap_imports_share_blob_bytes() {
             },
             account: AccountSelector::Id(acc.account_id.clone()),
         },
-        objects: Some(vec![vandelay::types::ObjectType::SieveScript]),
-        allow_source_change: false,
+        objects: Some(vec![vandelay::types::ObjectType::SieveScript].into()),
+        source_change: SourceChange::Reject,
     };
-    let jmap_common = CommonConfig {
+    let jmap_common = RunOptions {
         archive: jmap_archive.clone(),
         threads: 4,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 5,
-        allow_invalid_certs: true,
-        logger: Logger::from_flags(false, 0),
+        tls: TlsPolicy::AcceptInvalid,
+        logger: Logger::new(Level::Default),
     };
-    sync::import_jmap::run(jmap_common, jmap_cfg).expect("jmap import");
+    jmap_cfg
+        .run(jmap_common)
+        .into_result()
+        .expect("jmap import");
 
     let msieve_conn = Connection::open(&msieve_archive).unwrap();
     let jmap_conn = Connection::open(&jmap_archive).unwrap();
@@ -282,25 +273,28 @@ fn managesieve_and_jmap_imports_share_blob_bytes() {
 fn managesieve_dry_run_reports_diff_without_writing() {
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test1").expect("test1");
-    let archive = tmp_archive("dryrun");
+    let archive = common::tmp_archive("dryrun");
 
-    let mut common_cfg = common(&archive);
-    common_cfg.dry_run = true;
-    let summary =
-        sync::import_managesieve::run(common_cfg, basic_config(&acc.localpart)).expect("dryrun");
-    let (_, c) = &summary.per_type[0];
-    assert!(
-        c.created >= 1,
-        "expected at least one 'new' in dry-run plan"
-    );
+    let mut common_cfg = common::live_options(&archive);
+    common_cfg.mode = RunMode::DryRun;
+    let summary = basic_config(&acc.localpart)
+        .run(common_cfg)
+        .into_result()
+        .expect("dryrun");
+    let (_, plan) = &summary.plan[0];
+    assert!(plan.new >= 1, "expected at least one 'new' in dry-run plan");
 
     let conn = Connection::open(&archive).unwrap();
     assert_eq!(
-        count(&conn, "sieve_scripts"),
+        common::count(&conn, "sieve_scripts"),
         0,
         "dry-run must not write rows"
     );
-    assert_eq!(count(&conn, "blobs"), 0, "dry-run must not intern blobs");
+    assert_eq!(
+        common::count(&conn, "blobs"),
+        0,
+        "dry-run must not intern blobs"
+    );
 
     let _ = std::fs::remove_file(&archive);
     seeder::teardown(base_url()).expect("teardown");
@@ -312,12 +306,16 @@ fn managesieve_source_change_protection_refuses_second_account() {
     let fx = seeder::provision(base_url()).expect("provision");
     let acc1 = fx.account("test1").expect("test1");
     let acc2 = fx.account("test2").expect("test2");
-    let archive = tmp_archive("source_change");
+    let archive = common::tmp_archive("source_change");
 
-    sync::import_managesieve::run(common(&archive), basic_config(&acc1.localpart))
+    basic_config(&acc1.localpart)
+        .run(common::live_options(&archive))
+        .into_result()
         .expect("first import");
 
-    let err = sync::import_managesieve::run(common(&archive), basic_config(&acc2.localpart))
+    let err = basic_config(&acc2.localpart)
+        .run(common::live_options(&archive))
+        .into_result()
         .expect_err("should refuse the second source without override");
     assert!(matches!(err, vandelay::error::Error::SourceChange(_)));
 
@@ -330,11 +328,11 @@ fn managesieve_source_change_protection_refuses_second_account() {
 fn managesieve_implicit_tls_path_succeeds_when_offered() {
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test1").expect("test1");
-    let archive = tmp_archive("implicit_tls");
+    let archive = common::tmp_archive("implicit_tls");
 
     let mut cfg = basic_config(&acc.localpart);
     cfg.url = sieves_url();
-    let result = sync::import_managesieve::run(common(&archive), cfg);
+    let result = cfg.run(common::live_options(&archive)).into_result();
 
     if let Err(vandelay::error::Error::Connection(msg)) = &result {
         eprintln!("(expected on cleartext-only deployments) {msg}");
@@ -350,13 +348,15 @@ fn managesieve_round_trip_via_jmap_export_converges() {
     let fx = seeder::provision(base_url()).expect("provision");
     let src = fx.account("test1").expect("test1");
     let dst = fx.account("test4").expect("test4");
-    let archive = tmp_archive("roundtrip");
+    let archive = common::tmp_archive("roundtrip");
 
-    sync::import_managesieve::run(common(&archive), basic_config(&src.localpart))
+    basic_config(&src.localpart)
+        .run(common::live_options(&archive))
+        .into_result()
         .expect("managesieve import");
 
     let import_conn = Connection::open(&archive).unwrap();
-    let imported_scripts = count(&import_conn, "sieve_scripts");
+    let imported_scripts = common::count(&import_conn, "sieve_scripts");
     assert!(
         imported_scripts >= 1,
         "expected at least one script in the source archive"
@@ -374,15 +374,15 @@ fn managesieve_round_trip_via_jmap_export_converges() {
     );
     drop(import_conn);
 
-    let export_common = CommonConfig {
+    let export_common = RunOptions {
         archive: archive.clone(),
         threads: 4,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 5,
-        allow_invalid_certs: true,
-        logger: Logger::from_flags(false, 0),
+        tls: TlsPolicy::AcceptInvalid,
+        logger: Logger::new(Level::Default),
     };
-    let export_cfg = vandelay::sync::ExportConfig {
+    let export_cfg = vandelay::export::Export {
         connect: ConnectConfig {
             url: fx.base_url.clone(),
             auth: Auth::Basic {
@@ -391,16 +391,19 @@ fn managesieve_round_trip_via_jmap_export_converges() {
             },
             account: AccountSelector::Id(dst.account_id.clone()),
         },
-        objects: Some(vec![vandelay::types::ObjectType::SieveScript]),
-        prune: false,
-        yes: false,
+        objects: Some(vec![vandelay::types::ObjectType::SieveScript].into()),
+        prune: Prune::Keep,
+        confirm: Confirm::Prompt,
     };
-    let first = sync::export::run(export_common, export_cfg).expect("first export");
+    let first = export_cfg
+        .run(export_common)
+        .into_result()
+        .expect("first export");
     assert!(!first.any_failed(), "first export had failures: {first:?}");
     let created_first: u64 = first
         .per_type
         .iter()
-        .filter(|(k, _)| *k == "SieveScript")
+        .filter(|(k, _)| *k == ObjectType::SieveScript)
         .map(|(_, c)| c.created)
         .sum();
     assert_eq!(
@@ -408,15 +411,15 @@ fn managesieve_round_trip_via_jmap_export_converges() {
         "first export should create every imported script on the target ({first:?})"
     );
 
-    let export_common2 = CommonConfig {
+    let export_common2 = RunOptions {
         archive: archive.clone(),
         threads: 4,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 5,
-        allow_invalid_certs: true,
-        logger: Logger::from_flags(false, 0),
+        tls: TlsPolicy::AcceptInvalid,
+        logger: Logger::new(Level::Default),
     };
-    let export_cfg2 = vandelay::sync::ExportConfig {
+    let export_cfg2 = vandelay::export::Export {
         connect: ConnectConfig {
             url: fx.base_url.clone(),
             auth: Auth::Basic {
@@ -425,19 +428,22 @@ fn managesieve_round_trip_via_jmap_export_converges() {
             },
             account: AccountSelector::Id(dst.account_id.clone()),
         },
-        objects: Some(vec![vandelay::types::ObjectType::SieveScript]),
-        prune: false,
-        yes: false,
+        objects: Some(vec![vandelay::types::ObjectType::SieveScript].into()),
+        prune: Prune::Keep,
+        confirm: Confirm::Prompt,
     };
-    let second = sync::export::run(export_common2, export_cfg2).expect("second export");
+    let second = export_cfg2
+        .run(export_common2)
+        .into_result()
+        .expect("second export");
     for (name, counts) in &second.per_type {
         assert_eq!(
             counts.created, 0,
-            "{name}: round-trip second export should create nothing"
+            "{name:?}: round-trip second export should create nothing"
         );
         assert_eq!(
             counts.deleted, 0,
-            "{name}: round-trip second export should delete nothing"
+            "{name:?}: round-trip second export should delete nothing"
         );
     }
 

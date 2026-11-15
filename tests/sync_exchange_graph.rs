@@ -12,12 +12,16 @@ use std::path::PathBuf;
 use integration::stalwart::shared as shared_stalwart;
 use mockito::{Matcher, Server};
 use serde_json::{Value, json};
-use vandelay::exchange_graph::types::{EventBodyFormat, MailboxKind, Surfaces};
+use vandelay::archive::sources::SourceChange;
+use vandelay::exchange::graph::types::{EventBodyFormat, MailboxKind, Surfaces};
+use vandelay::export::{Confirm, Export, Prune};
+use vandelay::import::graph::{GraphAuth, GraphImport};
 use vandelay::jmap::account::AccountSelector;
-use vandelay::jmap::http::Auth;
-use vandelay::logging::Logger;
-use vandelay::sync::import_exchange_graph::{GraphAuth, GraphImportConfig};
-use vandelay::sync::{self, CommonConfig, ConnectConfig, ExportConfig};
+use vandelay::jmap::connect::ConnectConfig;
+use vandelay::logging::{Level, Logger};
+use vandelay::net::auth::Auth;
+use vandelay::net::http::TlsPolicy;
+use vandelay::sync::{RunMode, RunOptions};
 
 fn base_url() -> &'static str {
     shared_stalwart().base_url()
@@ -271,32 +275,31 @@ fn graph_import_survives_a_full_export_to_stalwart() {
     graph_fixture(&mut graph);
     let archive = tmp_archive("graph-roundtrip");
 
-    let import = sync::import_exchange_graph::run(
-        CommonConfig {
-            archive: archive.clone(),
-            threads: 4,
-            dry_run: false,
-            max_retries: 2,
-            allow_invalid_certs: true,
-            logger: Logger::from_flags(true, 0),
+    let import = (GraphImport {
+        auth: GraphAuth::PreAcquired {
+            token: "TOKEN".to_owned(),
         },
-        GraphImportConfig {
-            auth: GraphAuth::PreAcquired {
-                token: "TOKEN".to_owned(),
-            },
-            api_base: graph.url(),
-            user_target: None,
-            mailbox_kind: MailboxKind::Primary,
-            surfaces: Surfaces::ALL,
-            event_body_format: EventBodyFormat::Text,
-            graph_connections: 2,
-            top: 100,
-            exception_window_years: 5,
-            contact_photos: true,
-            event_attachments: true,
-            allow_source_change: false,
-        },
-    )
+        api_base: graph.url(),
+        user_target: None,
+        mailbox_kind: MailboxKind::Primary,
+        surfaces: Surfaces::ALL,
+        event_body_format: EventBodyFormat::Text,
+        graph_connections: 2,
+        top: 100,
+        exception_window_years: 5,
+        contact_photos: vandelay::import::graph::ContactPhotos::Fetch,
+        event_attachments: vandelay::import::graph::EventAttachments::Fetch,
+        source_change: SourceChange::Reject,
+    })
+    .run(RunOptions {
+        archive: archive.clone(),
+        threads: 4,
+        mode: RunMode::Apply,
+        max_retries: 2,
+        tls: TlsPolicy::AcceptInvalid,
+        logger: Logger::new(Level::Quiet),
+    })
+    .into_result()
     .expect("graph import");
     assert!(!import.any_failed(), "import reported failures");
 
@@ -340,29 +343,28 @@ fn graph_import_survives_a_full_export_to_stalwart() {
         "the export target must start empty so every assertion below is ours"
     );
 
-    let export = sync::export::run(
-        CommonConfig {
-            archive: archive.clone(),
-            threads: 4,
-            dry_run: false,
-            max_retries: 5,
-            allow_invalid_certs: true,
-            logger: Logger::from_flags(true, 0),
-        },
-        ExportConfig {
-            connect: ConnectConfig {
-                url: base_url().to_owned(),
-                auth: Auth::Basic {
-                    user: account.email.clone(),
-                    password: account.password.clone(),
-                },
-                account: AccountSelector::Id(account.account_id.clone()),
+    let export = (Export {
+        connect: ConnectConfig {
+            url: base_url().to_owned(),
+            auth: Auth::Basic {
+                user: account.email.clone(),
+                password: account.password.clone(),
             },
-            objects: None,
-            prune: false,
-            yes: true,
+            account: AccountSelector::Id(account.account_id.clone()),
         },
-    )
+        objects: None,
+        prune: Prune::Keep,
+        confirm: Confirm::Assume,
+    })
+    .run(RunOptions {
+        archive: archive.clone(),
+        threads: 4,
+        mode: RunMode::Apply,
+        max_retries: 5,
+        tls: TlsPolicy::AcceptInvalid,
+        logger: Logger::new(Level::Quiet),
+    })
+    .into_result()
     .expect("export");
     assert!(!export.any_failed(), "export reported failures");
 

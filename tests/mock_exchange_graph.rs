@@ -4,30 +4,37 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use std::sync::Once;
+use std::time::Duration;
 
 use encodify::base64::URL_SAFE_NO_PAD;
 use mockito::{Matcher, Server};
 use serde_json::json;
-use vandelay::exchange_graph::api::{Endpoints, collect_all_ids, paged_collect};
-use vandelay::exchange_graph::calendar_map::{EventType, classify_event_type, convert_event};
-use vandelay::exchange_graph::client::{Accept, GraphClient};
-use vandelay::exchange_graph::contact_map::convert_contact;
-use vandelay::exchange_graph::error::GraphError;
-use vandelay::exchange_graph::oauth::{
-    DeviceCodeResponse, TokenResponse, parse_device_code_response, parse_token_response,
-    run_device_code_polling_against,
-};
-use vandelay::exchange_graph::recurrence::convert_patterned_recurrence;
-use vandelay::exchange_graph::retry::{HttpClass, classify_http_status};
-use vandelay::exchange_graph::types::Surfaces;
-use vandelay::jmap::http::RetryPolicy;
-
-static INIT: Once = Once::new();
+use vandelay::archive::Archive;
+use vandelay::archive::sources::{SourceChange, SourceKey, SourceKind};
+use vandelay::exchange::graph::api::Endpoints;
+use vandelay::exchange::graph::calendar_map::{EventType, GraphEvent};
+use vandelay::exchange::graph::client::{Accept, GraphClient};
+use vandelay::exchange::graph::contact_map::GraphContact;
+use vandelay::exchange::graph::error::GraphError;
+use vandelay::exchange::graph::recurrence::GraphRecurrence;
+use vandelay::exchange::graph::retry::HttpClass;
+use vandelay::exchange::graph::types::Surfaces;
+use vandelay::exchange::oauth::{DeviceCodeFlow, DeviceCodeResponse, Dialect, Pace, TokenResponse};
+use vandelay::logging::{Level, Logger};
+use vandelay::net::http::{ClientOptions, TlsPolicy};
+use vandelay::net::retry::RetryPolicy;
+use vandelay::sync::{RunMode, SummaryType};
+use vandelay::types::ObjectType;
 
 fn client_with_retries(retries: u32) -> GraphClient {
-    INIT.call_once(|| {});
-    GraphClient::new("BEARER".to_owned(), RetryPolicy::new(retries), false)
+    GraphClient::new(
+        "BEARER".to_owned(),
+        ClientOptions {
+            retry: RetryPolicy::new(retries),
+            tls: TlsPolicy::Verify,
+            logger: Logger::new(Level::Quiet),
+        },
+    )
 }
 
 fn url_message_collection(server_url: &str, folder: &str, top: usize) -> String {
@@ -44,18 +51,18 @@ fn make_jwt(exp: u64, upn: &str) -> String {
 
 #[test]
 fn http_status_classifier_matches_spec_table() {
-    assert_eq!(classify_http_status(200), HttpClass::Success);
-    assert_eq!(classify_http_status(401), HttpClass::Auth);
-    assert_eq!(classify_http_status(403), HttpClass::Auth);
-    assert_eq!(classify_http_status(404), HttpClass::Vanished);
-    assert_eq!(classify_http_status(410), HttpClass::Vanished);
-    assert_eq!(classify_http_status(429), HttpClass::Retryable);
-    assert_eq!(classify_http_status(503), HttpClass::Retryable);
-    assert_eq!(classify_http_status(504), HttpClass::Retryable);
-    assert_eq!(classify_http_status(507), HttpClass::Fatal);
-    assert_eq!(classify_http_status(400), HttpClass::Fatal);
-    assert_eq!(classify_http_status(405), HttpClass::Fatal);
-    assert_eq!(classify_http_status(422), HttpClass::Fatal);
+    assert_eq!(HttpClass::of_status(200), HttpClass::Success);
+    assert_eq!(HttpClass::of_status(401), HttpClass::Auth);
+    assert_eq!(HttpClass::of_status(403), HttpClass::Auth);
+    assert_eq!(HttpClass::of_status(404), HttpClass::Vanished);
+    assert_eq!(HttpClass::of_status(410), HttpClass::Vanished);
+    assert_eq!(HttpClass::of_status(429), HttpClass::Retryable);
+    assert_eq!(HttpClass::of_status(503), HttpClass::Retryable);
+    assert_eq!(HttpClass::of_status(504), HttpClass::Retryable);
+    assert_eq!(HttpClass::of_status(507), HttpClass::Fatal);
+    assert_eq!(HttpClass::of_status(400), HttpClass::Fatal);
+    assert_eq!(HttpClass::of_status(405), HttpClass::Fatal);
+    assert_eq!(HttpClass::of_status(422), HttpClass::Fatal);
 }
 
 #[test]
@@ -68,7 +75,7 @@ fn device_code_response_parses_required_fields() {
         "expires_in": 900,
         "message": "Open the URL and enter the code."
     });
-    let parsed = parse_device_code_response(&body).unwrap();
+    let parsed = DeviceCodeResponse::parse(&body).unwrap();
     assert_eq!(parsed.device_code, "ABCDEF");
     assert_eq!(parsed.user_code, "BR4S-7XYZ");
     assert_eq!(parsed.interval, 5);
@@ -77,9 +84,9 @@ fn device_code_response_parses_required_fields() {
 
 #[test]
 fn token_response_handles_pending_and_success() {
-    let pending = parse_token_response(400, &json!({"error": "authorization_pending"}));
+    let pending = TokenResponse::parse(400, &json!({"error": "authorization_pending"}));
     assert!(matches!(pending, TokenResponse::Pending));
-    let success = parse_token_response(
+    let success = TokenResponse::parse(
         200,
         &json!({"access_token": make_jwt(9999999999, "alice@x.com"), "expires_in": 3599}),
     );
@@ -95,9 +102,9 @@ fn token_response_handles_pending_and_success() {
 
 #[test]
 fn token_response_declined_and_bad_code() {
-    let declined = parse_token_response(400, &json!({"error": "authorization_declined"}));
+    let declined = TokenResponse::parse(400, &json!({"error": "authorization_declined"}));
     assert!(matches!(declined, TokenResponse::Declined));
-    let bad = parse_token_response(400, &json!({"error": "bad_verification_code"}));
+    let bad = TokenResponse::parse(400, &json!({"error": "bad_verification_code"}));
     assert!(matches!(bad, TokenResponse::BadCode));
 }
 
@@ -112,25 +119,29 @@ fn device_code_polling_loop_converges_on_success() {
         message: None,
     };
     let mut attempt = 0;
-    let token = run_device_code_polling_against(
-        "https://login.x/common",
-        "client-id",
-        &response,
-        |_endpoint, _body| {
-            attempt += 1;
-            if attempt < 3 {
-                Ok((400, json!({"error": "authorization_pending"})))
-            } else {
-                Ok((
-                    200,
-                    json!({
-                        "access_token": make_jwt(9999999999, "alice@x"),
-                        "expires_in": 3599
-                    }),
-                ))
-            }
+    let token = DeviceCodeFlow {
+        response: &response,
+        client_id: "client-id",
+        token_endpoint: "https://login.x/common/oauth2/v2.0/token",
+        pace: Pace {
+            interval: Duration::from_millis(20),
+            slow_down: Duration::from_millis(20),
         },
-    )
+    }
+    .poll(|_endpoint, _form| {
+        attempt += 1;
+        if attempt < 3 {
+            Ok((400, json!({"error": "authorization_pending"})))
+        } else {
+            Ok((
+                200,
+                json!({
+                    "access_token": make_jwt(9999999999, "alice@x"),
+                    "expires_in": 3599
+                }),
+            ))
+        }
+    })
     .unwrap();
     assert_eq!(attempt, 3);
     assert_eq!(token.upn.as_deref(), Some("alice@x"));
@@ -146,14 +157,18 @@ fn device_code_polling_loop_aborts_on_decline() {
         expires_in: 5,
         message: None,
     };
-    let err = run_device_code_polling_against(
-        "https://login.x/common",
-        "client-id",
-        &response,
-        |_, _| Ok((400, json!({"error": "authorization_declined"}))),
-    )
+    let err = DeviceCodeFlow {
+        response: &response,
+        client_id: "client-id",
+        token_endpoint: "https://login.x/common/oauth2/v2.0/token",
+        pace: Pace {
+            interval: Duration::from_millis(20),
+            slow_down: Duration::from_millis(20),
+        },
+    }
+    .poll(|_, _| Ok((400, json!({"error": "authorization_declined"}))))
     .unwrap_err();
-    let msg = err.to_string();
+    let msg = Dialect::Graph.poll_error(err).to_string();
     assert!(msg.contains("declined"));
 }
 
@@ -212,7 +227,7 @@ fn pagination_collects_ids_across_three_pages_with_one_empty() {
 
     let client = client_with_retries(0);
     let url = url_message_collection(&base, "F1", 100);
-    let ids = collect_all_ids(&client, &url, &[]).unwrap();
+    let ids = client.collect_all_ids(&url, &[]).unwrap();
     assert_eq!(ids, vec!["M1".to_owned(), "M2".to_owned(), "M3".to_owned()]);
 }
 
@@ -233,11 +248,12 @@ fn pagination_terminates_when_no_next_link_present() {
     let client = client_with_retries(0);
     let url = url_message_collection(&base, "F", 100);
     let mut pages = 0;
-    paged_collect(&client, &url, &[], |_| {
-        pages += 1;
-        Ok(())
-    })
-    .unwrap();
+    client
+        .paged_collect(&url, &[], |_| {
+            pages += 1;
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(pages, 1);
 }
 
@@ -273,7 +289,7 @@ fn header_redelivery_is_asserted_via_mockito_match() {
         .create();
     let c = client_with_retries(0);
     let url = url_message_collection(&base, "F", 100);
-    let ids = collect_all_ids(&c, &url, &[]).unwrap();
+    let ids = c.collect_all_ids(&url, &[]).unwrap();
     assert_eq!(ids.len(), 2);
 }
 
@@ -294,7 +310,7 @@ fn case_sensitive_immutable_id_round_trip() {
     let base = server.url();
     let client = client_with_retries(0);
     let url = url_message_collection(&base, "F", 100);
-    let ids = collect_all_ids(&client, &url, &[]).unwrap();
+    let ids = client.collect_all_ids(&url, &[]).unwrap();
     assert_eq!(ids[0], id);
     assert!(ids[0].contains('='));
 }
@@ -330,8 +346,8 @@ fn rate_limit_with_retry_after_is_honoured_then_succeeds() {
     let elapsed = started.elapsed();
     assert_eq!(resp.status, 200);
     assert!(elapsed >= std::time::Duration::from_millis(800));
-    assert!(client.retries_observed() >= 1);
-    assert!(client.retry_after_sleeps() >= 1);
+    assert!(client.stats().retries_observed >= 1);
+    assert!(client.stats().retry_after_sleeps >= 1);
 }
 
 #[test]
@@ -361,7 +377,7 @@ fn rate_limit_without_retry_after_uses_shared_escalation() {
         )
         .unwrap();
     assert_eq!(r.status, 200);
-    assert!(client.retries_observed() >= 1);
+    assert!(client.stats().retries_observed >= 1);
 }
 
 #[test]
@@ -455,7 +471,7 @@ fn recurrence_daily_with_interval_round_trips() {
         "pattern": {"type": "daily", "interval": 2},
         "range": {"type": "noEnd"}
     });
-    let out = convert_patterned_recurrence(&pr).unwrap();
+    let out = GraphRecurrence(&pr).to_rule().unwrap();
     assert_eq!(out["frequency"], "daily");
     assert_eq!(out["interval"], 2);
 }
@@ -470,7 +486,7 @@ fn recurrence_weekly_with_days_of_week_and_count() {
         },
         "range": {"type": "numbered", "numberOfOccurrences": 12}
     });
-    let out = convert_patterned_recurrence(&pr).unwrap();
+    let out = GraphRecurrence(&pr).to_rule().unwrap();
     assert_eq!(out["frequency"], "weekly");
     assert_eq!(out["count"], 12);
     assert_eq!(out["byDay"][0]["day"], "mo");
@@ -486,7 +502,7 @@ fn recurrence_relative_monthly_emits_setpos() {
         },
         "range": {"type": "noEnd"}
     });
-    let out = convert_patterned_recurrence(&pr).unwrap();
+    let out = GraphRecurrence(&pr).to_rule().unwrap();
     assert_eq!(out["frequency"], "monthly");
     assert_eq!(out["bySetPosition"][0], 3);
     assert_eq!(out["byDay"][0]["day"], "th");
@@ -498,7 +514,7 @@ fn recurrence_yearly_with_end_date() {
         "pattern": {"type": "absoluteYearly", "interval": 1, "month": 12, "dayOfMonth": 25},
         "range": {"type": "endDate", "endDate": "2030-12-25"}
     });
-    let out = convert_patterned_recurrence(&pr).unwrap();
+    let out = GraphRecurrence(&pr).to_rule().unwrap();
     assert_eq!(out["frequency"], "yearly");
     assert_eq!(out["until"], "2030-12-25T23:59:59");
 }
@@ -506,7 +522,7 @@ fn recurrence_yearly_with_end_date() {
 #[test]
 fn occurrence_event_is_classified_for_skip() {
     let occ = json!({"id": "occ-1", "type": "occurrence", "seriesMasterId": "master-1"});
-    assert_eq!(classify_event_type(&occ), EventType::Occurrence);
+    assert_eq!(GraphEvent(&occ).event_type(), EventType::Occurrence);
 }
 
 #[test]
@@ -521,7 +537,7 @@ fn exception_event_carries_series_master_id() {
         "start": {"dateTime": "2026-06-15T11:00:00.0000000", "timeZone": "UTC"},
         "end": {"dateTime": "2026-06-15T12:00:00.0000000", "timeZone": "UTC"}
     });
-    let conv = convert_event(&ex, None).unwrap();
+    let conv = GraphEvent(&ex).convert(None).unwrap();
     assert_eq!(conv.event_type, EventType::Exception);
     assert_eq!(conv.series_master_id.as_deref(), Some("master-1"));
     assert_eq!(conv.original_start.as_deref(), Some("2026-06-15T10:00:00Z"));
@@ -536,7 +552,7 @@ fn contact_minimal_yields_jscontact_card() {
         "surname": "Liddell",
         "emailAddresses": [{"name": "Alice", "address": "alice@x.com"}]
     });
-    let out = convert_contact(&c).unwrap();
+    let out = GraphContact(&c).convert().unwrap();
     assert!(out.uid.starts_with("vandelay-graph-"));
     assert_eq!(out.data["@type"], "Card");
     assert_eq!(out.data["name"]["full"], "Alice Liddell");
@@ -581,52 +597,46 @@ fn integration_dry_run_against_mock_server_lists_three_surfaces() {
         .with_body(r#"{"value":[{"id":"CON1","displayName":"Contacts"}]}"#)
         .create();
     let base = server.url();
-    let common = vandelay::sync::CommonConfig {
+    let common = vandelay::sync::RunOptions {
         archive: tempfile::NamedTempFile::new().unwrap().path().to_owned(),
         threads: 2,
-        dry_run: true,
+        mode: RunMode::DryRun,
         max_retries: 0,
-        allow_invalid_certs: false,
-        logger: vandelay::logging::Logger::new(0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let config = vandelay::sync::import_exchange_graph::GraphImportConfig {
-        auth: vandelay::sync::import_exchange_graph::GraphAuth::PreAcquired {
-            token: make_jwt(9999999999, "alice@x.com"),
-        },
-        api_base: base.clone(),
-        user_target: None,
-        mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        surfaces: Surfaces::ALL,
-        event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
-        graph_connections: 2,
-        top: 100,
-        exception_window_years: 5,
-        contact_photos: false,
-        event_attachments: true,
-        allow_source_change: false,
-    };
-    let summary = vandelay::sync::import_exchange_graph::run(common, config).unwrap();
+    let config = make_config(base.clone(), None, Surfaces::ALL);
+    let summary = config.run(common).into_result().unwrap();
     let mailbox = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "mailbox")
+        .find(|(t, _)| *t == ObjectType::Mailbox)
         .map(|(_, c)| c.created)
         .unwrap_or(0);
     let calendar = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "calendar")
+        .find(|(t, _)| *t == ObjectType::Calendar)
         .map(|(_, c)| c.created)
         .unwrap_or(0);
     let addressbook = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "addressbook")
+        .find(|(t, _)| *t == ObjectType::AddressBook)
         .map(|(_, c)| c.created)
         .unwrap_or(0);
     assert_eq!(mailbox, 1);
     assert_eq!(calendar, 1);
     assert_eq!(addressbook, 1);
+    let planned: Vec<(SummaryType, u64)> = summary.plan.iter().map(|(t, p)| (*t, p.new)).collect();
+    assert_eq!(
+        planned,
+        [
+            (ObjectType::Mailbox.into(), 1),
+            (ObjectType::Calendar.into(), 1),
+            (ObjectType::AddressBook.into(), 1),
+        ]
+    );
 }
 
 #[test]
@@ -696,36 +706,21 @@ fn integration_full_run_mail_only_imports_mime_via_value() {
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let archive_path = tmp.path().to_owned();
-    let common = vandelay::sync::CommonConfig {
+    let common = vandelay::sync::RunOptions {
         archive: archive_path.clone(),
         threads: 2,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 0,
-        allow_invalid_certs: false,
-        logger: vandelay::logging::Logger::new(0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let config = vandelay::sync::import_exchange_graph::GraphImportConfig {
-        auth: vandelay::sync::import_exchange_graph::GraphAuth::PreAcquired {
-            token: make_jwt(9999999999, "alice@x.com"),
-        },
-        api_base: server.url(),
-        user_target: None,
-        mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        surfaces: surfaces("mail"),
-        event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
-        graph_connections: 2,
-        top: 100,
-        exception_window_years: 5,
-        contact_photos: false,
-        event_attachments: true,
-        allow_source_change: false,
-    };
+    let config = make_config(server.url(), None, surfaces("mail"));
     drop(tmp);
-    let summary = vandelay::sync::import_exchange_graph::run(common, config).unwrap();
+    let summary = config.run(common).into_result().unwrap();
     let emails = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "email")
+        .find(|(t, _)| *t == ObjectType::Email)
         .map(|(_, c)| c.created)
         .unwrap_or(0);
     assert_eq!(emails, 1, "expected one email created, got {emails}");
@@ -798,36 +793,21 @@ fn integration_duplicate_message_id_does_not_abort_run() {
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let archive_path = tmp.path().to_owned();
-    let common = vandelay::sync::CommonConfig {
+    let common = vandelay::sync::RunOptions {
         archive: archive_path.clone(),
         threads: 2,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 0,
-        allow_invalid_certs: false,
-        logger: vandelay::logging::Logger::new(0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let config = vandelay::sync::import_exchange_graph::GraphImportConfig {
-        auth: vandelay::sync::import_exchange_graph::GraphAuth::PreAcquired {
-            token: make_jwt(9999999999, "alice@x.com"),
-        },
-        api_base: server.url(),
-        user_target: None,
-        mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        surfaces: surfaces("mail"),
-        event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
-        graph_connections: 2,
-        top: 100,
-        exception_window_years: 5,
-        contact_photos: false,
-        event_attachments: true,
-        allow_source_change: false,
-    };
+    let config = make_config(server.url(), None, surfaces("mail"));
     drop(tmp);
-    let summary = vandelay::sync::import_exchange_graph::run(common, config).unwrap();
+    let summary = config.run(common).into_result().unwrap();
     let emails = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "email")
+        .find(|(t, _)| *t == ObjectType::Email)
         .map(|(_, c)| c.created)
         .unwrap_or(0);
     assert_eq!(emails, 1, "expected one email created, got {emails}");
@@ -901,48 +881,36 @@ fn integration_full_run_is_convergent_on_second_invocation() {
 
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
     let api_base = server.url();
-    let make_config = || vandelay::sync::import_exchange_graph::GraphImportConfig {
-        auth: vandelay::sync::import_exchange_graph::GraphAuth::PreAcquired {
-            token: make_jwt(9999999999, "alice@x.com"),
-        },
-        api_base: api_base.clone(),
-        user_target: None,
-        mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        surfaces: surfaces("mail"),
-        event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
-        graph_connections: 2,
-        top: 100,
-        exception_window_years: 5,
-        contact_photos: false,
-        event_attachments: true,
-        allow_source_change: false,
-    };
-    let make_common = |path: std::path::PathBuf| vandelay::sync::CommonConfig {
+    let make_config = || make_config(api_base.clone(), None, surfaces("mail"));
+    let make_common = |path: std::path::PathBuf| vandelay::sync::RunOptions {
         archive: path,
         threads: 2,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 0,
-        allow_invalid_certs: false,
-        logger: vandelay::logging::Logger::new(0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
 
-    let first =
-        vandelay::sync::import_exchange_graph::run(make_common(archive.clone()), make_config())
-            .unwrap();
+    let first = make_config()
+        .run(make_common(archive.clone()))
+        .into_result()
+        .unwrap();
     let created_first = first
         .per_type
         .iter()
-        .find(|(t, _)| *t == "email")
+        .find(|(t, _)| *t == ObjectType::Email)
         .map(|(_, c)| c.created)
         .unwrap_or(0);
     assert_eq!(created_first, 1);
 
-    let second =
-        vandelay::sync::import_exchange_graph::run(make_common(archive), make_config()).unwrap();
+    let second = make_config()
+        .run(make_common(archive))
+        .into_result()
+        .unwrap();
     let created_second = second
         .per_type
         .iter()
-        .find(|(t, _)| *t == "email")
+        .find(|(t, _)| *t == ObjectType::Email)
         .map(|(_, c)| c.created)
         .unwrap_or(0);
     assert_eq!(created_second, 0, "second run should not re-import");
@@ -951,21 +919,20 @@ fn integration_full_run_is_convergent_on_second_invocation() {
 #[test]
 fn source_change_protection_refuses_a_different_account() {
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    let conn = vandelay::db::init::open(&archive).unwrap();
-    vandelay::db::sources::upsert_source(
-        &conn,
-        &vandelay::db::sources::SourceKey {
-            kind: "exchange_graph".to_owned(),
-            session_url:
-                "https://login.microsoftonline.com/common|https://graph.microsoft.com/v1.0"
-                    .to_owned(),
-            account_id: "old-user-id".to_owned(),
-        },
-        Some("old@x.com"),
-        "old@x.com",
-    )
-    .unwrap();
-    drop(conn);
+    let db = Archive::open(&archive).unwrap();
+    db.store()
+        .sources()
+        .upsert(
+            &SourceKey {
+                kind: SourceKind::ExchangeGraph,
+                url: "https://login.microsoftonline.com/common|https://graph.microsoft.com/v1.0",
+                account_id: "old-user-id",
+            },
+            Some("old@x.com"),
+            "old@x.com",
+        )
+        .unwrap();
+    drop(db);
 
     let mut server = Server::new();
     let _principal = server
@@ -975,34 +942,112 @@ fn source_change_protection_refuses_a_different_account() {
         .with_body(r#"{"id":"new-user-id","userPrincipalName":"new@x.com"}"#)
         .create();
 
-    let common = vandelay::sync::CommonConfig {
+    let common = vandelay::sync::RunOptions {
         archive,
         threads: 2,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 0,
-        allow_invalid_certs: false,
-        logger: vandelay::logging::Logger::new(0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let config = vandelay::sync::import_exchange_graph::GraphImportConfig {
-        auth: vandelay::sync::import_exchange_graph::GraphAuth::PreAcquired {
+    let config = vandelay::import::graph::GraphImport {
+        auth: vandelay::import::graph::GraphAuth::PreAcquired {
             token: make_jwt(9999999999, "new@x.com"),
         },
-        api_base: server.url(),
-        user_target: None,
-        mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        surfaces: Surfaces::ALL,
-        event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
-        graph_connections: 2,
-        top: 100,
-        exception_window_years: 5,
-        contact_photos: false,
-        event_attachments: true,
-        allow_source_change: false,
+        ..make_config(server.url(), None, Surfaces::ALL)
     };
-    let err = vandelay::sync::import_exchange_graph::run(common, config).unwrap_err();
+    let err = config.run(common).into_result().unwrap_err();
     assert!(
         matches!(err, vandelay::error::Error::SourceChange(_)),
         "expected SourceChange error, got {err:?}"
+    );
+}
+
+// A dry run against an archive of another Graph account fails like the real run (R6).
+#[test]
+fn dry_run_reports_source_change_like_the_real_run() {
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    let db = Archive::open(&archive).unwrap();
+    db.store()
+        .sources()
+        .upsert(
+            &SourceKey {
+                kind: SourceKind::ExchangeGraph,
+                url: "https://login.microsoftonline.com/common|https://graph.microsoft.com/v1.0",
+                account_id: "old-user-id",
+            },
+            Some("old@x.com"),
+            "old@x.com",
+        )
+        .unwrap();
+    drop(db);
+
+    let mut server = Server::new();
+    let _principal = server
+        .mock("GET", Matcher::Regex(r"^/me\?\$select=id".to_owned()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"new-user-id","userPrincipalName":"new@x.com"}"#)
+        .create();
+    let folders = server
+        .mock("GET", "/me/mailFolders?$top=100&includeHiddenFolders=true")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[]}"#)
+        .expect(0)
+        .create();
+
+    let mut common = make_common(archive);
+    common.mode = RunMode::DryRun;
+    let err = make_config(server.url(), None, Surfaces::ALL)
+        .run(common)
+        .into_result()
+        .unwrap_err();
+    assert!(
+        matches!(err, vandelay::error::Error::SourceChange(_)),
+        "expected SourceChange error, got {err:?}"
+    );
+    assert_eq!(err.exit_status().code(), 4);
+    assert_eq!(
+        err.to_string(),
+        "source-change protection: archive already records exchange_graph source \
+         (https://login.microsoftonline.com/common|https://graph.microsoft.com/v1.0, \
+         account old-user-id); pass --allow-source-change to import a different account"
+    );
+    folders.assert();
+}
+
+// An abort on the calendar surface keeps the mail counts already gathered (R15).
+#[test]
+fn abort_after_mail_keeps_the_mail_counts() {
+    let mut server = Server::new();
+    let _principal = server
+        .mock("GET", Matcher::Regex(r"^/me\?\$select=id".to_owned()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"uid-1","userPrincipalName":"alice@x.com"}"#)
+        .create();
+    stub_mail_surface(&mut server);
+    let _calendars = server
+        .mock("GET", "/me/calendars?$top=100")
+        .with_status(400)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":{"code":"BadRequest","message":"nope"}}"#)
+        .create();
+
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    let outcome =
+        make_config(server.url(), None, surfaces("mail,calendar")).run(make_common(archive));
+    assert!(
+        outcome.error.is_some(),
+        "the calendar 400 must abort the run"
+    );
+    let summary = &outcome.summary;
+    assert_eq!(summary.get(ObjectType::Mailbox).map(|c| c.created), Some(1));
+    assert_eq!(summary.get(ObjectType::Email).map(|c| c.created), Some(1));
+    assert_eq!(
+        summary.get(ObjectType::Calendar).map(|c| c.created),
+        Some(0)
     );
 }
 
@@ -1032,41 +1077,41 @@ fn stub_well_known_folders(server: &mut Server, inbox_id: &str) {
         .create();
 }
 
-fn make_common(archive: std::path::PathBuf) -> vandelay::sync::CommonConfig {
-    vandelay::sync::CommonConfig {
+fn make_common(archive: std::path::PathBuf) -> vandelay::sync::RunOptions {
+    vandelay::sync::RunOptions {
         archive,
         threads: 2,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 0,
-        allow_invalid_certs: false,
-        logger: vandelay::logging::Logger::new(0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     }
 }
 
-fn surfaces(list: &str) -> vandelay::exchange_graph::types::Surfaces {
-    vandelay::exchange_graph::types::Surfaces::parse_list(list).unwrap()
+fn surfaces(list: &str) -> vandelay::exchange::graph::types::Surfaces {
+    vandelay::exchange::graph::types::Surfaces::parse_list(list).unwrap()
 }
 
 fn make_config(
     api_base: String,
     user_target: Option<String>,
-    surfaces: vandelay::exchange_graph::types::Surfaces,
-) -> vandelay::sync::import_exchange_graph::GraphImportConfig {
-    vandelay::sync::import_exchange_graph::GraphImportConfig {
-        auth: vandelay::sync::import_exchange_graph::GraphAuth::PreAcquired {
+    surfaces: vandelay::exchange::graph::types::Surfaces,
+) -> vandelay::import::graph::GraphImport {
+    vandelay::import::graph::GraphImport {
+        auth: vandelay::import::graph::GraphAuth::PreAcquired {
             token: make_jwt(9999999999, "alice@x.com"),
         },
         api_base,
         user_target,
-        mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
+        mailbox_kind: vandelay::exchange::graph::types::MailboxKind::Primary,
         surfaces,
-        event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
+        event_body_format: vandelay::exchange::graph::types::EventBodyFormat::Text,
         graph_connections: 2,
         top: 100,
         exception_window_years: 5,
-        contact_photos: false,
-        event_attachments: true,
-        allow_source_change: false,
+        contact_photos: vandelay::import::graph::ContactPhotos::Skip,
+        event_attachments: vandelay::import::graph::EventAttachments::Fetch,
+        source_change: SourceChange::Reject,
     }
 }
 
@@ -1118,23 +1163,22 @@ fn users_upn_routes_through_users_segment_not_me() {
         .expect_at_least(0)
         .create();
     let base = server.url();
-    let common = vandelay::sync::CommonConfig {
+    let common = vandelay::sync::RunOptions {
         archive: tempfile::NamedTempFile::new().unwrap().path().to_owned(),
         threads: 2,
-        dry_run: true,
+        mode: RunMode::DryRun,
         max_retries: 0,
-        allow_invalid_certs: false,
-        logger: vandelay::logging::Logger::new(0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let summary = vandelay::sync::import_exchange_graph::run(
-        common,
-        make_config(base, Some("alice@x.com".to_owned()), Surfaces::ALL),
-    )
-    .unwrap();
+    let summary = make_config(base, Some("alice@x.com".to_owned()), Surfaces::ALL)
+        .run(common)
+        .into_result()
+        .unwrap();
     let mailbox = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "mailbox")
+        .find(|(t, _)| *t == ObjectType::Mailbox)
         .map(|(_, c)| c.created)
         .unwrap_or(99);
     assert_eq!(mailbox, 0);
@@ -1228,20 +1272,20 @@ fn series_master_with_exception_merges_into_recurrence_overrides() {
         .create();
     let base = server.url();
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    let summary = vandelay::sync::import_exchange_graph::run(
-        make_common(archive.clone()),
-        make_config(base, None, surfaces("calendar")),
-    )
-    .unwrap();
+    let summary = make_config(base, None, surfaces("calendar"))
+        .run(make_common(archive.clone()))
+        .into_result()
+        .unwrap();
     let events = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "calendarevent")
+        .find(|(t, _)| *t == ObjectType::CalendarEvent)
         .map(|(_, c)| c.created)
         .unwrap_or(0);
     assert_eq!(events, 1, "exactly one master row, exception merged in");
 
-    let conn = vandelay::db::init::open(&archive).unwrap();
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
     let row: String = conn
         .query_row("SELECT data FROM calendar_events", [], |row| row.get(0))
         .unwrap();
@@ -1333,21 +1377,21 @@ fn occurrence_event_is_skipped_no_row_no_id_mapping() {
         .create();
     let base = server.url();
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    let summary = vandelay::sync::import_exchange_graph::run(
-        make_common(archive.clone()),
-        make_config(base, None, surfaces("calendar")),
-    )
-    .unwrap();
+    let summary = make_config(base, None, surfaces("calendar"))
+        .run(make_common(archive.clone()))
+        .into_result()
+        .unwrap();
     let events = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "calendarevent")
+        .find(|(t, _)| *t == ObjectType::CalendarEvent)
         .map(|(_, c)| c.created)
         .unwrap_or(99);
     assert_eq!(events, 0, "occurrence must not be fetched or stored");
     occ_get.assert();
 
-    let conn = vandelay::db::init::open(&archive).unwrap();
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM calendar_events", [], |row| row.get(0))
         .unwrap();
@@ -1413,12 +1457,12 @@ fn hidden_mail_folder_has_is_subscribed_zero() {
     stub_well_known_folders(&mut server, "FVISIBLE");
     let base = server.url();
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    let _ = vandelay::sync::import_exchange_graph::run(
-        make_common(archive.clone()),
-        make_config(base, None, surfaces("mail")),
-    )
-    .unwrap();
-    let conn = vandelay::db::init::open(&archive).unwrap();
+    let _ = make_config(base, None, surfaces("mail"))
+        .run(make_common(archive.clone()))
+        .into_result()
+        .unwrap();
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
     let visible: i64 = conn
         .query_row(
             "SELECT is_subscribed FROM mailboxes WHERE name = 'Inbox'",
@@ -1507,12 +1551,12 @@ fn well_known_folder_probes_assign_jmap_roles() {
     }
     let base = server.url();
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    let _ = vandelay::sync::import_exchange_graph::run(
-        make_common(archive.clone()),
-        make_config(base, None, surfaces("mail")),
-    )
-    .unwrap();
-    let conn = vandelay::db::init::open(&archive).unwrap();
+    let _ = make_config(base, None, surfaces("mail"))
+        .run(make_common(archive.clone()))
+        .into_result()
+        .unwrap();
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
     let mut stmt = conn
         .prepare("SELECT name, role FROM mailboxes ORDER BY name")
         .unwrap();
@@ -1587,15 +1631,14 @@ SGVsbG8=\r\n--X--\r\n";
         .create();
     let base = server.url();
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    let summary = vandelay::sync::import_exchange_graph::run(
-        make_common(archive),
-        make_config(base, None, surfaces("mail")),
-    )
-    .unwrap();
+    let summary = make_config(base, None, surfaces("mail"))
+        .run(make_common(archive))
+        .into_result()
+        .unwrap();
     let emails = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "email")
+        .find(|(t, _)| *t == ObjectType::Email)
         .map(|(_, c)| c.created)
         .unwrap_or(0);
     assert_eq!(emails, 1);
@@ -1675,11 +1718,10 @@ fn event_get_carries_outlook_timezone_and_body_content_type_prefer() {
         .create();
     let base = server.url();
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    let _ = vandelay::sync::import_exchange_graph::run(
-        make_common(archive),
-        make_config(base, None, surfaces("calendar")),
-    )
-    .unwrap();
+    let _ = make_config(base, None, surfaces("calendar"))
+        .run(make_common(archive))
+        .into_result()
+        .unwrap();
 }
 
 #[test]
@@ -1701,7 +1743,14 @@ fn graph_client_retries_after_401_when_bearer_is_swapped() {
         .expect(1)
         .create();
     let base = server.url();
-    let client = GraphClient::new("EXPIRED".to_owned(), RetryPolicy::new(0), false);
+    let client = GraphClient::new(
+        "EXPIRED".to_owned(),
+        ClientOptions {
+            retry: RetryPolicy::new(0),
+            tls: TlsPolicy::Verify,
+            logger: Logger::new(Level::Quiet),
+        },
+    );
     let url = format!("{base}/me");
     let err = client.get(&url, Accept::Json).unwrap_err();
     assert!(matches!(err, GraphError::Auth(_)));
@@ -1761,33 +1810,24 @@ fn full_run_records_graph_id_in_sync_id_exchange_graph_with_padding() {
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let archive = tmp.path().to_owned();
-    let common = vandelay::sync::CommonConfig {
+    let common = vandelay::sync::RunOptions {
         archive: archive.clone(),
         threads: 2,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 0,
-        allow_invalid_certs: false,
-        logger: vandelay::logging::Logger::new(0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let config = vandelay::sync::import_exchange_graph::GraphImportConfig {
-        auth: vandelay::sync::import_exchange_graph::GraphAuth::PreAcquired {
+    let config = vandelay::import::graph::GraphImport {
+        auth: vandelay::import::graph::GraphAuth::PreAcquired {
             token: make_jwt(9999999999, "pad@x.com"),
         },
-        api_base: server.url(),
-        user_target: None,
-        mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        surfaces: surfaces("mail"),
-        event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
-        graph_connections: 2,
-        top: 100,
-        exception_window_years: 5,
-        contact_photos: false,
-        event_attachments: true,
-        allow_source_change: false,
+        ..make_config(server.url(), None, surfaces("mail"))
     };
     drop(tmp);
-    let _ = vandelay::sync::import_exchange_graph::run(common, config).unwrap();
-    let conn = vandelay::db::init::open(&archive).unwrap();
+    let _ = config.run(common).into_result().unwrap();
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
     let (graph_id, type_name): (String, String) = conn
         .query_row(
             "SELECT graph_id, type_name FROM sync_id_exchange_graph",
@@ -1834,33 +1874,25 @@ fn archive_mailbox_kind_encodes_synthetic_suffix_in_account_id() {
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let archive = tmp.path().to_owned();
-    let common = vandelay::sync::CommonConfig {
+    let common = vandelay::sync::RunOptions {
         archive: archive.clone(),
         threads: 2,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 0,
-        allow_invalid_certs: false,
-        logger: vandelay::logging::Logger::new(0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let config = vandelay::sync::import_exchange_graph::GraphImportConfig {
-        auth: vandelay::sync::import_exchange_graph::GraphAuth::PreAcquired {
+    let config = vandelay::import::graph::GraphImport {
+        auth: vandelay::import::graph::GraphAuth::PreAcquired {
             token: make_jwt(9999999999, "a@x.com"),
         },
-        api_base: server.url(),
-        user_target: None,
-        mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Archive,
-        surfaces: surfaces("mail"),
-        event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
-        graph_connections: 2,
-        top: 100,
-        exception_window_years: 5,
-        contact_photos: false,
-        event_attachments: true,
-        allow_source_change: false,
+        mailbox_kind: vandelay::exchange::graph::types::MailboxKind::Archive,
+        ..make_config(server.url(), None, surfaces("mail"))
     };
     drop(tmp);
-    let _ = vandelay::sync::import_exchange_graph::run(common, config).unwrap();
-    let conn = vandelay::db::init::open(&archive).unwrap();
+    let _ = config.run(common).into_result().unwrap();
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
     let account_id: String = conn
         .query_row(
             "SELECT account_id FROM sources WHERE kind = 'exchange_graph'",
@@ -1874,19 +1906,20 @@ fn archive_mailbox_kind_encodes_synthetic_suffix_in_account_id() {
 #[test]
 fn allow_source_change_permits_overwriting_a_different_account() {
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    let conn = vandelay::db::init::open(&archive).unwrap();
-    vandelay::db::sources::upsert_source(
-        &conn,
-        &vandelay::db::sources::SourceKey {
-            kind: "exchange_graph".to_owned(),
-            session_url: "https://login.microsoftonline.com/common|https://x.example".to_owned(),
-            account_id: "different-uid".to_owned(),
-        },
-        Some("old@x.com"),
-        "old@x.com",
-    )
-    .unwrap();
-    drop(conn);
+    let db = Archive::open(&archive).unwrap();
+    db.store()
+        .sources()
+        .upsert(
+            &SourceKey {
+                kind: SourceKind::ExchangeGraph,
+                url: "https://login.microsoftonline.com/common|https://x.example",
+                account_id: "different-uid",
+            },
+            Some("old@x.com"),
+            "old@x.com",
+        )
+        .unwrap();
+    drop(db);
 
     let mut server = Server::new();
     let _principal = server
@@ -1902,31 +1935,22 @@ fn allow_source_change_permits_overwriting_a_different_account() {
         .with_body(r#"{"value":[]}"#)
         .create();
 
-    let common = vandelay::sync::CommonConfig {
+    let common = vandelay::sync::RunOptions {
         archive: archive.clone(),
         threads: 2,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 0,
-        allow_invalid_certs: false,
-        logger: vandelay::logging::Logger::new(0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let config = vandelay::sync::import_exchange_graph::GraphImportConfig {
-        auth: vandelay::sync::import_exchange_graph::GraphAuth::PreAcquired {
+    let config = vandelay::import::graph::GraphImport {
+        auth: vandelay::import::graph::GraphAuth::PreAcquired {
             token: make_jwt(9999999999, "new@x.com"),
         },
-        api_base: server.url(),
-        user_target: None,
-        mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        surfaces: surfaces("mail"),
-        event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
-        graph_connections: 2,
-        top: 100,
-        exception_window_years: 5,
-        contact_photos: false,
-        event_attachments: true,
-        allow_source_change: true,
+        source_change: SourceChange::Allow,
+        ..make_config(server.url(), None, surfaces("mail"))
     };
-    let result = vandelay::sync::import_exchange_graph::run(common, config);
+    let result = config.run(common).into_result();
     assert!(
         result.is_ok(),
         "--allow-source-change must permit a different account, got {result:?}"
@@ -1986,35 +2010,26 @@ fn dry_run_makes_no_per_item_get_and_no_sqlite_writes() {
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let archive = tmp.path().to_owned();
-    let common = vandelay::sync::CommonConfig {
+    let common = vandelay::sync::RunOptions {
         archive: archive.clone(),
         threads: 2,
-        dry_run: true,
+        mode: RunMode::DryRun,
         max_retries: 0,
-        allow_invalid_certs: false,
-        logger: vandelay::logging::Logger::new(0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let config = vandelay::sync::import_exchange_graph::GraphImportConfig {
-        auth: vandelay::sync::import_exchange_graph::GraphAuth::PreAcquired {
+    let config = vandelay::import::graph::GraphImport {
+        auth: vandelay::import::graph::GraphAuth::PreAcquired {
             token: make_jwt(9999999999, "a@x.com"),
         },
-        api_base: server.url(),
-        user_target: None,
-        mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        surfaces: Surfaces::ALL,
-        event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
-        graph_connections: 2,
-        top: 100,
-        exception_window_years: 5,
-        contact_photos: false,
-        event_attachments: true,
-        allow_source_change: false,
+        ..make_config(server.url(), None, Surfaces::ALL)
     };
     drop(tmp);
-    let _ = vandelay::sync::import_exchange_graph::run(common, config).unwrap();
+    let _ = config.run(common).into_result().unwrap();
     no_messages.assert();
     no_well_known.assert();
-    let conn = vandelay::db::init::open(&archive).unwrap();
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
     let sources: i64 = conn
         .query_row("SELECT count(*) FROM sources", [], |row| row.get(0))
         .unwrap();
@@ -2027,7 +2042,7 @@ fn dry_run_makes_no_per_item_get_and_no_sqlite_writes() {
 
 #[test]
 fn refresh_access_token_failure_message_carries_status() {
-    let other = parse_token_response(401, &json!({"error": "invalid_grant"}));
+    let other = TokenResponse::parse(401, &json!({"error": "invalid_grant"}));
     match other {
         TokenResponse::Other { error, .. } => assert_eq!(error, "invalid_grant"),
         v => panic!("expected Other for invalid_grant, got {v:?}"),
@@ -2036,45 +2051,120 @@ fn refresh_access_token_failure_message_carries_status() {
 
 #[test]
 fn token_response_expired_recognised() {
-    let r = parse_token_response(400, &json!({"error": "expired_token"}));
+    let r = TokenResponse::parse(400, &json!({"error": "expired_token"}));
     assert!(matches!(r, TokenResponse::Expired));
 }
 
 #[test]
 fn token_response_bad_code_recognised() {
-    let r = parse_token_response(400, &json!({"error": "bad_verification_code"}));
+    let r = TokenResponse::parse(400, &json!({"error": "bad_verification_code"}));
     assert!(matches!(r, TokenResponse::BadCode));
+}
+
+// Vanished emails are swept; a vanished mailbox with a live child is counted failed and kept (R8).
+#[test]
+fn vanished_items_are_swept_and_a_parent_with_a_live_child_is_kept() {
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    let principal = r#"{"id":"uid-1","userPrincipalName":"alice@x.com"}"#;
+    let mut server = Server::new();
+    let _principal = server
+        .mock("GET", Matcher::Regex(r"^/me\?\$select=id".to_owned()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(principal)
+        .create();
+    stub_mail_surface(&mut server);
+    make_config(server.url(), None, surfaces("mail"))
+        .run(make_common(archive.clone()))
+        .into_result()
+        .unwrap();
+
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
+    let parent: i64 = conn
+        .query_row(
+            "SELECT local_id FROM sync_id_exchange_graph WHERE graph_id = 'FMAIL'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO mailboxes (name, parent_id, sort_order, is_subscribed) VALUES ('Local', ?1, 0, 1)",
+        [parent],
+    )
+    .unwrap();
+    drop(db);
+
+    server.reset();
+    let _principal = server
+        .mock("GET", Matcher::Regex(r"^/me\?\$select=id".to_owned()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(principal)
+        .create();
+    let _folders = server
+        .mock("GET", "/me/mailFolders?$top=100&includeHiddenFolders=true")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[]}"#)
+        .create();
+    stub_well_known_folders(&mut server, "GONE");
+    let summary = make_config(server.url(), None, surfaces("mail"))
+        .run(make_common(archive.clone()))
+        .into_result()
+        .unwrap();
+    let email = summary.get(ObjectType::Email).unwrap();
+    assert_eq!((email.deleted, email.failed), (1, 0));
+    let mailbox = summary.get(ObjectType::Mailbox).unwrap();
+    assert_eq!((mailbox.deleted, mailbox.failed), (0, 1));
+
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
+    assert_eq!(row_count(conn, "emails"), 0);
+    assert_eq!(row_count(conn, "mailboxes"), 2);
+    let mapped: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sync_id_exchange_graph WHERE graph_id = 'FMAIL'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        mapped, 1,
+        "a mailbox that could not be deleted keeps its mapping"
+    );
 }
 
 #[test]
 fn folder_enumeration_failure_skips_vanished_deletion() {
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    let setup_conn = vandelay::db::init::open(&archive).unwrap();
-    let sid = vandelay::db::sources::upsert_source(
-        &setup_conn,
-        &vandelay::db::sources::SourceKey {
-            kind: "exchange_graph".to_owned(),
-            session_url: "stale".to_owned(),
-            account_id: "stale-uid".to_owned(),
-        },
-        Some("stale@x.com"),
-        "stale@x.com",
-    )
-    .unwrap();
+    let setup_db = Archive::open(&archive).unwrap();
+    let setup_conn = setup_db.connection();
+    let sid = setup_db
+        .store()
+        .sources()
+        .upsert(
+            &SourceKey {
+                kind: SourceKind::ExchangeGraph,
+                url: "stale",
+                account_id: "stale-uid",
+            },
+            Some("stale@x.com"),
+            "stale@x.com",
+        )
+        .unwrap();
     setup_conn
         .execute(
             "INSERT INTO mailboxes (id, name, sort_order, is_subscribed) VALUES (42, 'Inbox', 0, 1)",
             [],
         )
         .unwrap();
-    vandelay::db::exchange_graph_ids::insert(
-        &setup_conn,
-        sid,
-        vandelay::db::exchange_graph_ids::MAILBOX,
-        "FMAIL",
-        42,
-    )
-    .unwrap();
+    setup_conn
+        .execute(
+            "INSERT INTO sync_id_exchange_graph (source_id, type_name, graph_id, local_id) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![sid, "mailbox", "FMAIL", 42],
+        )
+        .unwrap();
     setup_conn
         .execute(
             "INSERT INTO blobs (hash, data) VALUES (x'aa', x'68656c6c6f')",
@@ -2091,14 +2181,12 @@ fn folder_enumeration_failure_skips_vanished_deletion() {
             rusqlite::params![blob_id],
         )
         .unwrap();
-    vandelay::db::exchange_graph_ids::insert(
-        &setup_conn,
-        sid,
-        vandelay::db::exchange_graph_ids::EMAIL,
-        "MSG-LOCAL",
-        1,
-    )
-    .unwrap();
+    setup_conn
+        .execute(
+            "INSERT INTO sync_id_exchange_graph (source_id, type_name, graph_id, local_id) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![sid, "email", "MSG-LOCAL", 1],
+        )
+        .unwrap();
     setup_conn
         .execute(
             "UPDATE sources SET kind = 'exchange_graph',
@@ -2112,7 +2200,7 @@ fn folder_enumeration_failure_skips_vanished_deletion() {
             ],
         )
         .unwrap();
-    drop(setup_conn);
+    drop(setup_db);
 
     let mut server = Server::new();
     let _principal = server
@@ -2160,32 +2248,24 @@ fn folder_enumeration_failure_skips_vanished_deletion() {
         .with_body("transient outage")
         .create();
 
-    let common = vandelay::sync::CommonConfig {
+    let common = vandelay::sync::RunOptions {
         archive: archive.clone(),
         threads: 2,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 0,
-        allow_invalid_certs: false,
-        logger: vandelay::logging::Logger::new(0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     };
-    let config = vandelay::sync::import_exchange_graph::GraphImportConfig {
-        auth: vandelay::sync::import_exchange_graph::GraphAuth::PreAcquired {
+    let config = vandelay::import::graph::GraphImport {
+        auth: vandelay::import::graph::GraphAuth::PreAcquired {
             token: make_jwt(9999999999, "flake@x.com"),
         },
-        api_base: server.url(),
-        user_target: None,
-        mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
-        surfaces: surfaces("mail"),
-        event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
-        graph_connections: 2,
-        top: 100,
-        exception_window_years: 5,
-        contact_photos: false,
-        event_attachments: true,
-        allow_source_change: true,
+        source_change: SourceChange::Allow,
+        ..make_config(server.url(), None, surfaces("mail"))
     };
-    let _ = vandelay::sync::import_exchange_graph::run(common, config).unwrap();
-    let conn = vandelay::db::init::open(&archive).unwrap();
+    let _ = config.run(common).into_result().unwrap();
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
     let remaining: i64 = conn
         .query_row("SELECT count(*) FROM emails WHERE id = 1", [], |row| {
             row.get(0)
@@ -2354,21 +2434,21 @@ fn contacts_surface_imports_only_address_books_and_cards() {
 
     let base = server.url();
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    vandelay::sync::import_exchange_graph::run(
-        make_common(archive.clone()),
-        make_config(base, None, surfaces("contacts")),
-    )
-    .unwrap();
+    make_config(base, None, surfaces("contacts"))
+        .run(make_common(archive.clone()))
+        .into_result()
+        .unwrap();
     no_mail.assert();
     no_calendars.assert();
 
-    let conn = vandelay::db::init::open(&archive).unwrap();
-    assert_eq!(row_count(&conn, "address_books"), 1);
-    assert_eq!(row_count(&conn, "contact_cards"), 1);
-    assert_eq!(row_count(&conn, "mailboxes"), 0);
-    assert_eq!(row_count(&conn, "emails"), 0);
-    assert_eq!(row_count(&conn, "calendars"), 0);
-    assert_eq!(row_count(&conn, "calendar_events"), 0);
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
+    assert_eq!(row_count(conn, "address_books"), 1);
+    assert_eq!(row_count(conn, "contact_cards"), 1);
+    assert_eq!(row_count(conn, "mailboxes"), 0);
+    assert_eq!(row_count(conn, "emails"), 0);
+    assert_eq!(row_count(conn, "calendars"), 0);
+    assert_eq!(row_count(conn, "calendar_events"), 0);
 }
 
 #[test]
@@ -2398,21 +2478,21 @@ fn mail_surface_imports_only_mailboxes_and_emails() {
 
     let base = server.url();
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    vandelay::sync::import_exchange_graph::run(
-        make_common(archive.clone()),
-        make_config(base, None, surfaces("mail")),
-    )
-    .unwrap();
+    make_config(base, None, surfaces("mail"))
+        .run(make_common(archive.clone()))
+        .into_result()
+        .unwrap();
     no_calendars.assert();
     no_contact_folders.assert();
 
-    let conn = vandelay::db::init::open(&archive).unwrap();
-    assert_eq!(row_count(&conn, "mailboxes"), 1);
-    assert_eq!(row_count(&conn, "emails"), 1);
-    assert_eq!(row_count(&conn, "address_books"), 0);
-    assert_eq!(row_count(&conn, "contact_cards"), 0);
-    assert_eq!(row_count(&conn, "calendars"), 0);
-    assert_eq!(row_count(&conn, "calendar_events"), 0);
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
+    assert_eq!(row_count(conn, "mailboxes"), 1);
+    assert_eq!(row_count(conn, "emails"), 1);
+    assert_eq!(row_count(conn, "address_books"), 0);
+    assert_eq!(row_count(conn, "contact_cards"), 0);
+    assert_eq!(row_count(conn, "calendars"), 0);
+    assert_eq!(row_count(conn, "calendar_events"), 0);
 }
 
 fn stub_principal(server: &mut Server) {
@@ -2472,13 +2552,12 @@ fn default_contact_folder_is_imported_although_contactfolders_omits_it() {
 
     let base = server.url();
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    let summary = vandelay::sync::import_exchange_graph::run(
-        make_common(archive.clone()),
-        make_config(base, None, surfaces("contacts")),
-    )
-    .unwrap();
+    let summary = make_config(base, None, surfaces("contacts"))
+        .run(make_common(archive.clone()))
+        .into_result()
+        .unwrap();
 
-    let count = |name: &str| {
+    let count = |name: ObjectType| {
         summary
             .per_type
             .iter()
@@ -2487,18 +2566,19 @@ fn default_contact_folder_is_imported_although_contactfolders_omits_it() {
             .unwrap_or(0)
     };
     assert_eq!(
-        count("addressbook"),
+        count(ObjectType::AddressBook),
         1,
         "the default Contacts folder must become an address book even though \
          /me/contactFolders never lists it"
     );
     assert_eq!(
-        count("contactcard"),
+        count(ObjectType::ContactCard),
         2,
         "both default-folder contacts import"
     );
 
-    let conn = vandelay::db::init::open(&archive).unwrap();
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
     let is_default: i64 = conn
         .query_row("SELECT is_default FROM address_books", [], |row| row.get(0))
         .unwrap();
@@ -2548,13 +2628,13 @@ fn default_contact_folder_falls_back_to_parent_of_an_existing_contact() {
 
     let base = server.url();
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    vandelay::sync::import_exchange_graph::run(
-        make_common(archive.clone()),
-        make_config(base, None, surfaces("contacts")),
-    )
-    .unwrap();
+    make_config(base, None, surfaces("contacts"))
+        .run(make_common(archive.clone()))
+        .into_result()
+        .unwrap();
 
-    let conn = vandelay::db::init::open(&archive).unwrap();
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
     let name: String = conn
         .query_row("SELECT name FROM address_books", [], |row| row.get(0))
         .unwrap();
@@ -2598,16 +2678,15 @@ fn contact_folder_reachable_by_two_paths_is_inserted_once() {
 
     let base = server.url();
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    let summary = vandelay::sync::import_exchange_graph::run(
-        make_common(archive.clone()),
-        make_config(base, None, surfaces("contacts")),
-    )
-    .expect("a folder reachable by two paths must not violate the id-mapping uniqueness");
+    let summary = make_config(base, None, surfaces("contacts"))
+        .run(make_common(archive.clone()))
+        .into_result()
+        .expect("a folder reachable by two paths must not violate the id-mapping uniqueness");
 
     let created = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "addressbook")
+        .find(|(t, _)| *t == ObjectType::AddressBook)
         .map(|(_, c)| c.created)
         .unwrap_or(0);
     assert_eq!(
@@ -2668,13 +2747,13 @@ fn message_state_becomes_jmap_keywords() {
 
     let base = server.url();
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    vandelay::sync::import_exchange_graph::run(
-        make_common(archive.clone()),
-        make_config(base, None, surfaces("mail")),
-    )
-    .unwrap();
+    make_config(base, None, surfaces("mail"))
+        .run(make_common(archive.clone()))
+        .into_result()
+        .unwrap();
 
-    let conn = vandelay::db::init::open(&archive).unwrap();
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
     let mut stmt = conn
         .prepare("SELECT keywords FROM emails ORDER BY id")
         .unwrap();
@@ -2735,16 +2814,15 @@ fn drive_items_import_as_file_nodes_and_skip_facetless_items() {
 
     let base = server.url();
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    let summary = vandelay::sync::import_exchange_graph::run(
-        make_common(archive.clone()),
-        make_config(base, None, surfaces("files")),
-    )
-    .unwrap();
+    let summary = make_config(base, None, surfaces("files"))
+        .run(make_common(archive.clone()))
+        .into_result()
+        .unwrap();
 
     let created = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "filenode")
+        .find(|(t, _)| *t == ObjectType::FileNode)
         .map(|(_, c)| c.created)
         .unwrap_or(0);
     assert_eq!(
@@ -2752,7 +2830,8 @@ fn drive_items_import_as_file_nodes_and_skip_facetless_items() {
         "one directory and two files; the remoteItem has no file or folder facet and is skipped"
     );
 
-    let conn = vandelay::db::init::open(&archive).unwrap();
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
     let vault: i64 = conn
         .query_row(
             "SELECT count(*) FROM file_nodes WHERE name = 'Personal Vault'",
@@ -2871,13 +2950,13 @@ fn a_deleted_occurrence_becomes_an_excluded_override() {
 
     let base = server.url();
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    vandelay::sync::import_exchange_graph::run(
-        make_common(archive.clone()),
-        make_config(base, None, surfaces("calendar")),
-    )
-    .unwrap();
+    make_config(base, None, surfaces("calendar"))
+        .run(make_common(archive.clone()))
+        .into_result()
+        .unwrap();
 
-    let conn = vandelay::db::init::open(&archive).unwrap();
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
     let row: String = conn
         .query_row("SELECT data FROM calendar_events", [], |row| row.get(0))
         .unwrap();
@@ -2937,13 +3016,13 @@ fn event_file_attachments_become_enclosure_links() {
 
     let base = server.url();
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
-    vandelay::sync::import_exchange_graph::run(
-        make_common(archive.clone()),
-        make_config(base, None, surfaces("calendar")),
-    )
-    .unwrap();
+    make_config(base, None, surfaces("calendar"))
+        .run(make_common(archive.clone()))
+        .into_result()
+        .unwrap();
 
-    let conn = vandelay::db::init::open(&archive).unwrap();
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
     let row: String = conn
         .query_row("SELECT data FROM calendar_events", [], |row| row.get(0))
         .unwrap();
@@ -3011,10 +3090,14 @@ fn contact_photo_categories_and_im_addresses_are_imported() {
     let base = server.url();
     let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
     let mut config = make_config(base, None, surfaces("contacts"));
-    config.contact_photos = true;
-    vandelay::sync::import_exchange_graph::run(make_common(archive.clone()), config).unwrap();
+    config.contact_photos = vandelay::import::graph::ContactPhotos::Fetch;
+    config
+        .run(make_common(archive.clone()))
+        .into_result()
+        .unwrap();
 
-    let conn = vandelay::db::init::open(&archive).unwrap();
+    let db = Archive::open(&archive).unwrap();
+    let conn = db.connection();
     let row: String = conn
         .query_row("SELECT data FROM contact_cards", [], |row| row.get(0))
         .unwrap();
@@ -3033,5 +3116,253 @@ fn contact_photo_categories_and_im_addresses_are_imported() {
     assert_eq!(
         v["media"]["photo"]["mediaType"], "image/png",
         "the type is sniffed from the bytes, not taken from Graph's jpeg header"
+    );
+}
+
+// With one connection, new messages get local ids in the server's enumeration order.
+#[test]
+fn single_connection_mail_import_keeps_server_order() {
+    let mut server = Server::new();
+    let _principal = server
+        .mock("GET", Matcher::Regex(r"^/me\?\$select=id".to_owned()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"uid-order","userPrincipalName":"alice@x.com"}"#)
+        .create();
+    let _folders = server
+        .mock("GET", "/me/mailFolders?$top=100&includeHiddenFolders=true")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[{"id":"FMAIL","displayName":"Inbox","isHidden":false}]}"#)
+        .create();
+    let _children = server
+        .mock(
+            "GET",
+            "/me/mailFolders/FMAIL/childFolders?$top=100&includeHiddenFolders=true",
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[]}"#)
+        .create();
+    let _well_known = server
+        .mock(
+            "GET",
+            Matcher::Regex(r"^/me/mailFolders/[a-z]+\?\$select=id$".to_owned()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"OTHER"}"#)
+        .create();
+    let order = [
+        "MSG-F", "MSG-B", "MSG-E", "MSG-A", "MSG-D", "MSG-C", "MSG-H", "MSG-G",
+    ];
+    let stubs: Vec<_> = order.iter().map(|id| json!({ "id": id })).collect();
+    let _ids = server
+        .mock(
+            "GET",
+            "/me/mailFolders/FMAIL/messages?$top=100&$select=id,isRead,isDraft,flag,categories",
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(json!({ "value": stubs }).to_string())
+        .create();
+    let _value = server
+        .mock(
+            "GET",
+            Matcher::Regex(r"^/me/messages/MSG-[A-H]/\$value$".to_owned()),
+        )
+        .with_status(200)
+        .with_header("content-type", "text/plain")
+        .with_body("From: a@x\r\nSubject: hi\r\n\r\nbody")
+        .create();
+
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    let config = vandelay::import::graph::GraphImport {
+        graph_connections: 1,
+        ..make_config(server.url(), None, surfaces("mail"))
+    };
+    config
+        .run(vandelay::sync::RunOptions {
+            archive: archive.clone(),
+            threads: 1,
+            mode: RunMode::Apply,
+            max_retries: 0,
+            tls: TlsPolicy::Verify,
+            logger: Logger::new(Level::Quiet),
+        })
+        .into_result()
+        .unwrap();
+
+    let db = Archive::open(&archive).unwrap();
+    let mut stmt = db
+        .connection()
+        .prepare(
+            "SELECT graph_id FROM sync_id_exchange_graph WHERE type_name = 'email' ORDER BY local_id",
+        )
+        .unwrap();
+    let imported: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(imported, order);
+}
+
+// A mail folder whose parent is not enumerated is still imported, as a root.
+#[test]
+fn mail_folder_with_missing_parent_is_imported_as_root() {
+    let mut server = Server::new();
+    let _principal = server
+        .mock("GET", Matcher::Regex(r"^/me\?\$select=id".to_owned()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"uid-orphan","userPrincipalName":"alice@x.com"}"#)
+        .create();
+    let _folders = server
+        .mock("GET", "/me/mailFolders?$top=100&includeHiddenFolders=true")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"value":[
+                {"id":"ORPHAN","displayName":"Orphan","parentFolderId":"MISSING","isHidden":false},
+                {"id":"ROOT","displayName":"Root","isHidden":false}
+            ]}"#,
+        )
+        .create();
+    let _children = server
+        .mock(
+            "GET",
+            Matcher::Regex(r"^/me/mailFolders/[A-Z]+/childFolders\?".to_owned()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[]}"#)
+        .create();
+    let _well_known = server
+        .mock(
+            "GET",
+            Matcher::Regex(r"^/me/mailFolders/[a-z]+\?\$select=id$".to_owned()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"OTHER"}"#)
+        .create();
+    let _messages = server
+        .mock(
+            "GET",
+            Matcher::Regex(r"^/me/mailFolders/[A-Z]+/messages\?".to_owned()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[]}"#)
+        .create();
+
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    let summary = make_config(server.url(), None, surfaces("mail"))
+        .run(vandelay::sync::RunOptions {
+            archive: archive.clone(),
+            threads: 1,
+            mode: RunMode::Apply,
+            max_retries: 0,
+            tls: TlsPolicy::Verify,
+            logger: Logger::new(Level::Quiet),
+        })
+        .into_result()
+        .unwrap();
+    let created = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == ObjectType::Mailbox)
+        .map(|(_, c)| c.created);
+    assert_eq!(created, Some(2));
+
+    let db = Archive::open(&archive).unwrap();
+    let parent: Option<i64> = db
+        .connection()
+        .query_row(
+            "SELECT m.parent_id FROM mailboxes m
+             JOIN sync_id_exchange_graph s ON s.local_id = m.id AND s.type_name = 'mailbox'
+             WHERE s.graph_id = 'ORPHAN'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(parent, None);
+}
+
+// Moving the default calendar, or losing the old default, leaves exactly the server's default flagged.
+#[test]
+fn moved_default_calendar_keeps_one_default() {
+    let mut server = Server::new();
+    let _principal = server
+        .mock("GET", Matcher::Regex(r"^/me\?\$select=id".to_owned()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"uid-default","userPrincipalName":"alice@x.com"}"#)
+        .create();
+    let _settings = server
+        .mock("GET", "/me/mailboxSettings?$select=timeZone")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"timeZone":"UTC"}"#)
+        .create();
+    let _events = server
+        .mock(
+            "GET",
+            Matcher::Regex(r"^/me/calendars/[A-Z]+/events\?".to_owned()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[]}"#)
+        .create();
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    let mut run = |calendars: &str| {
+        let listing = server
+            .mock("GET", "/me/calendars?$top=100")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(calendars)
+            .create();
+        make_config(server.url(), None, surfaces("calendar"))
+            .run(vandelay::sync::RunOptions {
+                archive: archive.clone(),
+                threads: 1,
+                mode: RunMode::Apply,
+                max_retries: 0,
+                tls: TlsPolicy::Verify,
+                logger: Logger::new(Level::Quiet),
+            })
+            .into_result()
+            .unwrap();
+        listing.remove();
+        let db = Archive::open(&archive).unwrap();
+        let mut stmt = db
+            .connection()
+            .prepare(
+                "SELECT s.graph_id, c.is_default FROM calendars c
+                 JOIN sync_id_exchange_graph s ON s.local_id = c.id AND s.type_name = 'calendar'
+                 ORDER BY s.graph_id",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    };
+    assert_eq!(
+        run(r#"{"value":[{"id":"A","name":"A","isDefaultCalendar":true},{"id":"B","name":"B"}]}"#),
+        [("A".to_owned(), true), ("B".to_owned(), false)]
+    );
+    assert_eq!(
+        run(
+            r#"{"value":[{"id":"B","name":"B","isDefaultCalendar":true},{"id":"A","name":"A","isDefaultCalendar":false}]}"#
+        ),
+        [("A".to_owned(), false), ("B".to_owned(), true)]
+    );
+    assert_eq!(
+        run(r#"{"value":[{"id":"C","name":"C","isDefaultCalendar":true},{"id":"A","name":"A"}]}"#),
+        [("A".to_owned(), false), ("C".to_owned(), true)]
     );
 }

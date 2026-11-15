@@ -6,20 +6,20 @@
 
 use encodify::base64::{LENIENT, STANDARD};
 use mockito::Matcher;
-use vandelay::exchange_ews::EwsClient;
-use vandelay::exchange_ews::autodiscover::{DiscoverySource, discover};
-use vandelay::exchange_ews::error::EwsError;
-use vandelay::exchange_ews::parse::{
-    EnvelopeKind, parse_find_folder_response, parse_find_item_response,
-    parse_get_attachment_inline, parse_response_messages, parse_sync_folder_items_response,
-    read_envelope_summary,
+use vandelay::archive::sources::SourceKind;
+use vandelay::exchange::ews::EwsClient;
+use vandelay::exchange::ews::autodiscover::{Autodiscover, DiscoverySource};
+use vandelay::exchange::ews::error::EwsError;
+use vandelay::exchange::ews::parse::{
+    EnvelopeKind, FindFolderResponse, FindItemResponse, GetAttachmentInline, ResponseMessage,
+    SyncFolderItemsResponse,
 };
-use vandelay::exchange_ews::types::{FolderClass, FolderId, ItemId, ResponseCode, ServerVersion};
-use vandelay::exchange_ews::xml::{
-    FolderRef, ItemShape, Traversal, find_folder_body, find_item_body, get_attachment_body,
-    get_item_body, sync_folder_items_body,
-};
-use vandelay::jmap::http::{Auth, RetryPolicy};
+use vandelay::exchange::ews::types::{FolderClass, FolderId, ItemId, ResponseCode, ServerVersion};
+use vandelay::exchange::ews::xml::{EwsRequest, FolderRef, ItemShape, Traversal};
+use vandelay::logging::{Level, Logger};
+use vandelay::net::auth::Auth;
+use vandelay::net::http::{ClientOptions, TlsPolicy};
+use vandelay::net::retry::RetryPolicy;
 
 const TXT_XML: &str = "text/xml; charset=utf-8";
 const APP_JSON: &str = "application/json";
@@ -29,8 +29,11 @@ fn client(retries: u32) -> EwsClient {
         Auth::Bearer {
             token: "t".to_owned(),
         },
-        RetryPolicy::new(retries),
-        false,
+        ClientOptions {
+            retry: RetryPolicy::new(retries),
+            tls: TlsPolicy::Verify,
+            logger: Logger::new(Level::Quiet),
+        },
     )
 }
 
@@ -59,8 +62,14 @@ fn autodiscover_v2_returns_global_endpoint() {
         .create();
     let _ = server;
     let url = "https://outlook.office365.com/EWS/Exchange.asmx";
-    assert!(vandelay::exchange_ews::autodiscover::is_fully_qualified_ews_url(url));
-    let r = discover(Some(url), None, None, false).unwrap();
+    assert!(Autodiscover::is_fully_qualified_ews_url(url));
+    let r = Autodiscover::new(ClientOptions {
+        retry: RetryPolicy::new(0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
+    })
+    .discover(Some(url), None, None)
+    .unwrap();
     assert_eq!(r.source, DiscoverySource::SuppliedUrl);
     assert_eq!(r.ews_url, url);
 }
@@ -80,7 +89,7 @@ fn find_folder_pagination_and_classification() {
            <t:FolderClass>IPF.Contact</t:FolderClass><t:DisplayName>Contacts</t:DisplayName></t:ContactsFolder>\
          </t:Folders></m:RootFolder></m:FindFolderResponseMessage></m:ResponseMessages></m:FindFolderResponse>"
     );
-    let parsed = parse_find_folder_response(envelope(&body).as_bytes()).unwrap();
+    let parsed = FindFolderResponse::parse(envelope(&body).as_bytes()).unwrap();
     assert_eq!(parsed.folders.len(), 3);
     let inbox = &parsed.folders[0];
     assert_eq!(inbox.folder_id.id, "FMAIL");
@@ -102,7 +111,7 @@ fn find_folder_classifies_workmail_folder_class_set() {
          <t:ContactsFolder><t:FolderId Id=\"CON\"/><t:FolderClass>IPF.Contact</t:FolderClass><t:DisplayName>Contacts</t:DisplayName></t:ContactsFolder>\
          </t:Folders></m:RootFolder></m:FindFolderResponseMessage></m:ResponseMessages></m:FindFolderResponse>"
     );
-    let parsed = parse_find_folder_response(envelope(&body).as_bytes()).unwrap();
+    let parsed = FindFolderResponse::parse(envelope(&body).as_bytes()).unwrap();
     let by_id = |id: &str| {
         parsed
             .folders
@@ -139,7 +148,7 @@ fn find_item_distribution_list_does_not_clobber_preceding_contact() {
          <t:DistributionList><t:ItemId Id=\"DL1\" ChangeKey=\"k3\"/></t:DistributionList>\
          </t:Items></m:RootFolder></m:FindItemResponseMessage></m:ResponseMessages></m:FindItemResponse>"
     ));
-    let parsed = parse_find_item_response(body.as_bytes()).unwrap();
+    let parsed = FindItemResponse::parse(body.as_bytes()).unwrap();
     assert_eq!(
         parsed.items.len(),
         3,
@@ -192,15 +201,25 @@ fn find_item_offset_loop_terminates_on_includes_last_true() {
 
     let c = client(0);
     let folder = FolderId::new("FID", "FCK");
-    let body0 = find_item_body(FolderRef::Concrete(&folder), Traversal::Shallow, 0, 2);
-    let r0 = c.call(&url, "FindItem", &body0).unwrap();
-    let parsed0 = parse_find_item_response(&r0.body).unwrap();
+    let body0 = EwsRequest::FindItem {
+        parent: FolderRef::Concrete(&folder),
+        traversal: Traversal::Shallow,
+        offset: 0,
+        page_size: 2,
+    };
+    let r0 = c.call(&url, &body0).unwrap();
+    let parsed0 = FindItemResponse::parse(&r0.body).unwrap();
     assert_eq!(parsed0.items.len(), 2);
     assert!(parsed0.more);
 
-    let body1 = find_item_body(FolderRef::Concrete(&folder), Traversal::Shallow, 2, 2);
-    let r1 = c.call(&url, "FindItem", &body1).unwrap();
-    let parsed1 = parse_find_item_response(&r1.body).unwrap();
+    let body1 = EwsRequest::FindItem {
+        parent: FolderRef::Concrete(&folder),
+        traversal: Traversal::Shallow,
+        offset: 2,
+        page_size: 2,
+    };
+    let r1 = c.call(&url, &body1).unwrap();
+    let parsed1 = FindItemResponse::parse(&r1.body).unwrap();
     assert_eq!(parsed1.items.len(), 2);
     assert!(!parsed1.more);
 }
@@ -221,7 +240,7 @@ fn get_item_mixed_success_and_per_item_error() {
            </m:GetItemResponseMessage>\
          </m:ResponseMessages></m:GetItemResponse>"
     ));
-    let r = parse_response_messages(body.as_bytes(), "GetItemResponseMessage").unwrap();
+    let r = ResponseMessage::parse_all(body.as_bytes(), "GetItemResponseMessage").unwrap();
     assert_eq!(r.len(), 2);
     assert!(r[0].success);
     assert!(r[0].inner_xml.contains("SGVsbG8="));
@@ -263,18 +282,18 @@ fn server_busy_with_back_off_triggers_retry_and_eventually_succeeds() {
         .create();
 
     let c = client(3);
-    let body = find_folder_body(
-        FolderRef::Distinguished(
-            vandelay::exchange_ews::types::DistinguishedFolderId::MsgFolderRoot,
+    let body = EwsRequest::FindFolder {
+        parent: FolderRef::Distinguished(
+            vandelay::exchange::ews::types::DistinguishedFolderId::MsgFolderRoot,
         ),
-        Traversal::Deep,
-    );
+        traversal: Traversal::Deep,
+    };
     let r = c
-        .call(&url, "FindFolder", &body)
+        .call(&url, &body)
         .expect("call should retry past busy fault");
-    let parsed = parse_find_folder_response(&r.body).unwrap();
+    let parsed = FindFolderResponse::parse(&r.body).unwrap();
     assert!(parsed.folders.is_empty());
-    assert!(c.retries_observed() >= 1);
+    assert!(c.stats().retries_observed >= 1);
 }
 
 #[test]
@@ -288,13 +307,13 @@ fn http_401_surfaces_as_auth_error() {
         .with_body("unauthorized")
         .create();
     let c = client(0);
-    let body = find_folder_body(
-        FolderRef::Distinguished(
-            vandelay::exchange_ews::types::DistinguishedFolderId::MsgFolderRoot,
+    let body = EwsRequest::FindFolder {
+        parent: FolderRef::Distinguished(
+            vandelay::exchange::ews::types::DistinguishedFolderId::MsgFolderRoot,
         ),
-        Traversal::Deep,
-    );
-    let err = c.call(&url, "FindFolder", &body).unwrap_err();
+        traversal: Traversal::Deep,
+    };
+    let err = c.call(&url, &body).unwrap_err();
     assert!(matches!(err, EwsError::Auth(_)), "got {err:?}");
 }
 
@@ -312,8 +331,8 @@ fn mime_content_round_trips_through_base64_decode() {
              </t:Message></m:Items></m:GetItemResponseMessage>\
          </m:ResponseMessages></m:GetItemResponse>"
     ));
-    let r = parse_response_messages(body.as_bytes(), "GetItemResponseMessage").unwrap();
-    let item = vandelay::exchange_ews::parse::parse_message_item(&r[0].inner_xml).unwrap();
+    let r = ResponseMessage::parse_all(body.as_bytes(), "GetItemResponseMessage").unwrap();
+    let item = vandelay::exchange::ews::parse::MessageItem::parse(&r[0].inner_xml).unwrap();
     let s = item.mime_content.unwrap();
     let bytes = LENIENT.decode(&s).unwrap();
     assert_eq!(bytes, original);
@@ -332,7 +351,7 @@ fn get_attachment_inline_decodes_photo_blob() {
            <t:Content>iVBORw0KGgo=</t:Content></t:FileAttachment>\
          </m:Attachments></m:GetAttachmentResponseMessage></m:ResponseMessages></m:GetAttachmentResponse>"
     ));
-    let items = parse_get_attachment_inline(body.as_bytes()).unwrap();
+    let items = GetAttachmentInline::parse_all(body.as_bytes()).unwrap();
     assert_eq!(items.len(), 1);
     assert!(items[0].is_contact_photo);
     assert_eq!(items[0].content_base64, "iVBORw0KGgo=");
@@ -360,7 +379,7 @@ fn calendar_item_master_inlines_modified_and_deleted_occurrences() {
            <t:DeletedOccurrence><t:Start>2025-06-17T14:00:00Z</t:Start></t:DeletedOccurrence>\
          </t:DeletedOccurrences>\
          </t:CalendarItem></vandelay-inner>";
-    let item = vandelay::exchange_ews::parse::parse_calendar_item(body).unwrap();
+    let item = vandelay::exchange::ews::parse::CalendarItemRaw::parse(body).unwrap();
     assert_eq!(item.id.id, "M1");
     assert_eq!(item.uid.as_deref(), Some("uid-1"));
     assert_eq!(item.modified_occurrences.len(), 1);
@@ -387,8 +406,8 @@ fn organizer_and_attendee_addresses_survive_an_ex_routing_type() {
            <t:EmailAddress>/o=ExchangeLabs/ou=Exchange Administrative Group (FYDIBOHF23SPDLT)/cn=Recipients/cn=bdc77b18152647a29d28ce1188376dc9-kristina</t:EmailAddress>\
            <t:RoutingType>EX</t:RoutingType></t:Mailbox><t:ResponseType>Unknown</t:ResponseType></t:Attendee></t:RequiredAttendees>\
          </t:CalendarItem></vandelay-inner>";
-    let item = vandelay::exchange_ews::parse::parse_calendar_item(body).unwrap();
-    let event = vandelay::exchange_ews::calendar_map::to_jscalendar(&item);
+    let item = vandelay::exchange::ews::parse::CalendarItemRaw::parse(body).unwrap();
+    let event = item.to_jscalendar();
 
     assert_eq!(
         event.data["organizerCalendarAddress"], "mailto:alice@example.com",
@@ -433,8 +452,8 @@ fn recurrence_end_date_with_a_timezone_offset_yields_a_bounded_series() {
            <t:EndDateRecurrence><t:StartDate>2021-08-04-06:00</t:StartDate><t:EndDate>2021-09-30-06:00</t:EndDate></t:EndDateRecurrence>\
          </t:Recurrence>\
          </t:CalendarItem></vandelay-inner>";
-    let item = vandelay::exchange_ews::parse::parse_calendar_item(body).unwrap();
-    let event = vandelay::exchange_ews::calendar_map::to_jscalendar(&item);
+    let item = vandelay::exchange::ews::parse::CalendarItemRaw::parse(body).unwrap();
+    let event = item.to_jscalendar();
     let rule = &event.data["recurrenceRule"];
     assert_eq!(rule["frequency"], "weekly");
     assert_eq!(
@@ -458,7 +477,7 @@ fn sync_folder_items_creates_updates_deletes_round_trip() {
            <t:ReadFlagChange><t:ItemId Id=\"R1\"/><t:IsRead>true</t:IsRead></t:ReadFlagChange>\
          </m:Changes></m:SyncFolderItemsResponseMessage></m:ResponseMessages></m:SyncFolderItemsResponse>"
     ));
-    let parsed = parse_sync_folder_items_response(body.as_bytes()).unwrap();
+    let parsed = SyncFolderItemsResponse::parse(body.as_bytes()).unwrap();
     assert_eq!(parsed.sync_state, "STATE-1");
     assert!(!parsed.more);
     assert_eq!(parsed.changes.len(), 5);
@@ -472,7 +491,7 @@ fn invalid_sync_state_data_fault_is_surfaced() {
          <ResponseCode xmlns=\"http://schemas.microsoft.com/exchange/services/2006/types\">ErrorInvalidSyncStateData</ResponseCode>\
          </detail></soap:Fault></soap:Body></soap:Envelope>"
     );
-    let env = read_envelope_summary(body.as_bytes()).unwrap();
+    let env = EnvelopeKind::read(body.as_bytes()).unwrap();
     match env {
         EnvelopeKind::Fault { fault, .. } => {
             assert!(matches!(
@@ -486,8 +505,9 @@ fn invalid_sync_state_data_fault_is_surfaced() {
 
 #[test]
 fn coordinator_diff_classifies_new_vanished_changed_unchanged() {
-    use vandelay::db::exchange_ews_ids::ItemRow;
-    use vandelay::sync::import_exchange_ews::items::{EnumeratedItem, diff};
+    use vandelay::archive::LocalId;
+    use vandelay::archive::ids::ews::ItemRow;
+    use vandelay::import::ews::items::{DiffPlan, EnumeratedItem};
 
     let server = vec![
         EnumeratedItem {
@@ -510,23 +530,23 @@ fn coordinator_diff_classifies_new_vanished_changed_unchanged() {
         ItemRow {
             item_id: "A".into(),
             change_key: "ck-1".into(),
-            local_id: 1,
+            local_id: LocalId::from_raw(1),
         },
         ItemRow {
             item_id: "B".into(),
             change_key: "ck-1".into(),
-            local_id: 2,
+            local_id: LocalId::from_raw(2),
         },
         ItemRow {
             item_id: "Z".into(),
             change_key: "ck-9".into(),
-            local_id: 99,
+            local_id: LocalId::from_raw(99),
         },
     ];
-    let plan = diff(&server, &local);
+    let plan = DiffPlan::full(&server, &local);
     assert_eq!(plan.new.len(), 1);
     assert_eq!(plan.new[0].id, "C");
-    assert_eq!(plan.present_unchanged.len(), 1);
+    assert_eq!(plan.present_unchanged, 1);
     assert_eq!(plan.present_changed.len(), 1);
     assert_eq!(plan.present_changed[0].0.id, "B");
     assert_eq!(plan.vanished.len(), 1);
@@ -535,56 +555,52 @@ fn coordinator_diff_classifies_new_vanished_changed_unchanged() {
 
 #[test]
 fn source_change_protection_refuses_different_account() {
-    use rusqlite::Connection;
-    use vandelay::db;
-    use vandelay::db::sources::SourceKey;
+    use vandelay::archive::Archive;
+    use vandelay::archive::sources::SourceKey;
 
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let conn = Connection::open(tmp.path()).unwrap();
-    db::init::apply_schema(&conn).unwrap();
+    let db = Archive::open_in_memory().unwrap();
+    let sources = db.store().sources();
     let key = SourceKey {
-        kind: "exchange_ews".into(),
-        session_url: "https://outlook.office365.com/EWS/Exchange.asmx".into(),
-        account_id: "alice@contoso.com".into(),
+        kind: SourceKind::ExchangeEws,
+        url: "https://outlook.office365.com/EWS/Exchange.asmx",
+        account_id: "alice@contoso.com",
     };
-    db::sources::upsert_source(&conn, &key, None, "alice@contoso.com").unwrap();
-    let conflict = db::sources::conflicting_source(
-        &conn,
-        "exchange_ews",
-        "https://outlook.office365.com/EWS/Exchange.asmx",
-        "bob@contoso.com",
-    )
-    .unwrap();
+    sources.upsert(&key, None, "alice@contoso.com").unwrap();
+    let conflict = sources
+        .conflicting(&SourceKey {
+            kind: SourceKind::ExchangeEws,
+            url: "https://outlook.office365.com/EWS/Exchange.asmx",
+            account_id: "bob@contoso.com",
+        })
+        .unwrap();
     assert!(conflict.is_some(), "different account_id must conflict");
 }
 
 #[test]
 fn mailbox_kinds_are_three_separate_sources() {
-    use rusqlite::Connection;
-    use vandelay::db;
-    use vandelay::db::sources::SourceKey;
+    use vandelay::archive::Archive;
+    use vandelay::archive::sources::SourceKey;
 
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let conn = Connection::open(tmp.path()).unwrap();
-    db::init::apply_schema(&conn).unwrap();
+    let db = Archive::open_in_memory().unwrap();
+    let sources = db.store().sources();
     let primary = SourceKey {
-        kind: "exchange_ews".into(),
-        session_url: "https://x/EWS/Exchange.asmx".into(),
-        account_id: "alice@contoso.com".into(),
+        kind: SourceKind::ExchangeEws,
+        url: "https://x/EWS/Exchange.asmx",
+        account_id: "alice@contoso.com",
     };
     let archive = SourceKey {
-        kind: "exchange_ews".into(),
-        session_url: "https://x/EWS/Exchange.asmx".into(),
-        account_id: "alice@contoso.com#archive".into(),
+        kind: SourceKind::ExchangeEws,
+        url: "https://x/EWS/Exchange.asmx",
+        account_id: "alice@contoso.com#archive",
     };
     let public = SourceKey {
-        kind: "exchange_ews".into(),
-        session_url: "https://x/EWS/Exchange.asmx".into(),
-        account_id: "__public_folders__@contoso.com".into(),
+        kind: SourceKind::ExchangeEws,
+        url: "https://x/EWS/Exchange.asmx",
+        account_id: "__public_folders__@contoso.com",
     };
-    let p = db::sources::upsert_source(&conn, &primary, None, "alice@contoso.com").unwrap();
-    let a = db::sources::upsert_source(&conn, &archive, None, "alice@contoso.com").unwrap();
-    let q = db::sources::upsert_source(&conn, &public, None, "alice@contoso.com").unwrap();
+    let p = sources.upsert(&primary, None, "alice@contoso.com").unwrap();
+    let a = sources.upsert(&archive, None, "alice@contoso.com").unwrap();
+    let q = sources.upsert(&public, None, "alice@contoso.com").unwrap();
     assert_ne!(p, a);
     assert_ne!(p, q);
     assert_ne!(a, q);
@@ -596,7 +612,12 @@ fn get_item_batches_chunk_the_id_list() {
     let chunks: Vec<&[ItemId]> = ids.chunks(3).collect();
     assert_eq!(chunks.len(), 3);
     for chunk in &chunks {
-        let body = get_item_body(ItemShape::Message, chunk, ServerVersion::Exchange2013Sp1);
+        let body = EwsRequest::GetItem {
+            shape: ItemShape::Message,
+            ids: chunk,
+            version: ServerVersion::Exchange2013Sp1,
+        }
+        .body();
         assert!(body.contains("<m:GetItem>"));
         for id in *chunk {
             assert!(body.contains(&format!("Id=\"{}\"", id.id)));
@@ -607,7 +628,13 @@ fn get_item_batches_chunk_the_id_list() {
 #[test]
 fn sync_folder_items_request_body_carries_state_and_max() {
     let folder = FolderId::new("FID", "FCK");
-    let body = sync_folder_items_body(&folder, "OPAQUE", 512, ServerVersion::Exchange2013Sp1);
+    let body = EwsRequest::SyncFolderItems {
+        folder: &folder,
+        sync_state: "OPAQUE",
+        max_changes: 512,
+        version: ServerVersion::Exchange2013Sp1,
+    }
+    .body();
     assert!(body.contains("<m:SyncState>OPAQUE</m:SyncState>"));
     assert!(body.contains("<m:MaxChangesReturned>512</m:MaxChangesReturned>"));
     assert!(body.contains("<m:SyncScope>NormalItems</m:SyncScope>"));
@@ -616,7 +643,7 @@ fn sync_folder_items_request_body_carries_state_and_max() {
 
 #[test]
 fn get_attachment_body_carries_inline_request() {
-    let body = get_attachment_body(&["A1", "A2"]);
+    let body = EwsRequest::GetAttachment { ids: &["A1", "A2"] }.body();
     assert!(body.contains("<t:AttachmentId Id=\"A1\"/>"));
     assert!(body.contains("<t:AttachmentId Id=\"A2\"/>"));
     assert!(body.contains("<t:IncludeMimeContent>true</t:IncludeMimeContent>"));
@@ -654,14 +681,14 @@ fn http_500_with_server_busy_body_is_treated_as_fault_and_retried() {
         .create();
 
     let c = client(3);
-    let body = find_folder_body(
-        FolderRef::Distinguished(
-            vandelay::exchange_ews::types::DistinguishedFolderId::MsgFolderRoot,
+    let body = EwsRequest::FindFolder {
+        parent: FolderRef::Distinguished(
+            vandelay::exchange::ews::types::DistinguishedFolderId::MsgFolderRoot,
         ),
-        Traversal::Deep,
-    );
-    let r = c.call(&url, "FindFolder", &body).expect("should retry");
-    let parsed = parse_find_folder_response(&r.body).unwrap();
+        traversal: Traversal::Deep,
+    };
+    let r = c.call(&url, &body).expect("should retry");
+    let parsed = FindFolderResponse::parse(&r.body).unwrap();
     assert!(parsed.folders.is_empty());
 }
 
@@ -711,19 +738,19 @@ fn invalid_server_version_fault_downgrades_and_succeeds() {
 
     let c = client(0);
     assert_eq!(c.server_version(), ServerVersion::Exchange2013Sp1);
-    let body = find_folder_body(
-        FolderRef::Distinguished(
-            vandelay::exchange_ews::types::DistinguishedFolderId::MsgFolderRoot,
+    let body = EwsRequest::FindFolder {
+        parent: FolderRef::Distinguished(
+            vandelay::exchange::ews::types::DistinguishedFolderId::MsgFolderRoot,
         ),
-        Traversal::Deep,
-    );
+        traversal: Traversal::Deep,
+    };
     let r = c
-        .call(&url, "FindFolder", &body)
+        .call(&url, &body)
         .expect("call should walk the version ladder down to a version the server accepts");
-    let parsed = parse_find_folder_response(&r.body).unwrap();
+    let parsed = FindFolderResponse::parse(&r.body).unwrap();
     assert!(parsed.folders.is_empty());
     assert_eq!(c.server_version(), ServerVersion::Exchange2010Sp2);
-    assert_eq!(c.retries_observed(), 0);
+    assert_eq!(c.stats().retries_observed, 0);
     m_sp1.assert();
     m_2013.assert();
     m_2010.assert();
@@ -749,13 +776,13 @@ fn unsupported_version_floor_surfaces_as_soap_fault() {
         .create();
 
     let c = client(0);
-    let body = find_folder_body(
-        FolderRef::Distinguished(
-            vandelay::exchange_ews::types::DistinguishedFolderId::MsgFolderRoot,
+    let body = EwsRequest::FindFolder {
+        parent: FolderRef::Distinguished(
+            vandelay::exchange::ews::types::DistinguishedFolderId::MsgFolderRoot,
         ),
-        Traversal::Deep,
-    );
-    let err = c.call(&url, "FindFolder", &body).unwrap_err();
+        traversal: Traversal::Deep,
+    };
+    let err = c.call(&url, &body).unwrap_err();
     assert!(
         matches!(
             err,
@@ -802,14 +829,14 @@ fn server_affinity_cookie_is_captured_and_resent() {
         .create();
 
     let c = client(0);
-    let body = find_folder_body(
-        FolderRef::Distinguished(
-            vandelay::exchange_ews::types::DistinguishedFolderId::MsgFolderRoot,
+    let body = EwsRequest::FindFolder {
+        parent: FolderRef::Distinguished(
+            vandelay::exchange::ews::types::DistinguishedFolderId::MsgFolderRoot,
         ),
-        Traversal::Deep,
-    );
-    c.call(&url, "FindFolder", &body).expect("first call ok");
-    c.call(&url, "FindFolder", &body).expect("second call ok");
+        traversal: Traversal::Deep,
+    };
+    c.call(&url, &body).expect("first call ok");
+    c.call(&url, &body).expect("second call ok");
     first.assert();
     second.assert();
 }
@@ -824,13 +851,13 @@ fn http_456_surfaces_as_account_locked_auth_error() {
         .with_body("Account locked. Unlock at https://unlock.example/")
         .create();
     let c = client(0);
-    let body = find_folder_body(
-        FolderRef::Distinguished(
-            vandelay::exchange_ews::types::DistinguishedFolderId::MsgFolderRoot,
+    let body = EwsRequest::FindFolder {
+        parent: FolderRef::Distinguished(
+            vandelay::exchange::ews::types::DistinguishedFolderId::MsgFolderRoot,
         ),
-        Traversal::Deep,
-    );
-    let err = c.call(&url, "FindFolder", &body).unwrap_err();
+        traversal: Traversal::Deep,
+    };
+    let err = c.call(&url, &body).unwrap_err();
     match err {
         EwsError::Auth(m) => assert!(m.contains("locked"), "got {m}"),
         other => panic!("expected Auth error, got {other:?}"),
@@ -839,8 +866,8 @@ fn http_456_surfaces_as_account_locked_auth_error() {
 
 #[test]
 fn for_each_fetched_item_streams_every_id_across_windows() {
-    use vandelay::logging::Logger;
-    use vandelay::sync::import_exchange_ews::items::{ItemRunCtx, for_each_fetched_item};
+    use vandelay::import::ews::items::{ItemEnumeration, ItemRunCtx, SyncBatch};
+    use vandelay::logging::{Level, Logger};
 
     let mut server = mockito::Server::new();
     let url = format!("{}/EWS/Exchange.asmx", server.url());
@@ -861,24 +888,24 @@ fn for_each_fetched_item_streams_every_id_across_windows() {
     let ctx = ItemRunCtx {
         client: &c,
         url: &url,
-        source_id: 1,
         owner_smtp: None,
         batch_size: 1,
         attachment_batch: 1,
         connections: 2,
-        use_syncfolderitems: false,
-        sync_batch: 512,
-        logger: Logger::new(0),
+        enumeration: ItemEnumeration::FindItem,
+        sync_batch: SyncBatch::MAX,
+        logger: Logger::new(Level::Quiet),
     };
     let ids: Vec<ItemId> = (0..5).map(|i| ItemId::new(format!("I{i}"), "K")).collect();
 
     let mut delivered = 0usize;
-    let failed = for_each_fetched_item(&ctx, ItemShape::Message, &ids, |msg| {
-        assert!(msg.success);
-        delivered += 1;
-        Ok(())
-    })
-    .expect("streaming fetch should succeed");
+    let failed = ctx
+        .for_each_fetched_item(ItemShape::Message, &ids, |msg| {
+            assert!(msg.success);
+            delivered += 1;
+            Ok(())
+        })
+        .expect("streaming fetch should succeed");
 
     assert_eq!(delivered, 5, "every id must be delivered exactly once");
     assert_eq!(failed, 0);
@@ -894,7 +921,7 @@ fn warning_response_class_is_treated_as_success_in_mock() {
          <m:Items><t:Message><t:ItemId Id=\"W1\" ChangeKey=\"K\"/></t:Message></m:Items>\
          </m:GetItemResponseMessage></m:ResponseMessages></m:GetItemResponse>"
     ));
-    let r = parse_response_messages(body.as_bytes(), "GetItemResponseMessage").unwrap();
+    let r = ResponseMessage::parse_all(body.as_bytes(), "GetItemResponseMessage").unwrap();
     assert!(r[0].success);
 }
 
@@ -912,7 +939,7 @@ fn default_namespace_envelope_parses_via_resolved_names() {
                 </t:Folder></t:Folders></m:RootFolder>\
                 </m:FindFolderResponseMessage></m:ResponseMessages></m:FindFolderResponse>\
                 </Body></Envelope>";
-    let parsed = parse_find_folder_response(body.as_bytes()).unwrap();
+    let parsed = FindFolderResponse::parse(body.as_bytes()).unwrap();
     assert_eq!(parsed.folders.len(), 1);
     assert_eq!(parsed.folders[0].folder_id.id, "D1");
 }
@@ -934,7 +961,7 @@ fn get_folder_messages_preserve_position_when_one_errors() {
          </m:GetFolderResponseMessage>\
          </m:ResponseMessages></m:GetFolderResponse>"
     ));
-    let msgs = parse_response_messages(body.as_bytes(), "GetFolderResponseMessage").unwrap();
+    let msgs = ResponseMessage::parse_all(body.as_bytes(), "GetFolderResponseMessage").unwrap();
     assert_eq!(msgs.len(), 3, "all three messages must be present");
     assert!(msgs[0].success);
     assert!(!msgs[1].success);
@@ -942,12 +969,12 @@ fn get_folder_messages_preserve_position_when_one_errors() {
 }
 
 fn plan_folders_against_mock(
-    kind: vandelay::exchange_ews::types::MailboxKind,
+    kind: vandelay::exchange::ews::types::MailboxKind,
     mailbox: Option<&str>,
     body_matcher: Matcher,
 ) {
-    use vandelay::logging::Logger;
-    use vandelay::sync::import_exchange_ews::folders::plan_folders;
+    use vandelay::import::ews::folders::FolderPlan;
+    use vandelay::logging::{Level, Logger};
 
     let mut server = mockito::Server::new();
     let url = format!("{}/EWS/Exchange.asmx", server.url());
@@ -983,7 +1010,7 @@ fn plan_folders_against_mock(
         .expect_at_least(1)
         .create();
 
-    let plan = plan_folders(&client(0), &url, kind, mailbox, Logger::new(0))
+    let plan = FolderPlan::discover(&client(0), &url, kind, mailbox, Logger::new(Level::Quiet))
         .expect("folder planning should succeed");
     assert_eq!(plan.root_folder_id, "ROOT");
     find.assert();
@@ -994,7 +1021,7 @@ fn plan_folders_against_mock(
 fn explicit_mailbox_addresses_distinguished_folders_in_that_mailbox() {
     // Regression for importing a FullAccess mailbox with Basic auth: folders must name --mailbox.
     plan_folders_against_mock(
-        vandelay::exchange_ews::types::MailboxKind::Primary,
+        vandelay::exchange::ews::types::MailboxKind::Primary,
         Some("bob@corp.example"),
         Matcher::Regex(
             "<t:DistinguishedFolderId Id=\"[a-z]+\"><t:Mailbox><t:EmailAddress>bob@corp.example</t:EmailAddress></t:Mailbox></t:DistinguishedFolderId>".into(),
@@ -1006,10 +1033,252 @@ fn explicit_mailbox_addresses_distinguished_folders_in_that_mailbox() {
 fn public_folders_ignore_explicit_mailbox() {
     // Public folder roots cannot carry a Mailbox element.
     plan_folders_against_mock(
-        vandelay::exchange_ews::types::MailboxKind::PublicFolders,
+        vandelay::exchange::ews::types::MailboxKind::PublicFolders,
         Some("bob@corp.example"),
         Matcher::Regex(
             "^(?s)[^@]*<t:DistinguishedFolderId Id=\"publicfoldersroot\"/>[^@]*$".into(),
         ),
     );
+}
+
+// A dry run against an archive of another EWS account fails like the real run (R6).
+#[test]
+fn dry_run_reports_source_change_like_the_real_run() {
+    use vandelay::archive::Archive;
+    use vandelay::archive::sources::{SourceChange, SourceKey};
+    use vandelay::exchange::ews::types::MailboxKind;
+    use vandelay::import::ews::{EwsAuth, EwsImport, ItemEnumeration};
+    use vandelay::sync::{RunMode, RunOptions};
+
+    const URL: &str = "https://ews.example.invalid/EWS/Exchange.asmx";
+    let path = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    let archive = Archive::open(&path).unwrap();
+    archive
+        .store()
+        .sources()
+        .upsert(
+            &SourceKey {
+                kind: SourceKind::ExchangeEws,
+                url: URL,
+                account_id: "old@x.com",
+            },
+            None,
+            "old@x.com",
+        )
+        .unwrap();
+    drop(archive);
+
+    let import = EwsImport {
+        url: Some(URL.to_owned()),
+        mailbox: Some("new@x.com".to_owned()),
+        mailbox_kind: MailboxKind::Primary,
+        auth: EwsAuth::Bearer {
+            token: "t".to_owned(),
+        },
+        ews_connections: 1,
+        getitem_batch: 10,
+        attachment_batch: 10,
+        enumeration: ItemEnumeration::SyncFolderItems,
+        source_change: SourceChange::Reject,
+    };
+    let options = RunOptions {
+        archive: path,
+        threads: 1,
+        mode: RunMode::DryRun,
+        max_retries: 0,
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
+    };
+    let err = import.run(options).into_result().unwrap_err();
+    assert_eq!(err.exit_status().code(), 4);
+    assert_eq!(
+        err.to_string(),
+        "source-change protection: archive already records exchange_ews source \
+         (https://ews.example.invalid/EWS/Exchange.asmx, account old@x.com); \
+         pass --allow-source-change to import a different account"
+    );
+}
+
+// A vanished message whose row cannot be deleted is counted and kept, the rest are swept (R8).
+#[test]
+fn vanished_item_delete_failure_is_counted_and_rolled_back() {
+    use vandelay::archive::Archive;
+    use vandelay::archive::sources::SourceKey;
+    use vandelay::exchange::ews::parse::FolderEntry;
+
+    use vandelay::import::ews::coordinator::EwsCoordinator;
+    use vandelay::import::ews::folder_sync::ItemKind;
+    use vandelay::import::ews::folders::{ClassifiedFolder, FolderPlan};
+    use vandelay::import::ews::items::{ItemEnumeration, ItemRunCtx, SyncBatch};
+    use vandelay::sync::TypeCounts;
+    use vandelay::types::ObjectType;
+
+    let mut server = mockito::Server::new();
+    let url = format!("{}/EWS/Exchange.asmx", server.url());
+    let soap = |server: &mut mockito::Server, action: &str, inner: &str| {
+        server
+            .mock("POST", "/EWS/Exchange.asmx")
+            .match_header("soapaction", Matcher::Regex(format!("/{action}\"$")))
+            .with_status(200)
+            .with_header("content-type", TXT_XML)
+            .with_body(envelope(inner))
+            .create()
+    };
+    let find_items = |ids: &[&str]| {
+        let items: String = ids
+            .iter()
+            .map(|id| {
+                format!(
+                    "<t:Message><t:ItemId Id=\"{id}\" ChangeKey=\"K\"/>\
+                     <t:ItemClass>IPM.Note</t:ItemClass></t:Message>"
+                )
+            })
+            .collect();
+        format!(
+            "<m:FindItemResponse{NS}><m:ResponseMessages>\
+             <m:FindItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode>\
+             <m:RootFolder TotalItemsInView=\"{}\" IncludesLastItemInRange=\"true\"><t:Items>{items}</t:Items>\
+             </m:RootFolder></m:FindItemResponseMessage></m:ResponseMessages></m:FindItemResponse>",
+            ids.len()
+        )
+    };
+    let mime = |id: &str| {
+        STANDARD.encode(format!("Message-ID: <{id}@x>\r\nSubject: {id}\r\n\r\nbody\r\n").as_bytes())
+    };
+    let get_items: String = ["M1", "M2"]
+        .iter()
+        .map(|id| {
+            format!(
+                "<m:GetItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode>\
+                 <m:Items><t:Message><t:ItemId Id=\"{id}\" ChangeKey=\"K\"/>\
+                 <t:MimeContent CharacterSet=\"UTF-8\">{}</t:MimeContent></t:Message></m:Items>\
+                 </m:GetItemResponseMessage>",
+                mime(id)
+            )
+        })
+        .collect();
+    soap(&mut server, "FindItem", &find_items(&["M1", "M2"]));
+    soap(
+        &mut server,
+        "GetItem",
+        &format!(
+            "<m:GetItemResponse{NS}><m:ResponseMessages>{get_items}</m:ResponseMessages></m:GetItemResponse>"
+        ),
+    );
+
+    let archive = Archive::open_in_memory().unwrap();
+    let source = archive
+        .store()
+        .sources()
+        .upsert(
+            &SourceKey {
+                kind: SourceKind::ExchangeEws,
+                url: &url,
+                account_id: "alice@x.com",
+            },
+            None,
+            "alice@x.com",
+        )
+        .unwrap();
+    let c = client(0);
+    let ctx = EwsCoordinator {
+        store: archive.store(),
+        source,
+        items: ItemRunCtx {
+            client: &c,
+            url: &url,
+            owner_smtp: None,
+            batch_size: 10,
+            attachment_batch: 10,
+            connections: 1,
+            enumeration: ItemEnumeration::FindItem,
+            sync_batch: SyncBatch::MAX,
+            logger: Logger::new(Level::Quiet),
+        },
+    };
+    let plan = FolderPlan {
+        mail: vec![ClassifiedFolder {
+            folder: FolderEntry {
+                folder_id: FolderId::new("INBOX", "K"),
+                parent_id: Some("ROOT".to_owned()),
+                display_name: "Inbox".to_owned(),
+                folder_class: "IPF.Note".to_owned(),
+                ..FolderEntry::default()
+            },
+            kind: FolderClass::Mail,
+        }],
+        calendar: Vec::new(),
+        contacts: Vec::new(),
+        well_known_roles: Default::default(),
+        root_folder_id: "ROOT".to_owned(),
+    };
+    let mut mailboxes = TypeCounts::default();
+    let mut emails = TypeCounts::default();
+    ctx.reconcile_folders(ItemKind::Message, &plan, &mut mailboxes, &mut emails)
+        .unwrap();
+    ctx.reconcile_items(ItemKind::Message, &plan, &mut emails)
+        .unwrap();
+    assert_eq!(emails.created, 2);
+
+    let pinned = ctx
+        .ids()
+        .local_id(ObjectType::Email, "M1")
+        .unwrap()
+        .unwrap();
+    archive
+        .connection()
+        .execute_batch(&format!(
+            "CREATE TEMP TRIGGER pin BEFORE DELETE ON emails WHEN old.id = {pinned} \
+             BEGIN SELECT RAISE(ABORT, 'pinned'); END"
+        ))
+        .unwrap();
+    server.reset();
+    soap(&mut server, "FindItem", &find_items(&[]));
+
+    let mut emails = TypeCounts::default();
+    ctx.reconcile_items(ItemKind::Message, &plan, &mut emails)
+        .unwrap();
+    assert_eq!((emails.deleted, emails.failed), (1, 1));
+    assert_eq!(
+        ctx.ids().local_id(ObjectType::Email, "M1").unwrap(),
+        Some(pinned),
+        "the failed row's id mapping must be rolled back with it"
+    );
+    assert_eq!(ctx.ids().local_id(ObjectType::Email, "M2").unwrap(), None);
+}
+
+// A 2xx device-code poll with an unreadable body reports the body error, as before the rewrite.
+#[test]
+fn device_code_poll_with_unreadable_2xx_body_reports_token_body_error() {
+    use vandelay::exchange::ews::oauth::SCOPE_DELEGATED;
+    use vandelay::exchange::oauth::{Authority, Dialect, OAuthClient};
+
+    let mut server = mockito::Server::new();
+    let _device = server
+        .mock("POST", "/common/oauth2/v2.0/devicecode")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"device_code":"DC","user_code":"U","interval":0,"expires_in":30}"#)
+        .create();
+    let _token = server
+        .mock("POST", "/common/oauth2/v2.0/token")
+        .with_status(200)
+        .with_header("content-type", "text/html")
+        .with_body("<html>proxy</html>")
+        .create();
+    let authority = Authority::new(format!("{}/common", server.url()));
+    let err = OAuthClient::new(
+        ClientOptions {
+            retry: RetryPolicy::new(0),
+            tls: TlsPolicy::Verify,
+            logger: Logger::new(Level::Quiet),
+        },
+        &authority,
+        "client-id",
+        SCOPE_DELEGATED,
+        Dialect::Ews,
+    )
+    .device_code()
+    .unwrap_err();
+    assert!(err.0.starts_with("token body: "), "got {:?}", err.0);
 }

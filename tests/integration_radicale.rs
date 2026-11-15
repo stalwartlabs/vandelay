@@ -6,27 +6,28 @@
 
 mod integration;
 
-use std::collections::HashSet;
-
-use integration::radicale::{AccountSeed, Radicale};
+use integration::layouts::{
+    assert_contact_collection_exact, assert_contact_data_well_formed,
+    assert_contact_uids_round_trip, assert_event_collection_exact, assert_event_data_well_formed,
+    assert_event_uids_round_trip,
+};
+use integration::radicale::Radicale;
 use integration::validate::{
     all_contact_uids, all_event_uids, assert_contact_round_trip, assert_event_round_trip,
-    calendar_event_count, cleanup, collection_id_by_name, collection_names, common,
-    contact_card_count, count, open_archive, tmp_archive,
+    calendar_event_count, cleanup, collection_id_by_name, common, count, open_archive, tmp_archive,
 };
 use integration::{Account, Endpoint};
 
-use rusqlite::Connection;
-use serde_json::Value;
+use vandelay::archive::sources::SourceChange;
 use vandelay::error::Error;
-use vandelay::sync::import_dav;
-use vandelay::sync::import_dav::{DavAuth, DavImportConfig, DavKindArg, SourceChange};
+use vandelay::import::dav::{DavImport, DavKindArg};
+use vandelay::net::auth::Auth;
 
-fn dav_config(kind: DavKindArg, account: &Account, http: &Endpoint) -> DavImportConfig {
-    DavImportConfig {
+fn dav_config(kind: DavKindArg, account: &Account, http: &Endpoint) -> DavImport {
+    DavImport {
         kind,
         url: format!("http://{}:{}/{}/", http.host, http.port, account.username),
-        auth: DavAuth::Basic {
+        auth: Auth::Basic {
             user: account.username.clone(),
             password: account.password.clone(),
         },
@@ -77,11 +78,10 @@ fn radicale_starts_seeds_and_imports() {
         );
 
         let cal_archive = tmp_archive(&format!("radicale-cal-{}", seed.username));
-        let summary = import_dav::run(
-            common(&cal_archive),
-            dav_config(DavKindArg::Caldav, account, &r.endpoint),
-        )
-        .expect("caldav import");
+        let summary = dav_config(DavKindArg::Caldav, account, &r.endpoint)
+            .run(common(&cal_archive))
+            .into_result()
+            .expect("caldav import");
         assert!(
             !summary.any_failed(),
             "{}: first caldav import had failures: {summary:?}",
@@ -106,11 +106,10 @@ fn radicale_starts_seeds_and_imports() {
         let blob_count = count(&conn, "blobs") as usize;
         drop(conn);
 
-        let summary2 = import_dav::run(
-            common(&cal_archive),
-            dav_config(DavKindArg::Caldav, account, &r.endpoint),
-        )
-        .expect("idempotent caldav re-import");
+        let summary2 = dav_config(DavKindArg::Caldav, account, &r.endpoint)
+            .run(common(&cal_archive))
+            .into_result()
+            .expect("idempotent caldav re-import");
         assert!(
             !summary2.any_failed(),
             "{}: idempotent caldav re-import had failures",
@@ -138,11 +137,10 @@ fn radicale_starts_seeds_and_imports() {
         drop(conn);
 
         let card_archive = tmp_archive(&format!("radicale-card-{}", seed.username));
-        let summary = import_dav::run(
-            common(&card_archive),
-            dav_config(DavKindArg::Carddav, account, &r.endpoint),
-        )
-        .expect("carddav import");
+        let summary = dav_config(DavKindArg::Carddav, account, &r.endpoint)
+            .run(common(&card_archive))
+            .into_result()
+            .expect("carddav import");
         assert!(
             !summary.any_failed(),
             "{}: first carddav import had failures: {summary:?}",
@@ -166,11 +164,10 @@ fn radicale_starts_seeds_and_imports() {
         let card_count = count(&conn, "contact_cards") as usize;
         drop(conn);
 
-        let summary2 = import_dav::run(
-            common(&card_archive),
-            dav_config(DavKindArg::Carddav, account, &r.endpoint),
-        )
-        .expect("idempotent carddav re-import");
+        let summary2 = dav_config(DavKindArg::Carddav, account, &r.endpoint)
+            .run(common(&card_archive))
+            .into_result()
+            .expect("idempotent carddav re-import");
         assert!(
             !summary2.any_failed(),
             "{}: idempotent carddav re-import had failures",
@@ -203,11 +200,10 @@ fn radicale_starts_seeds_and_imports() {
             .expect("uid");
         r.delete_item(account, &vanish_target_href)
             .expect("radicale delete vanished item");
-        let summary_after_vanish = import_dav::run(
-            common(&cal_archive),
-            dav_config(DavKindArg::Caldav, account, &r.endpoint),
-        )
-        .expect("caldav re-import after vanish");
+        let summary_after_vanish = dav_config(DavKindArg::Caldav, account, &r.endpoint)
+            .run(common(&cal_archive))
+            .into_result()
+            .expect("caldav re-import after vanish");
         assert!(
             !summary_after_vanish.any_failed(),
             "{}: re-import after vanish had failures",
@@ -233,11 +229,10 @@ fn radicale_starts_seeds_and_imports() {
         let (_added_event_href, added_event_uid) = r
             .add_event(account, 0, &format!("rad-{}", seed.username), &icals)
             .expect("radicale add event");
-        let summary_after_add_event = import_dav::run(
-            common(&cal_archive),
-            dav_config(DavKindArg::Caldav, account, &r.endpoint),
-        )
-        .expect("caldav re-import after add");
+        let summary_after_add_event = dav_config(DavKindArg::Caldav, account, &r.endpoint)
+            .run(common(&cal_archive))
+            .into_result()
+            .expect("caldav re-import after add");
         assert!(
             !summary_after_add_event.any_failed(),
             "{}: re-import after add-event had failures",
@@ -274,11 +269,10 @@ fn radicale_starts_seeds_and_imports() {
         let (_added_card_href, added_card_uid) = r
             .add_contact(account, 0, &format!("rad-{}", seed.username), &vcards)
             .expect("radicale add contact");
-        let summary_after_add_contact = import_dav::run(
-            common(&card_archive),
-            dav_config(DavKindArg::Carddav, account, &r.endpoint),
-        )
-        .expect("carddav re-import after add");
+        let summary_after_add_contact = dav_config(DavKindArg::Carddav, account, &r.endpoint)
+            .run(common(&card_archive))
+            .into_result()
+            .expect("carddav re-import after add");
         assert!(
             !summary_after_add_contact.any_failed(),
             "{}: re-import after add-contact had failures",
@@ -307,16 +301,14 @@ fn radicale_starts_seeds_and_imports() {
     let primary = &r.accounts[0];
     let other = &r.accounts[1];
     let shared_archive = tmp_archive("radicale-source-change");
-    import_dav::run(
-        common(&shared_archive),
-        dav_config(DavKindArg::Caldav, primary, &r.endpoint),
-    )
-    .expect("seed archive with primary user");
-    let err = import_dav::run(
-        common(&shared_archive),
-        dav_config(DavKindArg::Caldav, other, &r.endpoint),
-    )
-    .expect_err("expected source-change abort when pointing at second user");
+    dav_config(DavKindArg::Caldav, primary, &r.endpoint)
+        .run(common(&shared_archive))
+        .into_result()
+        .expect("seed archive with primary user");
+    let err = dav_config(DavKindArg::Caldav, other, &r.endpoint)
+        .run(common(&shared_archive))
+        .into_result()
+        .expect_err("expected source-change abort when pointing at second user");
     assert!(
         matches!(err, Error::SourceChange(_)),
         "expected SourceChange, got {err:?}"
@@ -324,136 +316,4 @@ fn radicale_starts_seeds_and_imports() {
     cleanup(&shared_archive);
 
     r.stop().expect("radicale stop");
-}
-
-fn assert_event_collection_exact(conn: &Connection, seed: &AccountSeed) {
-    let names = collection_names(conn, "calendars");
-    let expected: HashSet<String> = seed
-        .calendars
-        .iter()
-        .map(|c| c.display_name.clone())
-        .collect();
-    assert_eq!(
-        names, expected,
-        "{}: calendar displayname set mismatch",
-        seed.username
-    );
-    for plan in &seed.calendars {
-        let cal_id = collection_id_by_name(conn, "calendars", &plan.display_name)
-            .unwrap_or_else(|| panic!("calendar {} missing", plan.display_name));
-        let got = calendar_event_count(conn, cal_id);
-        assert_eq!(
-            got as usize,
-            plan.items.len(),
-            "{}: calendar {} event count {got} != seeded {}",
-            seed.username,
-            plan.display_name,
-            plan.items.len()
-        );
-    }
-}
-
-fn assert_contact_collection_exact(conn: &Connection, seed: &AccountSeed) {
-    let names = collection_names(conn, "address_books");
-    let expected: HashSet<String> = seed
-        .address_books
-        .iter()
-        .map(|c| c.display_name.clone())
-        .collect();
-    assert_eq!(
-        names, expected,
-        "{}: address book displayname set mismatch",
-        seed.username
-    );
-    for plan in &seed.address_books {
-        let book_id = collection_id_by_name(conn, "address_books", &plan.display_name)
-            .unwrap_or_else(|| panic!("address book {} missing", plan.display_name));
-        let got = contact_card_count(conn, book_id);
-        assert_eq!(
-            got as usize,
-            plan.items.len(),
-            "{}: book {} contact count {got} != seeded {}",
-            seed.username,
-            plan.display_name,
-            plan.items.len()
-        );
-    }
-}
-
-fn assert_event_uids_round_trip(conn: &Connection, seed: &AccountSeed) {
-    let imported = all_event_uids(conn);
-    let expected = seed.event_uids();
-    let missing: Vec<_> = expected.difference(&imported).collect();
-    assert!(
-        missing.is_empty(),
-        "{}: event uids missing from archive: {missing:?}",
-        seed.username
-    );
-}
-
-fn assert_contact_uids_round_trip(conn: &Connection, seed: &AccountSeed) {
-    let imported = all_contact_uids(conn);
-    let expected = seed.contact_uids();
-    let missing: Vec<_> = expected.difference(&imported).collect();
-    assert!(
-        missing.is_empty(),
-        "{}: contact uids missing from archive: {missing:?}",
-        seed.username
-    );
-}
-
-fn assert_event_data_well_formed(conn: &Connection) {
-    let mut stmt = conn
-        .prepare("SELECT data, data_type FROM calendar_events")
-        .expect("prepare");
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        .expect("query")
-        .filter_map(|r| r.ok())
-        .collect();
-    assert!(!rows.is_empty(), "no calendar_events rows");
-    for (raw, data_type) in rows {
-        assert_eq!(
-            data_type, "Event",
-            "all VEVENT seeds must land as Event, got data_type={data_type}, raw={raw}"
-        );
-        let v: Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| panic!("calendar_events.data invalid JSON: {e}; raw={raw}"));
-        let obj = v.as_object().expect("event data is object");
-        let kind = obj
-            .get("@type")
-            .or_else(|| obj.get("type"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        assert_eq!(kind, "Event", "JSCalendar @type must be Event, got {kind}");
-        assert!(obj.contains_key("uid"), "event JSON missing uid: {obj:?}");
-        assert!(
-            obj.contains_key("start"),
-            "event JSON missing start: {obj:?}"
-        );
-    }
-}
-
-fn assert_contact_data_well_formed(conn: &Connection) {
-    let mut stmt = conn
-        .prepare("SELECT uid, data FROM contact_cards")
-        .expect("prepare");
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        .expect("query")
-        .filter_map(|r| r.ok())
-        .collect();
-    assert!(!rows.is_empty(), "no contact_cards rows");
-    for (uid, raw) in rows {
-        assert!(!uid.is_empty(), "contact uid empty");
-        let v: Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| panic!("contact_cards.data invalid JSON: {e}; raw={raw}"));
-        let obj = v.as_object().expect("contact data is object");
-        let kind = obj
-            .get("@type")
-            .or_else(|| obj.get("type"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        assert_eq!(kind, "Card", "JSContact @type must be Card, got {kind}");
-    }
 }

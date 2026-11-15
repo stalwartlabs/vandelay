@@ -4,14 +4,17 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use crate::db::init::OpenError;
+use std::fmt::Display;
+use std::io;
+
+use crate::archive::ArchiveError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("usage error: {0}")]
+    #[error("{0}")]
     Usage(String),
 
-    #[error("connection error: {0}")]
+    #[error("connection failed: {0}")]
     Connection(String),
 
     #[error("account resolution failed: {0}")]
@@ -29,20 +32,28 @@ pub enum Error {
     #[error("not yet implemented: {0}")]
     Unimplemented(&'static str),
 
-    #[error("archive error: {0}")]
-    Db(#[from] OpenError),
+    #[error("archive: {0}")]
+    Db(#[from] ArchiveError),
 
-    #[error("i/o error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("i/o: {0}")]
+    Io(#[from] io::Error),
 }
 
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
-        Error::Db(OpenError::Sqlite(e))
+        Error::Db(ArchiveError::Sqlite(e))
     }
 }
 
 impl Error {
+    pub fn partial(e: impl Display) -> Error {
+        Error::Partial(e.to_string())
+    }
+
+    pub fn connection(e: impl Display) -> Error {
+        Error::Connection(e.to_string())
+    }
+
     pub fn aborts_run(&self) -> bool {
         match self {
             Error::Partial(_) => false,
@@ -57,18 +68,35 @@ impl Error {
         }
     }
 
-    pub fn exit_code(&self) -> i32 {
+    pub fn exit_status(&self) -> ExitStatus {
         match self {
-            Error::Usage(_) => 1,
-            Error::Connection(_) => 2,
-            Error::Account(_) => 3,
-            Error::SourceChange(_) => 4,
-            Error::Partial(_) => 5,
-            Error::PruneAborted => 6,
-            Error::Unimplemented(_) => 1,
-            Error::Db(_) => 7,
-            Error::Io(_) => 7,
+            Error::Usage(_) | Error::Unimplemented(_) => ExitStatus::Usage,
+            Error::Connection(_) => ExitStatus::Connection,
+            Error::Account(_) => ExitStatus::Account,
+            Error::SourceChange(_) => ExitStatus::SourceChange,
+            Error::Partial(_) => ExitStatus::Partial,
+            Error::PruneAborted => ExitStatus::PruneAborted,
+            Error::Db(_) | Error::Io(_) => ExitStatus::Archive,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ExitStatus {
+    Ok = 0,
+    Usage = 1,
+    Connection = 2,
+    Account = 3,
+    SourceChange = 4,
+    Partial = 5,
+    PruneAborted = 6,
+    Archive = 7,
+}
+
+impl ExitStatus {
+    pub fn code(self) -> i32 {
+        self as i32
     }
 }
 
@@ -78,15 +106,43 @@ mod tests {
 
     #[test]
     fn exit_codes_match_cli_md_table() {
-        assert_eq!(Error::Usage("x".into()).exit_code(), 1);
-        assert_eq!(Error::Unimplemented("x").exit_code(), 1);
-        assert_eq!(Error::Connection("x".into()).exit_code(), 2);
-        assert_eq!(Error::Account("x".into()).exit_code(), 3);
-        assert_eq!(Error::SourceChange("x".into()).exit_code(), 4);
-        assert_eq!(Error::Partial("x".into()).exit_code(), 5);
-        assert_eq!(Error::PruneAborted.exit_code(), 6);
-        let io = Error::Io(std::io::Error::other("disk"));
-        assert_eq!(io.exit_code(), 7);
+        assert_eq!(Error::Usage("x".into()).exit_status(), ExitStatus::Usage);
+        assert_eq!(Error::Unimplemented("x").exit_status(), ExitStatus::Usage);
+        assert_eq!(
+            Error::Connection("x".into()).exit_status(),
+            ExitStatus::Connection
+        );
+        assert_eq!(
+            Error::Account("x".into()).exit_status(),
+            ExitStatus::Account
+        );
+        assert_eq!(
+            Error::SourceChange("x".into()).exit_status(),
+            ExitStatus::SourceChange
+        );
+        assert_eq!(
+            Error::Partial("x".into()).exit_status(),
+            ExitStatus::Partial
+        );
+        assert_eq!(Error::PruneAborted.exit_status(), ExitStatus::PruneAborted);
+        let io = Error::Io(io::Error::other("disk"));
+        assert_eq!(io.exit_status(), ExitStatus::Archive);
+    }
+
+    #[test]
+    fn exit_status_codes_are_stable() {
+        let codes = [
+            ExitStatus::Ok,
+            ExitStatus::Usage,
+            ExitStatus::Connection,
+            ExitStatus::Account,
+            ExitStatus::SourceChange,
+            ExitStatus::Partial,
+            ExitStatus::PruneAborted,
+            ExitStatus::Archive,
+        ]
+        .map(ExitStatus::code);
+        assert_eq!(codes, [0, 1, 2, 3, 4, 5, 6, 7]);
     }
 
     #[test]
@@ -102,8 +158,8 @@ mod tests {
         assert!(Error::Usage("bad flag".into()).aborts_run());
         assert!(Error::Unimplemented("x").aborts_run());
         assert!(Error::PruneAborted.aborts_run());
-        assert!(Error::Db(OpenError::Sqlite(rusqlite::Error::QueryReturnedNoRows)).aborts_run());
-        assert!(Error::Io(std::io::Error::other("disk")).aborts_run());
+        assert!(Error::Db(ArchiveError::Sqlite(rusqlite::Error::QueryReturnedNoRows)).aborts_run());
+        assert!(Error::Io(io::Error::other("disk")).aborts_run());
     }
 
     #[test]
@@ -112,13 +168,23 @@ mod tests {
             Error::Connection("x".into()),
             Error::Account("x".into()),
             Error::SourceChange("x".into()),
-            Error::Db(OpenError::Sqlite(rusqlite::Error::QueryReturnedNoRows)),
-            Error::Io(std::io::Error::other("disk")),
+            Error::Db(ArchiveError::Sqlite(rusqlite::Error::QueryReturnedNoRows)),
+            Error::Io(io::Error::other("disk")),
         ] {
             assert!(e.aborts_run(), "{e} must abort the run");
-            assert_ne!(e.exit_code(), 5, "{e} must not report a partial failure");
+            assert_ne!(
+                e.exit_status(),
+                ExitStatus::Partial,
+                "{e} must not report a partial failure"
+            );
         }
-        assert_eq!(Error::Connection("x".into()).exit_code(), 2);
-        assert_eq!(Error::Partial("x".into()).exit_code(), 5);
+        assert_eq!(
+            Error::Connection("x".into()).exit_status(),
+            ExitStatus::Connection
+        );
+        assert_eq!(
+            Error::Partial("x".into()).exit_status(),
+            ExitStatus::Partial
+        );
     }
 }

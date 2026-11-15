@@ -6,12 +6,19 @@
 
 use std::io::Cursor;
 
+use vandelay::archive::sources::{SourceKey, SourceKind};
 use vandelay::dav::client::DavClient;
-use vandelay::dav::discover::{DavKind, discover};
-use vandelay::dav::parse::{parse_multistatus, strip_ascii_control_chars};
-use vandelay::dav::xml;
-use vandelay::jmap::error::JmapError;
-use vandelay::jmap::http::{Auth, RetryPolicy};
+use vandelay::dav::discover::{DavKind, Discovery};
+use vandelay::dav::error::DavError;
+use vandelay::dav::parse::{ControlBytes, MultistatusParser};
+use vandelay::dav::xml::Propfind;
+use vandelay::error::ExitStatus;
+use vandelay::logging::{Level, Logger};
+use vandelay::net::auth::Auth;
+use vandelay::net::http::{ClientOptions, TlsPolicy};
+use vandelay::net::retry::RetryPolicy;
+use vandelay::sync::RunMode;
+use vandelay::types::ObjectType;
 
 fn client(retries: u32) -> DavClient {
     DavClient::new(
@@ -19,8 +26,11 @@ fn client(retries: u32) -> DavClient {
             user: "u".into(),
             password: "p".into(),
         },
-        RetryPolicy::new(retries),
-        false,
+        ClientOptions {
+            retry: RetryPolicy::new(retries),
+            tls: TlsPolicy::Verify,
+            logger: Logger::new(Level::Default),
+        },
     )
 }
 
@@ -61,7 +71,7 @@ fn discovery_uses_url_as_homeset_when_collection_present() {
     let _m = multistatus_response(&mut server, "PROPFIND", "/dav/cal/", &body);
     let c = client(0);
     let url_with_path = format!("{url}/dav/cal/");
-    let disc = discover(&c, DavKind::Caldav, &url_with_path).expect("discover");
+    let disc = Discovery::run(&c, DavKind::Caldav, &url_with_path).expect("discover");
     assert_eq!(disc.collections.len(), 1);
     assert!(disc.collections[0].props.is_calendar);
 }
@@ -117,7 +127,7 @@ fn discovery_resolves_per_user_principal_even_when_url_lists_collections() {
         .create();
 
     let c = client(0);
-    let disc = discover(&c, DavKind::Caldav, &format!("{url}/dav/cal/")).expect("discover");
+    let disc = Discovery::run(&c, DavKind::Caldav, &format!("{url}/dav/cal/")).expect("discover");
     assert_eq!(disc.collections.len(), 1);
     assert_eq!(
         disc.principal_url.as_deref(),
@@ -190,7 +200,7 @@ fn discovery_falls_through_principal_to_home_set() {
     );
 
     let c = client(0);
-    let disc = discover(&c, DavKind::Caldav, &url).expect("discover");
+    let disc = Discovery::run(&c, DavKind::Caldav, &url).expect("discover");
     assert_eq!(disc.collections.len(), 1);
     assert!(disc.principal_url.is_some());
     assert!(disc.home_set_url.ends_with("/dav/cal/alice/"));
@@ -209,7 +219,7 @@ fn discovery_returns_not_found_when_no_collections() {
         .create();
 
     let c = client(0);
-    let err = discover(&c, DavKind::Caldav, &server.url()).unwrap_err();
+    let err = Discovery::run(&c, DavKind::Caldav, &server.url()).unwrap_err();
     assert!(matches!(
         err,
         vandelay::dav::discover::DiscoveryError::NotFound { .. }
@@ -231,7 +241,7 @@ fn parses_multistatus_with_default_namespace_no_prefix() {
     </propstat>
   </response>
 </multistatus>"#;
-    let r = parse_multistatus(Cursor::new(body), "https://x/").expect("parse");
+    let r = MultistatusParser::parse(Cursor::new(body), "https://x/").expect("parse");
     assert_eq!(r.len(), 1);
     assert!(r[0].props.is_calendar);
     assert_eq!(r[0].props.displayname.as_deref(), Some("A"));
@@ -240,8 +250,8 @@ fn parses_multistatus_with_default_namespace_no_prefix() {
 #[test]
 fn ascii_control_chars_are_stripped_before_parse() {
     let dirty: Vec<u8> = b"<?xml version=\"1.0\"?>\x02<d:multistatus xmlns:d=\"DAV:\"/>".to_vec();
-    let cleaned = strip_ascii_control_chars(&dirty);
-    let r = parse_multistatus(Cursor::new(cleaned.as_ref()), "https://x/").expect("parse");
+    let cleaned = ControlBytes::strip(&dirty);
+    let r = MultistatusParser::parse(Cursor::new(cleaned.as_ref()), "https://x/").expect("parse");
     assert!(r.is_empty());
 }
 
@@ -279,7 +289,7 @@ fn rate_limited_propfind_retries_via_shared_schedule() {
         elapsed.as_millis() >= 900,
         "expected Retry-After 1s honoured, elapsed={elapsed:?}"
     );
-    assert!(c.retries_observed() >= 1);
+    assert!(c.stats().retries_observed >= 1);
 }
 
 #[test]
@@ -295,7 +305,7 @@ fn auth_failure_401_is_fatal() {
     let err = c
         .propfind(&format!("{}/", server.url()), 0, "<x/>")
         .unwrap_err();
-    assert!(matches!(err, JmapError::Auth(_)), "got {err:?}");
+    assert!(matches!(err, DavError::Auth(_)), "got {err:?}");
 }
 
 #[test]
@@ -329,7 +339,7 @@ fn http_503_retries_then_succeeds() {
         .propfind(&format!("{}/", server.url()), 0, "<x/>")
         .expect("propfind");
     assert_eq!(result.status, 207);
-    assert!(c.retries_observed() >= 1);
+    assert!(c.stats().retries_observed >= 1);
 }
 
 #[test]
@@ -346,7 +356,7 @@ END:VEVENT</c:calendar-data>
     </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
   </d:response>
 </d:multistatus>"#;
-    let r = parse_multistatus(Cursor::new(body), "https://x/").expect("parse");
+    let r = MultistatusParser::parse(Cursor::new(body), "https://x/").expect("parse");
     assert_eq!(r.len(), 1);
     assert_eq!(
         r[0].props.displayname.as_deref(),
@@ -372,20 +382,20 @@ fn duplicate_response_hrefs_collapsed_on_parse() {
     <d:propstat><d:prop><d:getetag>"b"</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
   </d:response>
 </d:multistatus>"#;
-    let r = parse_multistatus(Cursor::new(body), "https://x/").expect("parse");
+    let r = MultistatusParser::parse(Cursor::new(body), "https://x/").expect("parse");
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].props.etag.as_deref(), Some("\"a\""));
 }
 
 #[test]
 fn xml_request_bodies_match_expected_shape() {
-    let cup = xml::propfind_current_user_principal();
+    let cup = Propfind::CurrentUserPrincipal.body();
     assert!(cup.contains("<d:current-user-principal/>"));
-    let chs = xml::propfind_calendar_home_set();
+    let chs = Propfind::CalendarHomeSet.body();
     assert!(chs.contains("<c:calendar-home-set/>"));
-    let ahs = xml::propfind_addressbook_home_set();
+    let ahs = Propfind::AddressbookHomeSet.body();
     assert!(ahs.contains("<c:addressbook-home-set/>"));
-    let listing = xml::propfind_webdav_listing();
+    let listing = Propfind::WebdavListing.body();
     assert!(listing.contains("<d:getcontentlength/>"));
 }
 
@@ -422,7 +432,7 @@ END:VCALENDAR
         .report(&format!("{}/dav/cal/u/d/", server.url()), 1, "<x/>")
         .expect("report");
     assert_eq!(result.status, 207);
-    let parsed = parse_multistatus(Cursor::new(&result.body), "https://x/").expect("parse");
+    let parsed = MultistatusParser::parse(Cursor::new(&result.body), "https://x/").expect("parse");
     assert_eq!(parsed.len(), 1);
     assert!(parsed[0].props.calendar_data.is_some());
 }
@@ -471,8 +481,8 @@ fn webdav_listing_returns_collection_and_file() {
     let result = c
         .propfind(&format!("{url}/files/"), 1, "<x/>")
         .expect("propfind");
-    let parsed =
-        parse_multistatus(Cursor::new(&result.body), &format!("{url}/files/")).expect("parse");
+    let parsed = MultistatusParser::parse(Cursor::new(&result.body), &format!("{url}/files/"))
+        .expect("parse");
     assert!(
         parsed
             .iter()
@@ -489,15 +499,15 @@ fn webdav_listing_returns_collection_and_file() {
 
 #[test]
 fn google_usage_limits_403_classified_retryable() {
-    use vandelay::dav::retry::{DavOutcome, classify};
+    use vandelay::dav::retry::DavOutcome;
     let body = br#"{"error":{"errors":[{"domain":"usageLimits"}]}}"#;
-    assert_eq!(classify(403, body), DavOutcome::Retryable);
+    assert_eq!(DavOutcome::classify(403, body), DavOutcome::Retryable);
 }
 
 #[test]
 fn non_quota_403_is_auth() {
-    use vandelay::dav::retry::{DavOutcome, classify};
-    assert_eq!(classify(403, b"forbidden"), DavOutcome::Auth);
+    use vandelay::dav::retry::DavOutcome;
+    assert_eq!(DavOutcome::classify(403, b"forbidden"), DavOutcome::Auth);
 }
 
 #[test]
@@ -519,7 +529,7 @@ fn server_extra_unsolicited_href_in_multiget_is_logged_not_crashed() {
     </d:propstat>
   </d:response>
 </d:multistatus>"#;
-    let r = parse_multistatus(Cursor::new(body), "https://x/").expect("parse");
+    let r = MultistatusParser::parse(Cursor::new(body), "https://x/").expect("parse");
     assert_eq!(r.len(), 2);
 }
 
@@ -532,7 +542,7 @@ fn server_404_on_individual_item_in_multiget_recorded_as_vanished() {
     <d:status>HTTP/1.1 404 Not Found</d:status>
   </d:response>
 </d:multistatus>"#;
-    let r = parse_multistatus(Cursor::new(body), "https://x/").expect("parse");
+    let r = MultistatusParser::parse(Cursor::new(body), "https://x/").expect("parse");
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].status, Some(404));
 }
@@ -592,7 +602,7 @@ fn discovery_via_well_known_redirect_307() {
         multistatus_response(&mut server, "PROPFIND", "/dav/cal/u/", &collections_body);
 
     let c = client(0);
-    let disc = discover(&c, DavKind::Caldav, &url).expect("discover");
+    let disc = Discovery::run(&c, DavKind::Caldav, &url).expect("discover");
     assert_eq!(disc.collections.len(), 1);
     assert!(disc.home_set_url.ends_with("/dav/cal/u/"));
 }
@@ -655,7 +665,7 @@ fn discovery_survives_501_on_the_user_supplied_url() {
         multistatus_response(&mut server, "PROPFIND", "/dav/cal/u/", &collections_body);
 
     let c = client(0);
-    let disc = discover(&c, DavKind::Caldav, &url).expect("discovery must not abort on 501");
+    let disc = Discovery::run(&c, DavKind::Caldav, &url).expect("discovery must not abort on 501");
     assert_eq!(disc.collections.len(), 1);
     assert!(disc.home_set_url.ends_with("/dav/cal/u/"));
 }
@@ -701,7 +711,7 @@ fn discovery_when_server_omits_current_user_principal() {
         multistatus_response(&mut server, "PROPFIND", "/dav/cal/u/", &collections_body);
 
     let c = client(0);
-    let disc = discover(&c, DavKind::Caldav, &url).expect("discover");
+    let disc = Discovery::run(&c, DavKind::Caldav, &url).expect("discover");
     assert_eq!(disc.collections.len(), 1);
     assert!(
         disc.home_set_url.ends_with("/dav/cal/u/"),
@@ -731,7 +741,8 @@ fn propfind_depth1_self_inclusion_is_filtered_during_enumeration() {
     </d:propstat>
   </d:response>
 </d:multistatus>"#;
-    let parsed = parse_multistatus(Cursor::new(body), "https://x/dav/cal/u/d/").expect("parse");
+    let parsed =
+        MultistatusParser::parse(Cursor::new(body), "https://x/dav/cal/u/d/").expect("parse");
     let non_collection: Vec<_> = parsed.iter().filter(|r| !r.props.is_collection).collect();
     let collection: Vec<_> = parsed.iter().filter(|r| r.props.is_collection).collect();
     assert_eq!(non_collection.len(), 1);
@@ -750,7 +761,7 @@ fn item_missing_etag_records_empty_etag() {
     </d:propstat>
   </d:response>
 </d:multistatus>"#;
-    let r = parse_multistatus(Cursor::new(body), "https://x/").expect("parse");
+    let r = MultistatusParser::parse(Cursor::new(body), "https://x/").expect("parse");
     assert!(r[0].props.etag.is_none(), "missing etag should be None");
 }
 
@@ -770,7 +781,7 @@ END:VCALENDAR</c:calendar-data>
     </d:propstat>
   </d:response>
 </d:multistatus>"#;
-    let r = parse_multistatus(Cursor::new(multiget_body), "https://x/").expect("parse");
+    let r = MultistatusParser::parse(Cursor::new(multiget_body), "https://x/").expect("parse");
     assert_eq!(r[0].props.etag.as_deref(), Some("\"v2\""));
 }
 
@@ -793,7 +804,7 @@ fn webdav_cycle_breaks_on_lex_smallest() {
     </d:propstat>
   </d:response>
 </d:multistatus>"#;
-    let parsed = parse_multistatus(Cursor::new(body), "https://x/").expect("parse");
+    let parsed = MultistatusParser::parse(Cursor::new(body), "https://x/").expect("parse");
     let mut hrefs: Vec<&str> = parsed.iter().map(|r| r.href.as_str()).collect();
     hrefs.sort();
     assert_eq!(hrefs[0], "/files/a/");
@@ -801,8 +812,8 @@ fn webdav_cycle_breaks_on_lex_smallest() {
 
 #[test]
 fn multiget_405_method_not_allowed_triggers_get_fallback() {
-    use vandelay::dav::retry::{DavOutcome, classify};
-    assert_eq!(classify(405, b""), DavOutcome::Fatal);
+    use vandelay::dav::retry::DavOutcome;
+    assert_eq!(DavOutcome::classify(405, b""), DavOutcome::Fatal);
 }
 
 #[test]
@@ -821,7 +832,7 @@ fn parser_accepts_response_with_propstat_404_on_one_property() {
     </d:propstat>
   </d:response>
 </d:multistatus>"#;
-    let r = parse_multistatus(Cursor::new(body), "https://x/").expect("parse");
+    let r = MultistatusParser::parse(Cursor::new(body), "https://x/").expect("parse");
     assert_eq!(r[0].props.etag.as_deref(), Some("\"v\""));
     assert_eq!(r[0].propstat_errors, vec![404]);
 }
@@ -868,7 +879,7 @@ fn streaming_propfind_propagates_401_as_auth_error() {
     let err = c
         .propfind_responses(&format!("{}/", server.url()), 0, "<x/>", &server.url())
         .unwrap_err();
-    assert!(matches!(err, JmapError::Auth(_)), "got {err:?}");
+    assert!(matches!(err, DavError::Auth(_)), "got {err:?}");
 }
 
 #[test]
@@ -893,19 +904,24 @@ fn streaming_propfind_404_returns_empty_responses() {
 
 #[test]
 fn source_change_protection_rejects_different_account_id() {
-    use rusqlite::Connection;
-    use vandelay::db::{init, sources};
+    use vandelay::archive::Archive;
 
-    let conn = Connection::open_in_memory().unwrap();
-    init::apply_schema(&conn).unwrap();
-    let first = sources::SourceKey {
-        kind: "caldav".to_owned(),
-        session_url: "https://x".to_owned(),
-        account_id: "alice".to_owned(),
+    let archive = Archive::open_in_memory().unwrap();
+    let sources = archive.store().sources();
+    let first = SourceKey {
+        kind: SourceKind::CalDav,
+        url: "https://x",
+        account_id: "alice",
     };
-    sources::upsert_source(&conn, &first, Some("alice"), "alice").unwrap();
+    sources.upsert(&first, Some("alice"), "alice").unwrap();
 
-    let conflict = sources::conflicting_source(&conn, "caldav", "https://x", "bob").expect("query");
+    let conflict = sources
+        .conflicting(&SourceKey {
+            kind: SourceKind::CalDav,
+            url: "https://x",
+            account_id: "bob",
+        })
+        .expect("query");
     assert!(
         conflict.is_some(),
         "different account id under same kind+url is a conflict"
@@ -967,7 +983,7 @@ fn discovery_follows_real_307_from_well_known_to_dav_root() {
         multistatus_response(&mut server, "PROPFIND", "/dav/cal/u/", &collections_body);
 
     let c = client(0);
-    let disc = discover(&c, DavKind::Caldav, &url).expect("discover");
+    let disc = Discovery::run(&c, DavKind::Caldav, &url).expect("discover");
     assert_eq!(disc.collections.len(), 1);
     assert!(disc.home_set_url.ends_with("/dav/cal/u/"));
 }
@@ -1009,7 +1025,7 @@ fn discovery_skips_vfreebusy_only_calendars() {
     );
     let _m = multistatus_response(&mut server, "PROPFIND", "/dav/cal/u/", &body);
     let c = client(0);
-    let disc = discover(&c, DavKind::Caldav, &format!("{url}/dav/cal/u/")).expect("discover");
+    let disc = Discovery::run(&c, DavKind::Caldav, &format!("{url}/dav/cal/u/")).expect("discover");
     assert_eq!(disc.collections.len(), 1);
     assert_eq!(
         disc.collections[0].props.displayname.as_deref(),
@@ -1042,22 +1058,21 @@ fn webdav_discovery_keeps_only_self_row_as_root() {
     );
     let _m = multistatus_response(&mut server, "PROPFIND", "/files/u/", &body);
     let c = client(0);
-    let disc = discover(&c, DavKind::Webdav, &format!("{url}/files/u/")).expect("discover");
+    let disc = Discovery::run(&c, DavKind::Webdav, &format!("{url}/files/u/")).expect("discover");
     assert_eq!(disc.collections.len(), 1, "only self-row returned");
     assert!(disc.collections[0].href.as_str().ends_with("/files/u/"));
 }
 
 #[test]
 fn webdav_root_collection_is_not_materialised_children_map_to_target_root() {
-    use rusqlite::Connection;
+    use vandelay::archive::Archive;
+    use vandelay::archive::sources::SourceKey;
     use vandelay::dav::discover::DiscoveredCollection;
     use vandelay::dav::href::Href;
     use vandelay::dav::parse::ResourceProps;
-    use vandelay::db;
-    use vandelay::db::sources::SourceKey;
+    use vandelay::import::dav::tree::FileTree;
     use vandelay::logging::Logger;
     use vandelay::sync::TypeCounts;
-    use vandelay::sync::import_dav::tree::{WebDavCtx, reconcile_filenodes};
 
     let mut server = mockito::Server::new();
     let url = server.url();
@@ -1122,19 +1137,21 @@ fn webdav_root_collection_is_not_materialised_children_map_to_target_root() {
         .with_body("inner\n")
         .create();
 
-    let mut conn = Connection::open_in_memory().unwrap();
-    db::init::apply_schema(&conn).unwrap();
-    let source_id = db::sources::upsert_source(
-        &conn,
-        &SourceKey {
-            kind: "webdav".to_owned(),
-            session_url: url.clone(),
-            account_id: format!("{url}/dav/file/u/"),
-        },
-        Some("u"),
-        "u",
-    )
-    .unwrap();
+    let archive = Archive::open_in_memory().unwrap();
+    let conn = archive.connection();
+    let source = archive
+        .store()
+        .sources()
+        .upsert(
+            &SourceKey {
+                kind: SourceKind::WebDav,
+                url: &url,
+                account_id: &format!("{url}/dav/file/u/"),
+            },
+            Some("u"),
+            "u",
+        )
+        .unwrap();
 
     let root = DiscoveredCollection {
         url: format!("{url}/dav/file/u/"),
@@ -1146,15 +1163,16 @@ fn webdav_root_collection_is_not_materialised_children_map_to_target_root() {
         },
     };
     let c = client(0);
-    let ctx = WebDavCtx {
+    let tree = FileTree {
         client: &c,
-        source_id,
+        store: archive.store(),
+        source,
         base_url: &url,
         dav_connections: 2,
-        logger: Logger::from_flags(false, 0),
+        logger: Logger::new(Level::Default),
     };
     let mut counts = TypeCounts::default();
-    reconcile_filenodes(&mut conn, &ctx, &root, &mut counts).expect("reconcile");
+    tree.reconcile(&root, &mut counts).expect("reconcile");
 
     let total: i64 = conn
         .query_row("SELECT count(*) FROM file_nodes", [], |r| r.get(0))
@@ -1212,6 +1230,121 @@ fn webdav_root_collection_is_not_materialised_children_map_to_target_root() {
         Some(sub_id),
         "a nested file keeps its real parent directory"
     );
+}
+
+#[test]
+fn webdav_walk_lists_each_directory_once_when_children_point_back_up() {
+    // a/ lists the root and b/ lists a/: both cycles end without a second PROPFIND
+    use std::fmt::Write;
+    use vandelay::archive::Archive;
+    use vandelay::dav::discover::DiscoveredCollection;
+    use vandelay::dav::href::Href;
+    use vandelay::dav::parse::ResourceProps;
+    use vandelay::import::dav::tree::FileTree;
+    use vandelay::sync::TypeCounts;
+
+    let mut server = mockito::Server::new();
+    let url = server.url();
+    let listing = |hrefs: &[&str]| {
+        let mut body = String::from(r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">"#);
+        for href in hrefs {
+            let _ = write!(
+                body,
+                r#"<d:response><d:href>{url}{href}</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#
+            );
+        }
+        body.push_str("</d:multistatus>");
+        body
+    };
+    let mocks: Vec<mockito::Mock> = [
+        ("/dav/file/u/", listing(&["/dav/file/u/", "/dav/file/u/a/"])),
+        (
+            "/dav/file/u/a/",
+            listing(&["/dav/file/u/a/", "/dav/file/u/a/b/", "/dav/file/u/"]),
+        ),
+        (
+            "/dav/file/u/a/b/",
+            listing(&["/dav/file/u/a/b/", "/dav/file/u/a/"]),
+        ),
+    ]
+    .into_iter()
+    .map(|(path, body)| {
+        server
+            .mock("PROPFIND", path)
+            .with_status(207)
+            .with_header("content-type", "application/xml; charset=utf-8")
+            .with_body(body)
+            .expect(1)
+            .create()
+    })
+    .collect();
+
+    let archive = Archive::open_in_memory().unwrap();
+    let source = archive
+        .store()
+        .sources()
+        .upsert(
+            &SourceKey {
+                kind: SourceKind::WebDav,
+                url: &url,
+                account_id: &format!("{url}/dav/file/u/"),
+            },
+            Some("u"),
+            "u",
+        )
+        .unwrap();
+    let root = DiscoveredCollection {
+        url: format!("{url}/dav/file/u/"),
+        href: Href::from_normalised("/dav/file/u/".to_owned()),
+        props: ResourceProps {
+            is_collection: true,
+            ..Default::default()
+        },
+    };
+    let c = client(0);
+    let tree = FileTree {
+        client: &c,
+        store: archive.store(),
+        source,
+        base_url: &url,
+        dav_connections: 1,
+        logger: Logger::new(Level::Quiet),
+    };
+    let mut counts = TypeCounts::default();
+    tree.reconcile(&root, &mut counts).expect("reconcile");
+    assert_eq!(counts.failed, 0);
+    for mock in &mocks {
+        mock.assert();
+    }
+}
+
+#[test]
+fn bearer_auth_is_sent_as_the_authorization_header() {
+    let mut server = mockito::Server::new();
+    let url = server.url();
+    let m = server
+        .mock("PROPFIND", "/dav/")
+        .match_header("authorization", "Bearer abc")
+        .with_status(207)
+        .with_header("content-type", "application/xml; charset=utf-8")
+        .with_body(r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"/>"#)
+        .expect(1)
+        .create();
+    let c = DavClient::new(
+        Auth::Bearer {
+            token: "abc".into(),
+        },
+        ClientOptions {
+            retry: RetryPolicy::new(0),
+            tls: TlsPolicy::Verify,
+            logger: Logger::new(Level::Quiet),
+        },
+    );
+    let response = c
+        .propfind(&format!("{url}/dav/"), 0, Propfind::WebdavListing.body())
+        .expect("propfind");
+    assert_eq!(response.status, 207);
+    m.assert();
 }
 
 #[test]
@@ -1292,7 +1425,7 @@ fn get_stream_429_with_retry_after_honours_header() {
         elapsed.as_millis() >= 900,
         "expected Retry-After 1s honoured, elapsed={elapsed:?}"
     );
-    assert!(c.retry_after_sleeps() >= 1);
+    assert!(c.stats().retry_after_sleeps >= 1);
 }
 
 #[test]
@@ -1307,7 +1440,7 @@ fn execute_30x_without_location_is_fatal_not_loop() {
     let err = c
         .propfind(&format!("{}/no-location", server.url()), 0, "<x/>")
         .unwrap_err();
-    assert!(matches!(err, JmapError::Connect(_)), "got {err:?}");
+    assert!(matches!(err, DavError::Connect(_)), "got {err:?}");
 }
 
 #[test]
@@ -1326,7 +1459,7 @@ fn webdav_display_or_basename_test_via_parser_keeps_basename_semantics() {
     </d:propstat>
   </d:response>
 </d:multistatus>"#;
-    let parsed = parse_multistatus(Cursor::new(body), "https://x/").expect("parse");
+    let parsed = MultistatusParser::parse(Cursor::new(body), "https://x/").expect("parse");
     assert_eq!(
         parsed[0].props.displayname.as_deref(),
         Some("differently named.jpg")
@@ -1337,9 +1470,10 @@ fn webdav_display_or_basename_test_via_parser_keeps_basename_semantics() {
 #[test]
 fn dry_run_writes_nothing_but_emits_per_collection_counts() {
     use std::path::PathBuf;
+    use vandelay::archive::sources::SourceChange;
+    use vandelay::import::dav::{DavImport, DavKindArg};
     use vandelay::logging::Logger;
-    use vandelay::sync::CommonConfig;
-    use vandelay::sync::import_dav::{DavAuth, DavImportConfig, DavKindArg, SourceChange, run};
+    use vandelay::sync::RunOptions;
 
     let mut server = mockito::Server::new();
     let url = server.url();
@@ -1389,18 +1523,18 @@ fn dry_run_writes_nothing_but_emits_per_collection_counts() {
             .as_nanos()
     ));
     let _ = std::fs::remove_file(&archive);
-    let common = CommonConfig {
+    let common = RunOptions {
         archive: archive.clone(),
         threads: 1,
-        dry_run: true,
+        mode: RunMode::DryRun,
         max_retries: 0,
-        allow_invalid_certs: true,
-        logger: Logger::from_flags(true, 0),
+        tls: TlsPolicy::AcceptInvalid,
+        logger: Logger::new(Level::Quiet),
     };
-    let config = DavImportConfig {
+    let config = DavImport {
         kind: DavKindArg::Caldav,
         url: format!("{url}/dav/cal/u/"),
-        auth: DavAuth::Basic {
+        auth: Auth::Basic {
             user: "alice".to_owned(),
             password: "p".to_owned(),
         },
@@ -1409,7 +1543,7 @@ fn dry_run_writes_nothing_but_emits_per_collection_counts() {
         multiget_batch: 50,
         source_change: SourceChange::Reject,
     };
-    let summary = run(common, config).expect("dry-run ok");
+    let mut summary = config.run(common).into_result().expect("dry-run ok");
 
     let conn = rusqlite::Connection::open(&archive).unwrap();
     let n_sources: i64 = conn
@@ -1432,27 +1566,18 @@ fn dry_run_writes_nothing_but_emits_per_collection_counts() {
     assert_eq!(n_events, 0, "dry-run does not write events");
     assert_eq!(n_sync, 0, "dry-run does not write sync_id_dav");
 
-    let calendar_counts = summary
-        .per_type
-        .iter()
-        .find(|(name, _)| *name == "calendar")
-        .expect("calendar counts in summary");
-    let event_counts = summary
-        .per_type
-        .iter()
-        .find(|(name, _)| *name == "calendarevent")
-        .expect("event counts in summary");
-    assert_eq!(calendar_counts.1.created, 1);
-    assert_eq!(event_counts.1.created, 2);
+    assert_eq!(summary.plan(ObjectType::Calendar).new, 1);
+    assert_eq!(summary.plan(ObjectType::CalendarEvent).new, 2);
 }
 
 #[test]
 fn dav_source_change_protection_fires_across_users_on_same_root() {
     use encodify::base64::STANDARD;
     use std::path::PathBuf;
+    use vandelay::archive::sources::SourceChange;
+    use vandelay::import::dav::{DavImport, DavKindArg};
     use vandelay::logging::Logger;
-    use vandelay::sync::CommonConfig;
-    use vandelay::sync::import_dav::{DavAuth, DavImportConfig, DavKindArg, SourceChange, run};
+    use vandelay::sync::RunOptions;
 
     let mut server = mockito::Server::new();
     let url = server.url();
@@ -1542,18 +1667,18 @@ fn dav_source_change_protection_fires_across_users_on_same_root() {
     ));
     let _ = std::fs::remove_file(&archive);
 
-    let common = |archive: &PathBuf| CommonConfig {
+    let common = |archive: &PathBuf| RunOptions {
         archive: archive.clone(),
         threads: 1,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 0,
-        allow_invalid_certs: true,
-        logger: Logger::from_flags(false, 0),
+        tls: TlsPolicy::AcceptInvalid,
+        logger: Logger::new(Level::Default),
     };
-    let config = |user: &str, pass: &str| DavImportConfig {
+    let config = |user: &str, pass: &str| DavImport {
         kind: DavKindArg::Caldav,
         url: format!("{url}/dav/cal/"),
-        auth: DavAuth::Basic {
+        auth: Auth::Basic {
             user: user.to_owned(),
             password: pass.to_owned(),
         },
@@ -1563,8 +1688,14 @@ fn dav_source_change_protection_fires_across_users_on_same_root() {
         source_change: SourceChange::Reject,
     };
 
-    run(common(&archive), config("secondary@vandelay.org", "passA")).expect("user A import ok");
-    let err = run(common(&archive), config("tertiary@vandelay.org", "passB")).unwrap_err();
+    config("secondary@vandelay.org", "passA")
+        .run(common(&archive))
+        .into_result()
+        .expect("user A import ok");
+    let err = config("tertiary@vandelay.org", "passB")
+        .run(common(&archive))
+        .into_result()
+        .unwrap_err();
     let _ = std::fs::remove_file(&archive);
     assert!(
         matches!(err, vandelay::error::Error::SourceChange(_)),
@@ -1574,18 +1705,22 @@ fn dav_source_change_protection_fires_across_users_on_same_root() {
 
 #[test]
 fn source_change_protection_rejects_different_session_url_same_account() {
-    use rusqlite::Connection;
-    use vandelay::db::{init, sources};
+    use vandelay::archive::Archive;
 
-    let conn = Connection::open_in_memory().unwrap();
-    init::apply_schema(&conn).unwrap();
-    let first = sources::SourceKey {
-        kind: "caldav".to_owned(),
-        session_url: "https://host1.example".to_owned(),
-        account_id: "alice".to_owned(),
+    let archive = Archive::open_in_memory().unwrap();
+    let sources = archive.store().sources();
+    let first = SourceKey {
+        kind: SourceKind::CalDav,
+        url: "https://host1.example",
+        account_id: "alice",
     };
-    sources::upsert_source(&conn, &first, Some("alice"), "alice").unwrap();
-    let conflict = sources::conflicting_source(&conn, "caldav", "https://host2.example", "alice")
+    sources.upsert(&first, Some("alice"), "alice").unwrap();
+    let conflict = sources
+        .conflicting(&SourceKey {
+            kind: SourceKind::CalDav,
+            url: "https://host2.example",
+            account_id: "alice",
+        })
         .expect("query");
     assert!(
         conflict.is_some(),
@@ -1612,7 +1747,7 @@ fn etag_missing_in_enumeration_propagates_to_storage_layer() {
     </d:propstat>
   </d:response>
 </d:multistatus>"#;
-    let parsed = parse_multistatus(Cursor::new(body), "https://x/").expect("parse");
+    let parsed = MultistatusParser::parse(Cursor::new(body), "https://x/").expect("parse");
     let no_etag = parsed
         .iter()
         .find(|r| r.href.as_str().ends_with("no-etag.ics"))
@@ -1627,34 +1762,39 @@ fn etag_missing_in_enumeration_propagates_to_storage_layer() {
 
 #[test]
 fn mixed_source_archive_allows_distinct_kinds_against_same_url() {
-    use rusqlite::Connection;
-    use vandelay::db::{init, sources};
+    use vandelay::archive::Archive;
 
-    let conn = Connection::open_in_memory().unwrap();
-    init::apply_schema(&conn).unwrap();
-    let caldav = sources::SourceKey {
-        kind: "caldav".to_owned(),
-        session_url: "https://x".to_owned(),
-        account_id: "alice".to_owned(),
+    let archive = Archive::open_in_memory().unwrap();
+    let sources = archive.store().sources();
+    let caldav = SourceKey {
+        kind: SourceKind::CalDav,
+        url: "https://x",
+        account_id: "alice",
     };
-    let carddav = sources::SourceKey {
-        kind: "carddav".to_owned(),
-        session_url: "https://x".to_owned(),
-        account_id: "alice".to_owned(),
+    let carddav = SourceKey {
+        kind: SourceKind::CardDav,
+        url: "https://x",
+        account_id: "alice",
     };
-    let webdav = sources::SourceKey {
-        kind: "webdav".to_owned(),
-        session_url: "https://x".to_owned(),
-        account_id: "alice".to_owned(),
+    let webdav = SourceKey {
+        kind: SourceKind::WebDav,
+        url: "https://x",
+        account_id: "alice",
     };
-    let id_cal = sources::upsert_source(&conn, &caldav, Some("alice"), "alice").unwrap();
-    let id_card = sources::upsert_source(&conn, &carddav, Some("alice"), "alice").unwrap();
-    let id_web = sources::upsert_source(&conn, &webdav, Some("alice"), "alice").unwrap();
+    let id_cal = sources.upsert(&caldav, Some("alice"), "alice").unwrap();
+    let id_card = sources.upsert(&carddav, Some("alice"), "alice").unwrap();
+    let id_web = sources.upsert(&webdav, Some("alice"), "alice").unwrap();
     assert_ne!(id_cal, id_card);
     assert_ne!(id_card, id_web);
     assert_ne!(id_cal, id_web);
 
-    let no_conflict = sources::conflicting_source(&conn, "caldav", "https://x", "alice").unwrap();
+    let no_conflict = sources
+        .conflicting(&SourceKey {
+            kind: SourceKind::CalDav,
+            url: "https://x",
+            account_id: "alice",
+        })
+        .unwrap();
     assert!(no_conflict.is_none());
 }
 
@@ -1671,29 +1811,29 @@ fn dav_archive() -> std::path::PathBuf {
     p
 }
 
-fn caldav_import_config(url: &str) -> vandelay::sync::import_dav::DavImportConfig {
-    vandelay::sync::import_dav::DavImportConfig {
-        kind: vandelay::sync::import_dav::DavKindArg::Caldav,
+fn caldav_import_config(url: &str) -> vandelay::import::dav::DavImport {
+    vandelay::import::dav::DavImport {
+        kind: vandelay::import::dav::DavKindArg::Caldav,
         url: url.to_owned(),
-        auth: vandelay::sync::import_dav::DavAuth::Basic {
+        auth: Auth::Basic {
             user: "u".to_owned(),
             password: "p".to_owned(),
         },
         allow_cleartext: true,
         dav_connections: 1,
         multiget_batch: 8,
-        source_change: vandelay::sync::import_dav::SourceChange::Reject,
+        source_change: vandelay::archive::sources::SourceChange::Reject,
     }
 }
 
-fn dav_common(archive: &std::path::Path) -> vandelay::sync::CommonConfig {
-    vandelay::sync::CommonConfig {
+fn dav_common(archive: &std::path::Path) -> vandelay::sync::RunOptions {
+    vandelay::sync::RunOptions {
         archive: archive.to_path_buf(),
         threads: 1,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 0,
-        allow_invalid_certs: false,
-        logger: vandelay::logging::Logger::from_flags(true, 0),
+        tls: TlsPolicy::Verify,
+        logger: vandelay::logging::Logger::new(Level::Quiet),
     }
 }
 
@@ -1705,6 +1845,39 @@ fn row_count(archive: &std::path::Path, table: &str) -> i64 {
 
 #[test]
 fn forbidden_collection_is_a_per_unit_failure_and_the_others_still_import() {
+    let (_, archive) = failing_collection_beside_a_readable_one(
+        403,
+        "text/plain",
+        "you may not read this calendar",
+    );
+    assert_eq!(row_count(&archive, "calendars"), 2);
+    assert_eq!(row_count(&archive, "calendar_events"), 1);
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn every_collection_scoped_failure_stays_per_unit() {
+    // 405, an exhausted 503 and a malformed multistatus each fail only their collection
+    for (status, content_type, body) in [
+        (405, "text/plain", "method not allowed"),
+        (503, "text/plain", "try later"),
+        (
+            207,
+            "application/xml",
+            "<d:multistatus xmlns:d=\"DAV:\"><d:response>",
+        ),
+    ] {
+        let (_, archive) = failing_collection_beside_a_readable_one(status, content_type, body);
+        assert_eq!(row_count(&archive, "calendar_events"), 1, "status {status}");
+        let _ = std::fs::remove_file(&archive);
+    }
+}
+
+fn failing_collection_beside_a_readable_one(
+    status: usize,
+    content_type: &str,
+    body: &str,
+) -> (vandelay::sync::Summary, std::path::PathBuf) {
     let mut server = mockito::Server::new();
     let url = server.url();
 
@@ -1779,27 +1952,26 @@ END:VCALENDAR
     let _work_multiget =
         multistatus_response(&mut server, "REPORT", "/dav/cal/u/work/", &work_data);
 
-    let forbidden = server
+    let failing = server
         .mock("PROPFIND", "/dav/cal/u/shared/")
-        .with_status(403)
-        .with_header("content-type", "text/plain")
-        .with_body("you may not read this calendar")
+        .with_status(status)
+        .with_header("content-type", content_type)
+        .with_body(body)
         .expect_at_least(1)
         .create();
 
     let archive = dav_archive();
-    let summary = vandelay::sync::import_dav::run(
-        dav_common(&archive),
-        caldav_import_config(&format!("{url}/dav/cal/u/")),
-    )
-    .expect("a forbidden collection must not abort the run");
+    let summary = caldav_import_config(&format!("{url}/dav/cal/u/"))
+        .run(dav_common(&archive))
+        .into_result()
+        .unwrap_or_else(|e| panic!("status {status} must not abort the run: {e}"));
 
-    forbidden.assert();
+    failing.assert();
 
     let events = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "calendarevent")
+        .find(|(t, _)| *t == ObjectType::CalendarEvent)
         .map(|(_, c)| c.clone())
         .expect("calendarevent counts");
     assert_eq!(events.failed, 1, "the forbidden calendar counts as failed");
@@ -1808,10 +1980,7 @@ END:VCALENDAR
         summary.any_failed(),
         "a per-unit failure ends the run at exit 5"
     );
-
-    assert_eq!(row_count(&archive, "calendars"), 2);
-    assert_eq!(row_count(&archive, "calendar_events"), 1);
-    let _ = std::fs::remove_file(&archive);
+    (summary, archive)
 }
 
 // Kerio Connect sends calendar-data with bare CR line breaks, raw or as &#13; (issue #48).
@@ -1901,16 +2070,15 @@ fn kerio_bare_cr_calendar_data_imports() {
     let _multiget = multistatus_response(&mut server, "REPORT", coll, &data);
 
     let archive = dav_archive();
-    let summary = vandelay::sync::import_dav::run(
-        dav_common(&archive),
-        caldav_import_config(&format!("{url}{home}")),
-    )
-    .expect("import");
+    let summary = caldav_import_config(&format!("{url}{home}"))
+        .run(dav_common(&archive))
+        .into_result()
+        .expect("import");
 
     let events = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "calendarevent")
+        .find(|(t, _)| *t == ObjectType::CalendarEvent)
         .map(|(_, c)| c.clone())
         .expect("calendarevent counts");
     assert_eq!(events.failed, 0, "{events:?}");
@@ -1944,17 +2112,16 @@ fn credentials_rejected_during_discovery_still_aborts_the_run() {
         .create();
 
     let archive = dav_archive();
-    let err = vandelay::sync::import_dav::run(
-        dav_common(&archive),
-        caldav_import_config(&format!("{url}/dav/cal/u/")),
-    )
-    .expect_err("credentials rejected for the principal aborts the run");
+    let err = caldav_import_config(&format!("{url}/dav/cal/u/"))
+        .run(dav_common(&archive))
+        .into_result()
+        .expect_err("credentials rejected for the principal aborts the run");
 
     assert!(
         matches!(err, vandelay::error::Error::Connection(_)),
         "discovery-level auth rejection is a whole-run failure, got {err:?}"
     );
-    assert_eq!(err.exit_code(), 2);
+    assert_eq!(err.exit_status(), ExitStatus::Connection);
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -1987,10 +2154,7 @@ fn dav_import_reports_both_phases_when_every_collection_fails() {
         .create();
 
     let archive = dav_archive();
-    let outcome = vandelay::sync::import_dav::run_reporting(
-        dav_common(&archive),
-        caldav_import_config(&format!("{url}/dav/cal/u/")),
-    );
+    let outcome = caldav_import_config(&format!("{url}/dav/cal/u/")).run(dav_common(&archive));
     assert!(outcome.error.is_none());
     assert_eq!(
         outcome
@@ -1999,7 +2163,7 @@ fn dav_import_reports_both_phases_when_every_collection_fails() {
             .iter()
             .map(|(t, _)| *t)
             .collect::<Vec<_>>(),
-        vec!["calendar", "calendarevent"],
+        vec![ObjectType::Calendar, ObjectType::CalendarEvent],
         "both phases are reported even when every collection failed"
     );
     let _ = std::fs::remove_file(&archive);
@@ -2059,10 +2223,10 @@ fn webdav_share(server: &mut mockito::Server, prefix: &str, body: &str) -> Vec<m
 
 fn webdav_import_config(
     url: &str,
-    source_change: vandelay::sync::import_dav::SourceChange,
-) -> vandelay::sync::import_dav::DavImportConfig {
-    vandelay::sync::import_dav::DavImportConfig {
-        kind: vandelay::sync::import_dav::DavKindArg::Webdav,
+    source_change: vandelay::archive::sources::SourceChange,
+) -> vandelay::import::dav::DavImport {
+    vandelay::import::dav::DavImport {
+        kind: vandelay::import::dav::DavKindArg::Webdav,
         source_change,
         ..caldav_import_config(url)
     }
@@ -2070,7 +2234,7 @@ fn webdav_import_config(
 
 #[test]
 fn allow_source_change_keeps_the_moved_share_old_tree() {
-    use vandelay::sync::import_dav::{SourceChange, run};
+    use vandelay::archive::sources::SourceChange;
 
     let mut server = mockito::Server::new();
     let url = server.url();
@@ -2078,16 +2242,14 @@ fn allow_source_change_keeps_the_moved_share_old_tree() {
     let _new = webdav_share(&mut server, "/new/u/", "new\n");
     let archive = dav_archive();
 
-    run(
-        dav_common(&archive),
-        webdav_import_config(&format!("{url}/old/u/"), SourceChange::Reject),
-    )
-    .expect("old share import");
-    run(
-        dav_common(&archive),
-        webdav_import_config(&format!("{url}/new/u/"), SourceChange::Allow),
-    )
-    .expect("new share import");
+    webdav_import_config(&format!("{url}/old/u/"), SourceChange::Reject)
+        .run(dav_common(&archive))
+        .into_result()
+        .expect("old share import");
+    webdav_import_config(&format!("{url}/new/u/"), SourceChange::Allow)
+        .run(dav_common(&archive))
+        .into_result()
+        .expect("new share import");
 
     let (nodes, sources) = (
         row_count(&archive, "file_nodes"),
@@ -2100,7 +2262,7 @@ fn allow_source_change_keeps_the_moved_share_old_tree() {
 
 #[test]
 fn replace_source_drops_the_moved_share_old_tree() {
-    use vandelay::sync::import_dav::{SourceChange, run};
+    use vandelay::archive::sources::SourceChange;
 
     let mut server = mockito::Server::new();
     let url = server.url();
@@ -2108,20 +2270,17 @@ fn replace_source_drops_the_moved_share_old_tree() {
     let _new = webdav_share(&mut server, "/new/u/", "new\n");
     let archive = dav_archive();
 
-    run(
-        dav_common(&archive),
-        webdav_import_config(&format!("{url}/old/u/"), SourceChange::Reject),
-    )
-    .expect("old share import");
-    let summary = run(
-        dav_common(&archive),
-        webdav_import_config(&format!("{url}/new/u/"), SourceChange::Replace),
-    )
-    .expect("new share import");
-    let rerun = run(
-        dav_common(&archive),
-        webdav_import_config(&format!("{url}/new/u/"), SourceChange::Reject),
-    );
+    webdav_import_config(&format!("{url}/old/u/"), SourceChange::Reject)
+        .run(dav_common(&archive))
+        .into_result()
+        .expect("old share import");
+    let summary = webdav_import_config(&format!("{url}/new/u/"), SourceChange::Replace)
+        .run(dav_common(&archive))
+        .into_result()
+        .expect("new share import");
+    let rerun = webdav_import_config(&format!("{url}/new/u/"), SourceChange::Reject)
+        .run(dav_common(&archive))
+        .into_result();
 
     let conn = rusqlite::Connection::open(&archive).unwrap();
     let account: String = conn
@@ -2151,7 +2310,7 @@ fn replace_source_drops_the_moved_share_old_tree() {
     let filenode = summary
         .per_type
         .iter()
-        .find(|(name, _)| *name == "filenode")
+        .find(|(name, _)| *name == ObjectType::FileNode)
         .expect("filenode counts");
     assert_eq!(filenode.1.deleted, 2);
     assert!(
@@ -2161,8 +2320,9 @@ fn replace_source_drops_the_moved_share_old_tree() {
 }
 
 #[test]
-fn dry_run_replace_source_keeps_the_old_tree() {
-    use vandelay::sync::import_dav::{SourceChange, run};
+fn replace_source_removal_failure_leaves_the_new_source_unregistered() {
+    // --replace-source removes the old sources before registering the new one
+    use vandelay::archive::sources::SourceChange;
 
     let mut server = mockito::Server::new();
     let url = server.url();
@@ -2170,18 +2330,87 @@ fn dry_run_replace_source_keeps_the_old_tree() {
     let _new = webdav_share(&mut server, "/new/u/", "new\n");
     let archive = dav_archive();
 
-    run(
-        dav_common(&archive),
-        webdav_import_config(&format!("{url}/old/u/"), SourceChange::Reject),
+    webdav_import_config(&format!("{url}/old/u/"), SourceChange::Reject)
+        .run(dav_common(&archive))
+        .into_result()
+        .expect("old share import");
+    let conn = rusqlite::Connection::open(&archive).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER block_source_delete BEFORE DELETE ON sources
+         BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
     )
-    .expect("old share import");
+    .unwrap();
+    drop(conn);
+    let result = webdav_import_config(&format!("{url}/new/u/"), SourceChange::Replace)
+        .run(dav_common(&archive))
+        .into_result();
+
+    let conn = rusqlite::Connection::open(&archive).unwrap();
+    let accounts: Vec<String> = conn
+        .prepare("SELECT account_id FROM sources")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    drop(conn);
+    let _ = std::fs::remove_file(&archive);
+
+    assert!(result.is_err(), "the removal failure aborts the run");
+    assert_eq!(accounts.len(), 1, "sources: {accounts:?}");
+    assert!(
+        accounts[0].ends_with("/old/u/"),
+        "kept source is {accounts:?}"
+    );
+}
+
+#[test]
+fn source_registration_sql_failure_is_a_partial_exit() {
+    // a failing sources upsert ends a DAV run at exit 5, not 7
+    use vandelay::archive::sources::SourceChange;
+
+    let mut server = mockito::Server::new();
+    let url = server.url();
+    let _share = webdav_share(&mut server, "/new/u/", "new\n");
+    let archive = dav_archive();
+    let db = vandelay::archive::Archive::open(&archive).unwrap();
+    db.connection()
+        .execute_batch(
+            "CREATE TRIGGER block_source_insert BEFORE INSERT ON sources
+         BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+        )
+        .unwrap();
+    drop(db);
+    let err = webdav_import_config(&format!("{url}/new/u/"), SourceChange::Reject)
+        .run(dav_common(&archive))
+        .into_result()
+        .expect_err("source registration fails");
+    let _ = std::fs::remove_file(&archive);
+
+    assert!(matches!(err, vandelay::error::Error::Partial(_)), "{err:?}");
+    assert_eq!(err.exit_status(), ExitStatus::Partial);
+}
+
+#[test]
+fn dry_run_replace_source_keeps_the_old_tree() {
+    use vandelay::archive::sources::SourceChange;
+
+    let mut server = mockito::Server::new();
+    let url = server.url();
+    let _old = webdav_share(&mut server, "/old/u/", "old\n");
+    let _new = webdav_share(&mut server, "/new/u/", "new\n");
+    let archive = dav_archive();
+
+    webdav_import_config(&format!("{url}/old/u/"), SourceChange::Reject)
+        .run(dav_common(&archive))
+        .into_result()
+        .expect("old share import");
     let mut common = dav_common(&archive);
-    common.dry_run = true;
-    run(
-        common,
-        webdav_import_config(&format!("{url}/new/u/"), SourceChange::Replace),
-    )
-    .expect("dry-run");
+    common.mode = RunMode::DryRun;
+    webdav_import_config(&format!("{url}/new/u/"), SourceChange::Replace)
+        .run(common)
+        .into_result()
+        .expect("dry-run");
 
     let (nodes, sources) = (
         row_count(&archive, "file_nodes"),
@@ -2189,5 +2418,40 @@ fn dry_run_replace_source_keeps_the_old_tree() {
     );
     let _ = std::fs::remove_file(&archive);
     assert_eq!(nodes, 2);
+    assert_eq!(sources, 1);
+}
+
+#[test]
+fn dry_run_rejects_another_account_like_the_real_run() {
+    // R6: the source-change guard runs in a dry run too, so it predicts exit 4
+    use vandelay::archive::sources::SourceChange;
+
+    let mut server = mockito::Server::new();
+    let url = server.url();
+    let _old = webdav_share(&mut server, "/old/u/", "old\n");
+    let _new = webdav_share(&mut server, "/new/u/", "new\n");
+    let archive = dav_archive();
+
+    webdav_import_config(&format!("{url}/old/u/"), SourceChange::Reject)
+        .run(dav_common(&archive))
+        .into_result()
+        .expect("old share import");
+    let mut common = dav_common(&archive);
+    common.mode = RunMode::DryRun;
+    let outcome = webdav_import_config(&format!("{url}/new/u/"), SourceChange::Reject).run(common);
+    let real = webdav_import_config(&format!("{url}/new/u/"), SourceChange::Reject)
+        .run(dav_common(&archive))
+        .into_result();
+    let sources = row_count(&archive, "sources");
+    let _ = std::fs::remove_file(&archive);
+
+    let dry = outcome
+        .error
+        .expect("dry run must refuse the account change");
+    assert_eq!(dry.exit_status(), ExitStatus::SourceChange);
+    assert_eq!(
+        real.expect_err("real run refuses").to_string(),
+        dry.to_string()
+    );
     assert_eq!(sources, 1);
 }

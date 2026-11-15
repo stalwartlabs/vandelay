@@ -7,6 +7,8 @@
 use std::fmt;
 use std::io;
 
+use crate::net::stream::StreamError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ImapError {
     #[error("transport error: {0}")]
@@ -40,6 +42,35 @@ pub enum ImapError {
     Unsupported(String),
 }
 
+impl ImapError {
+    pub fn into_auth_failure(self) -> ImapError {
+        match self {
+            ImapError::No(no) if no.is_auth_failed() => ImapError::AuthFailed(no.text),
+            other => other,
+        }
+    }
+
+    pub fn is_auth_failed(&self) -> bool {
+        match self {
+            ImapError::AuthFailed(_) => true,
+            ImapError::No(no) => no.is_auth_failed(),
+            _ => false,
+        }
+    }
+}
+
+impl From<StreamError> for ImapError {
+    fn from(e: StreamError) -> ImapError {
+        match e {
+            StreamError::Io(e) => ImapError::Io(e),
+            StreamError::Tls(m) => ImapError::Tls(m),
+            StreamError::CompressedStartTls => {
+                ImapError::Protocol("cannot STARTTLS after COMPRESS DEFLATE".into())
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NoError {
     pub text: String,
@@ -71,10 +102,14 @@ impl NoError {
     }
 
     pub fn is_auth_failed(&self) -> bool {
-        matches!(
-            self.code.as_deref(),
-            Some("AUTHENTICATIONFAILED") | Some("PRIVACYREQUIRED") | Some("AUTHORIZATIONFAILED")
-        )
+        self.code.as_deref().is_some_and(|code| {
+            hashify::set!(
+                code.as_bytes(),
+                "AUTHENTICATIONFAILED",
+                "PRIVACYREQUIRED",
+                "AUTHORIZATIONFAILED",
+            )
+        })
     }
 }
 

@@ -6,5 +6,10 @@
 
 pub mod address;
 pub mod date;
+pub mod ews;
+pub mod graph;
 pub mod jscalendar;
+pub mod mailbox;
+pub mod oauth;
 pub mod tz;
+pub mod vocab;

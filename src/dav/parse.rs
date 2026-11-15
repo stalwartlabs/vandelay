@@ -4,14 +4,17 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use std::io::BufRead;
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::io::{self, BufRead, Read};
 
 use quick_xml::NsReader;
-use quick_xml::events::{BytesRef, Event};
+use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::ResolveResult;
 
-use crate::dav::href::{Href, normalise};
-use crate::dav::xml::{NS_APPLE_ICAL, NS_CALDAV, NS_CARDDAV, NS_DAV};
+use crate::dav::href::{Href, HrefError};
+use crate::dav::retry::DavOutcome;
+use crate::net::xml::Entity;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
@@ -21,7 +24,7 @@ pub enum ParseError {
     Href {
         href: String,
         #[source]
-        source: crate::dav::href::HrefError,
+        source: HrefError,
     },
     #[error("missing href in response")]
     MissingHref,
@@ -57,6 +60,51 @@ pub struct ResourceProps {
     pub address_data: Option<String>,
 }
 
+impl ResourceProps {
+    fn merge(&mut self, src: ResourceProps) {
+        self.is_collection |= src.is_collection;
+        self.is_calendar |= src.is_calendar;
+        self.is_addressbook |= src.is_addressbook;
+        ResourceProps::overwrite_some(&mut self.displayname, src.displayname);
+        ResourceProps::overwrite_some(&mut self.current_user_principal, src.current_user_principal);
+        ResourceProps::overwrite_some(&mut self.calendar_home_set, src.calendar_home_set);
+        ResourceProps::overwrite_some(&mut self.addressbook_home_set, src.addressbook_home_set);
+        ResourceProps::overwrite_some(&mut self.etag, src.etag);
+        ResourceProps::overwrite_some(&mut self.content_type, src.content_type);
+        ResourceProps::overwrite_some(&mut self.last_modified, src.last_modified);
+        ResourceProps::overwrite_some(&mut self.creation_date, src.creation_date);
+        ResourceProps::overwrite_some(&mut self.content_length, src.content_length);
+        ResourceProps::overwrite_some(&mut self.calendar_description, src.calendar_description);
+        ResourceProps::overwrite_some(
+            &mut self.addressbook_description,
+            src.addressbook_description,
+        );
+        ResourceProps::overwrite_some(&mut self.calendar_color, src.calendar_color);
+        ResourceProps::overwrite_some(&mut self.calendar_order, src.calendar_order);
+        ResourceProps::overwrite_some(&mut self.calendar_timezone, src.calendar_timezone);
+        ResourceProps::overwrite_some(&mut self.calendar_data, src.calendar_data);
+        ResourceProps::overwrite_some(&mut self.address_data, src.address_data);
+        if !src.supported_components.is_empty() {
+            self.supported_components = src.supported_components;
+        }
+    }
+
+    fn overwrite_some<T>(target: &mut Option<T>, src: Option<T>) {
+        if src.is_some() {
+            *target = src;
+        }
+    }
+
+    fn mark_resourcetype(&mut self, element: Element) {
+        match element {
+            Element::Collection => self.is_collection = true,
+            Element::Calendar => self.is_calendar = true,
+            Element::Addressbook => self.is_addressbook = true,
+            _ => {}
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DavResponse {
     pub href: Href,
@@ -65,8 +113,19 @@ pub struct DavResponse {
     pub propstat_errors: Vec<u16>,
 }
 
+impl DavResponse {
+    pub fn is_gone(&self) -> bool {
+        self.status.is_some_and(DavOutcome::is_gone)
+            || self
+                .propstat_errors
+                .iter()
+                .copied()
+                .any(DavOutcome::is_gone)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NsKind {
+enum Namespace {
     Dav,
     Caldav,
     Carddav,
@@ -74,545 +133,438 @@ enum NsKind {
     Other,
 }
 
-fn classify_ns(ns: &ResolveResult<'_>) -> NsKind {
-    match ns {
-        ResolveResult::Bound(prefix) => {
-            let p = prefix.as_ref();
-            if p == NS_DAV {
-                NsKind::Dav
-            } else if p == NS_CALDAV {
-                NsKind::Caldav
-            } else if p == NS_CARDDAV {
-                NsKind::Carddav
-            } else if p == NS_APPLE_ICAL {
-                NsKind::Apple
-            } else {
-                NsKind::Other
-            }
-        }
-        _ => NsKind::Other,
+impl Namespace {
+    fn of(resolved: &ResolveResult<'_>) -> Namespace {
+        let ResolveResult::Bound(ns) = resolved else {
+            return Namespace::Other;
+        };
+        hashify::map!(ns.as_ref().as_bytes(), Namespace,
+            "DAV:" => Namespace::Dav,
+            "urn:ietf:params:xml:ns:caldav" => Namespace::Caldav,
+            "urn:ietf:params:xml:ns:carddav" => Namespace::Carddav,
+            "http://apple.com/ns/ical/" => Namespace::Apple,
+        )
+        .copied()
+        .unwrap_or(Namespace::Other)
     }
 }
 
-fn is(ns: NsKind, local: &str, expected_ns: NsKind, target: &str) -> bool {
-    ns == expected_ns && local.eq_ignore_ascii_case(target)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Element {
+    Response,
+    Href,
+    Status,
+    Propstat,
+    Prop,
+    ResourceType,
+    Collection,
+    DisplayName,
+    CurrentUserPrincipal,
+    GetEtag,
+    GetContentType,
+    GetLastModified,
+    CreationDate,
+    GetContentLength,
+    Calendar,
+    CalendarHomeSet,
+    CalendarDescription,
+    CalendarTimezone,
+    SupportedCalendarComponentSet,
+    Comp,
+    CalendarData,
+    Addressbook,
+    AddressbookHomeSet,
+    AddressbookDescription,
+    AddressData,
+    CalendarColor,
+    CalendarOrder,
+    Other,
+}
+
+impl Element {
+    fn of(ns: Namespace, local: &str) -> Element {
+        let Some(&(expected, element)) = hashify::map_ignore_case!(local.as_bytes(), (Namespace, Element),
+            "response" => (Namespace::Dav, Element::Response),
+            "href" => (Namespace::Dav, Element::Href),
+            "status" => (Namespace::Dav, Element::Status),
+            "propstat" => (Namespace::Dav, Element::Propstat),
+            "prop" => (Namespace::Dav, Element::Prop),
+            "resourcetype" => (Namespace::Dav, Element::ResourceType),
+            "collection" => (Namespace::Dav, Element::Collection),
+            "displayname" => (Namespace::Dav, Element::DisplayName),
+            "current-user-principal" => (Namespace::Dav, Element::CurrentUserPrincipal),
+            "getetag" => (Namespace::Dav, Element::GetEtag),
+            "getcontenttype" => (Namespace::Dav, Element::GetContentType),
+            "getlastmodified" => (Namespace::Dav, Element::GetLastModified),
+            "creationdate" => (Namespace::Dav, Element::CreationDate),
+            "getcontentlength" => (Namespace::Dav, Element::GetContentLength),
+            "calendar" => (Namespace::Caldav, Element::Calendar),
+            "calendar-home-set" => (Namespace::Caldav, Element::CalendarHomeSet),
+            "calendar-description" => (Namespace::Caldav, Element::CalendarDescription),
+            "calendar-timezone" => (Namespace::Caldav, Element::CalendarTimezone),
+            "supported-calendar-component-set" => (Namespace::Caldav, Element::SupportedCalendarComponentSet),
+            "comp" => (Namespace::Caldav, Element::Comp),
+            "calendar-data" => (Namespace::Caldav, Element::CalendarData),
+            "addressbook" => (Namespace::Carddav, Element::Addressbook),
+            "addressbook-home-set" => (Namespace::Carddav, Element::AddressbookHomeSet),
+            "addressbook-description" => (Namespace::Carddav, Element::AddressbookDescription),
+            "address-data" => (Namespace::Carddav, Element::AddressData),
+            "calendar-color" => (Namespace::Apple, Element::CalendarColor),
+            "calendar-order" => (Namespace::Apple, Element::CalendarOrder),
+        ) else {
+            return Element::Other;
+        };
+        if expected == ns {
+            element
+        } else {
+            Element::Other
+        }
+    }
 }
 
 #[derive(Debug)]
 enum Step {
-    StartElement {
-        ns: NsKind,
-        local: String,
-        attrs: Vec<(String, String)>,
-    },
-    EmptyElement {
-        ns: NsKind,
-        local: String,
-        attrs: Vec<(String, String)>,
-    },
-    EndElement {
-        ns: NsKind,
-        local: String,
-    },
+    Start(Element, Option<String>),
+    Empty(Element, Option<String>),
+    End(Element),
     Text(String),
-    CData(String),
-    Entity(char),
+    Char(char),
     Other,
     Eof,
 }
 
-fn resolve_entity(g: &BytesRef) -> Option<char> {
-    if let Ok(Some(c)) = g.resolve_char_ref() {
-        return Some(c);
-    }
-    match g.as_ref() {
-        "amp" => Some('&'),
-        "lt" => Some('<'),
-        "gt" => Some('>'),
-        "quot" => Some('"'),
-        "apos" => Some('\''),
-        _ => None,
+impl Step {
+    fn opening(ns: Namespace, e: &BytesStart<'_>) -> (Element, Option<String>) {
+        let element = Element::of(ns, e.local_name().as_ref());
+        let name = match element {
+            Element::Comp => e
+                .attributes()
+                .flatten()
+                .find(|a| a.key.as_ref() == "name")
+                .map(|a| a.value.into_owned()),
+            _ => None,
+        };
+        (element, name)
     }
 }
 
-fn next_step<R: BufRead>(xml: &mut NsReader<R>, buf: &mut Vec<u8>) -> Result<Step, ParseError> {
-    buf.clear();
-    let (ns, ev) = xml.read_resolved_event_into(buf)?;
-    let ns_kind = classify_ns(&ns);
-    Ok(match ev {
-        Event::Start(e) => {
-            let local = e.local_name().as_ref().to_owned();
-            let attrs = e
-                .attributes()
-                .flatten()
-                .map(|a| (a.key.as_ref().to_owned(), a.value.into_owned()))
-                .collect();
-            Step::StartElement {
-                ns: ns_kind,
-                local,
-                attrs,
-            }
-        }
-        Event::Empty(e) => {
-            let local = e.local_name().as_ref().to_owned();
-            let attrs = e
-                .attributes()
-                .flatten()
-                .map(|a| (a.key.as_ref().to_owned(), a.value.into_owned()))
-                .collect();
-            Step::EmptyElement {
-                ns: ns_kind,
-                local,
-                attrs,
-            }
-        }
-        Event::End(e) => Step::EndElement {
-            ns: ns_kind,
-            local: e.local_name().as_ref().to_owned(),
-        },
-        Event::Text(t) => Step::Text(t.into_inner().into_owned()),
-        Event::CData(cd) => Step::CData(cd.into_inner().into_owned()),
-        Event::GeneralRef(g) => match resolve_entity(&g) {
-            Some(c) => Step::Entity(c),
-            None => Step::Other,
-        },
-        Event::Eof => Step::Eof,
-        _ => Step::Other,
-    })
+pub struct MultistatusParser<'b, R> {
+    xml: NsReader<R>,
+    buf: Vec<u8>,
+    base_url: &'b str,
 }
 
-pub fn parse_multistatus<R: BufRead>(
-    reader: R,
-    base_url: &str,
-) -> Result<Vec<DavResponse>, ParseError> {
-    let mut xml = NsReader::from_reader(reader);
-    let mut buf = Vec::new();
-    let mut out: Vec<DavResponse> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    loop {
-        let step = next_step(&mut xml, &mut buf)?;
-        match step {
-            Step::StartElement { ns, local, .. } if is(ns, &local, NsKind::Dav, "response") => {
-                if let Some(r) = parse_response(&mut xml, base_url)?
-                    && seen.insert(r.href.as_str().to_owned())
-                {
-                    out.push(r);
+impl<'b, R: BufRead> MultistatusParser<'b, R> {
+    pub fn parse(reader: R, base_url: &'b str) -> Result<Vec<DavResponse>, ParseError> {
+        let mut parser = MultistatusParser {
+            xml: NsReader::from_reader(reader),
+            buf: Vec::new(),
+            base_url,
+        };
+        let mut out: Vec<DavResponse> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        loop {
+            match parser.next_step()? {
+                Step::Start(Element::Response, _) => {
+                    let response = parser.response()?;
+                    if seen.insert(response.href.as_str().to_owned()) {
+                        out.push(response);
+                    }
                 }
+                Step::Eof => break,
+                _ => {}
             }
-            Step::Eof => break,
-            _ => {}
         }
+        Ok(out)
     }
-    Ok(out)
-}
 
-fn parse_response<R: BufRead>(
-    xml: &mut NsReader<R>,
-    base_url: &str,
-) -> Result<Option<DavResponse>, ParseError> {
-    let mut buf = Vec::new();
-    let mut href: Option<String> = None;
-    let mut status: Option<u16> = None;
-    let mut props = ResourceProps::default();
-    let mut propstat_errors: Vec<u16> = Vec::new();
+    fn next_step(&mut self) -> Result<Step, ParseError> {
+        self.buf.clear();
+        let (resolved, event) = self.xml.read_resolved_event_into(&mut self.buf)?;
+        let ns = Namespace::of(&resolved);
+        Ok(match event {
+            Event::Start(e) => {
+                let (element, name) = Step::opening(ns, &e);
+                Step::Start(element, name)
+            }
+            Event::Empty(e) => {
+                let (element, name) = Step::opening(ns, &e);
+                Step::Empty(element, name)
+            }
+            Event::End(e) => Step::End(Element::of(ns, e.local_name().as_ref())),
+            Event::Text(t) => Step::Text(t.into_inner().into_owned()),
+            Event::CData(cd) => Step::Text(cd.into_inner().into_owned()),
+            Event::GeneralRef(g) => Entity::from_ref(&g).map_or(Step::Other, Step::Char),
+            Event::Eof => Step::Eof,
+            _ => Step::Other,
+        })
+    }
 
-    loop {
-        let step = next_step(xml, &mut buf)?;
-        match step {
-            Step::StartElement { ns, local, .. } => {
-                if is(ns, &local, NsKind::Dav, "href") {
-                    let text = read_token(xml)?;
+    fn unexpected_eof(context: &str) -> ParseError {
+        ParseError::Xml(format!("unexpected EOF {context}"))
+    }
+
+    fn response(&mut self) -> Result<DavResponse, ParseError> {
+        let mut href: Option<String> = None;
+        let mut status: Option<u16> = None;
+        let mut props = ResourceProps::default();
+        let mut propstat_errors: Vec<u16> = Vec::new();
+        loop {
+            match self.next_step()? {
+                Step::Start(Element::Href, _) => {
+                    let text = self.token()?;
                     if href.is_none() {
                         href = Some(text);
                     }
-                } else if is(ns, &local, NsKind::Dav, "status") {
-                    let text = read_token(xml)?;
-                    status = parse_http_status(&text);
-                } else if is(ns, &local, NsKind::Dav, "propstat") {
-                    let (block_status, block_props) = parse_propstat(xml)?;
-                    match block_status {
-                        Some(s) if (200..300).contains(&s) => merge_props(&mut props, block_props),
-                        Some(s) => propstat_errors.push(s),
-                        None => {}
-                    }
-                } else {
-                    skip_element(xml, &local)?;
+                }
+                Step::Start(Element::Status, _) => {
+                    status = MultistatusParser::<R>::http_status(&self.token()?);
+                }
+                Step::Start(Element::Propstat, _) => match self.propstat()? {
+                    (Some(s), block) if (200..300).contains(&s) => props.merge(block),
+                    (Some(s), _) => propstat_errors.push(s),
+                    (None, _) => {}
+                },
+                Step::Start(..) => self.skip()?,
+                Step::End(Element::Response) => break,
+                Step::Eof => return Err(MultistatusParser::<R>::unexpected_eof("in <response>")),
+                _ => {}
+            }
+        }
+        let raw_href = href.ok_or(ParseError::MissingHref)?;
+        let href = Href::parse(self.base_url, &raw_href).map_err(|source| ParseError::Href {
+            href: raw_href,
+            source,
+        })?;
+        Ok(DavResponse {
+            href,
+            status,
+            props,
+            propstat_errors,
+        })
+    }
+
+    fn propstat(&mut self) -> Result<(Option<u16>, ResourceProps), ParseError> {
+        let mut status: Option<u16> = None;
+        let mut props = ResourceProps::default();
+        loop {
+            match self.next_step()? {
+                Step::Start(Element::Status, _) => {
+                    status = MultistatusParser::<R>::http_status(&self.token()?);
+                }
+                Step::Start(Element::Prop, _) => self.prop_block(&mut props)?,
+                Step::Start(..) => self.skip()?,
+                Step::End(Element::Propstat) => break,
+                Step::Eof => return Err(MultistatusParser::<R>::unexpected_eof("in <propstat>")),
+                _ => {}
+            }
+        }
+        Ok((status, props))
+    }
+
+    fn prop_block(&mut self, props: &mut ResourceProps) -> Result<(), ParseError> {
+        loop {
+            match self.next_step()? {
+                Step::Start(element, _) => self.prop_element(props, element)?,
+                Step::End(Element::Prop) => break,
+                Step::Eof => return Err(MultistatusParser::<R>::unexpected_eof("in <prop>")),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn prop_element(
+        &mut self,
+        props: &mut ResourceProps,
+        element: Element,
+    ) -> Result<(), ParseError> {
+        match element {
+            Element::ResourceType => self.resourcetype(props)?,
+            Element::DisplayName => props.displayname = Some(self.token()?),
+            Element::CurrentUserPrincipal => {
+                props.current_user_principal = self.first_href(element)?;
+            }
+            Element::CalendarHomeSet => props.calendar_home_set = self.first_href(element)?,
+            Element::AddressbookHomeSet => props.addressbook_home_set = self.first_href(element)?,
+            Element::GetEtag => {
+                let raw = self.token()?;
+                if !raw.is_empty() {
+                    props.etag = Some(raw);
                 }
             }
-            Step::EndElement { ns, local } if is(ns, &local, NsKind::Dav, "response") => break,
-            Step::Eof => return Err(ParseError::Xml("unexpected EOF in <response>".into())),
-            _ => {}
+            Element::GetContentType => props.content_type = Some(self.token()?),
+            Element::GetLastModified => props.last_modified = Some(self.token()?),
+            Element::CreationDate => props.creation_date = Some(self.token()?),
+            Element::GetContentLength => props.content_length = self.token()?.parse::<u64>().ok(),
+            Element::CalendarDescription => props.calendar_description = Some(self.token()?),
+            Element::AddressbookDescription => props.addressbook_description = Some(self.token()?),
+            Element::CalendarColor => props.calendar_color = Some(self.token()?),
+            Element::CalendarOrder => props.calendar_order = self.token()?.parse::<i64>().ok(),
+            Element::CalendarTimezone => props.calendar_timezone = Some(self.token()?),
+            Element::SupportedCalendarComponentSet => self.supported_components(props)?,
+            Element::CalendarData => props.calendar_data = Some(self.text()?),
+            Element::AddressData => props.address_data = Some(self.text()?),
+            _ => self.skip()?,
         }
+        Ok(())
     }
 
-    let raw_href = href.ok_or(ParseError::MissingHref)?;
-    let normalised = normalise(base_url, &raw_href).map_err(|e| ParseError::Href {
-        href: raw_href,
-        source: e,
-    })?;
-    Ok(Some(DavResponse {
-        href: normalised,
-        status,
-        props,
-        propstat_errors,
-    }))
-}
-
-fn parse_propstat<R: BufRead>(
-    xml: &mut NsReader<R>,
-) -> Result<(Option<u16>, ResourceProps), ParseError> {
-    let mut buf = Vec::new();
-    let mut status: Option<u16> = None;
-    let mut props = ResourceProps::default();
-    loop {
-        let step = next_step(xml, &mut buf)?;
-        match step {
-            Step::StartElement { ns, local, .. } => {
-                if is(ns, &local, NsKind::Dav, "status") {
-                    let text = read_token(xml)?;
-                    status = parse_http_status(&text);
-                } else if is(ns, &local, NsKind::Dav, "prop") {
-                    parse_prop_block(xml, &mut props)?;
-                } else {
-                    skip_element(xml, &local)?;
+    fn resourcetype(&mut self, props: &mut ResourceProps) -> Result<(), ParseError> {
+        loop {
+            match self.next_step()? {
+                Step::Start(element, _) => {
+                    props.mark_resourcetype(element);
+                    self.skip()?;
                 }
-            }
-            Step::EndElement { ns, local } if is(ns, &local, NsKind::Dav, "propstat") => break,
-            Step::Eof => return Err(ParseError::Xml("unexpected EOF in <propstat>".into())),
-            _ => {}
-        }
-    }
-    Ok((status, props))
-}
-
-fn parse_prop_block<R: BufRead>(
-    xml: &mut NsReader<R>,
-    props: &mut ResourceProps,
-) -> Result<(), ParseError> {
-    let mut buf = Vec::new();
-    loop {
-        let step = next_step(xml, &mut buf)?;
-        match step {
-            Step::StartElement { ns, local, .. } => {
-                handle_prop_element(xml, props, ns, &local)?;
-            }
-            Step::EmptyElement { .. } => {}
-            Step::EndElement { ns, local } if is(ns, &local, NsKind::Dav, "prop") => break,
-            Step::Eof => return Err(ParseError::Xml("unexpected EOF in <prop>".into())),
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn handle_prop_element<R: BufRead>(
-    xml: &mut NsReader<R>,
-    props: &mut ResourceProps,
-    ns: NsKind,
-    local: &str,
-) -> Result<(), ParseError> {
-    if is(ns, local, NsKind::Dav, "resourcetype") {
-        consume_resourcetype(xml, props)?;
-    } else if is(ns, local, NsKind::Dav, "displayname") {
-        props.displayname = Some(read_token(xml)?);
-    } else if is(ns, local, NsKind::Dav, "current-user-principal") {
-        props.current_user_principal = read_first_href(xml, "current-user-principal")?;
-    } else if is(ns, local, NsKind::Caldav, "calendar-home-set") {
-        props.calendar_home_set = read_first_href(xml, "calendar-home-set")?;
-    } else if is(ns, local, NsKind::Carddav, "addressbook-home-set") {
-        props.addressbook_home_set = read_first_href(xml, "addressbook-home-set")?;
-    } else if is(ns, local, NsKind::Dav, "getetag") {
-        let raw = read_token(xml)?;
-        if !raw.is_empty() {
-            props.etag = Some(raw);
-        }
-    } else if is(ns, local, NsKind::Dav, "getcontenttype") {
-        props.content_type = Some(read_token(xml)?);
-    } else if is(ns, local, NsKind::Dav, "getlastmodified") {
-        props.last_modified = Some(read_token(xml)?);
-    } else if is(ns, local, NsKind::Dav, "creationdate") {
-        props.creation_date = Some(read_token(xml)?);
-    } else if is(ns, local, NsKind::Dav, "getcontentlength") {
-        let raw = read_token(xml)?;
-        props.content_length = raw.parse::<u64>().ok();
-    } else if is(ns, local, NsKind::Caldav, "calendar-description") {
-        props.calendar_description = Some(read_token(xml)?);
-    } else if is(ns, local, NsKind::Carddav, "addressbook-description") {
-        props.addressbook_description = Some(read_token(xml)?);
-    } else if is(ns, local, NsKind::Apple, "calendar-color") {
-        props.calendar_color = Some(read_token(xml)?);
-    } else if is(ns, local, NsKind::Apple, "calendar-order") {
-        let raw = read_token(xml)?;
-        props.calendar_order = raw.parse::<i64>().ok();
-    } else if is(ns, local, NsKind::Caldav, "calendar-timezone") {
-        props.calendar_timezone = Some(read_token(xml)?);
-    } else if is(
-        ns,
-        local,
-        NsKind::Caldav,
-        "supported-calendar-component-set",
-    ) {
-        consume_supported_components(xml, props)?;
-    } else if is(ns, local, NsKind::Caldav, "calendar-data") {
-        props.calendar_data = Some(read_text(xml)?);
-    } else if is(ns, local, NsKind::Carddav, "address-data") {
-        props.address_data = Some(read_text(xml)?);
-    } else {
-        skip_element(xml, local)?;
-    }
-    Ok(())
-}
-
-fn consume_resourcetype<R: BufRead>(
-    xml: &mut NsReader<R>,
-    props: &mut ResourceProps,
-) -> Result<(), ParseError> {
-    let mut buf = Vec::new();
-    loop {
-        let step = next_step(xml, &mut buf)?;
-        match step {
-            Step::StartElement { ns, local, .. } => {
-                mark_resourcetype(ns, &local, props);
-                skip_element(xml, &local)?;
-            }
-            Step::EmptyElement { ns, local, .. } => {
-                mark_resourcetype(ns, &local, props);
-            }
-            Step::EndElement { ns, local } if is(ns, &local, NsKind::Dav, "resourcetype") => break,
-            Step::Eof => {
-                return Err(ParseError::Xml("unexpected EOF in <resourcetype>".into()));
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn mark_resourcetype(ns: NsKind, local: &str, props: &mut ResourceProps) {
-    if is(ns, local, NsKind::Dav, "collection") {
-        props.is_collection = true;
-    } else if is(ns, local, NsKind::Caldav, "calendar") {
-        props.is_calendar = true;
-    } else if is(ns, local, NsKind::Carddav, "addressbook") {
-        props.is_addressbook = true;
-    }
-}
-
-fn consume_supported_components<R: BufRead>(
-    xml: &mut NsReader<R>,
-    props: &mut ResourceProps,
-) -> Result<(), ParseError> {
-    let mut buf = Vec::new();
-    loop {
-        let step = next_step(xml, &mut buf)?;
-        match step {
-            Step::StartElement {
-                ns,
-                local,
-                ref attrs,
-            } if is(ns, &local, NsKind::Caldav, "comp") => {
-                if let Some(name) = attr_lookup(attrs, "name") {
-                    props.supported_components.push(name);
+                Step::Empty(element, _) => props.mark_resourcetype(element),
+                Step::End(Element::ResourceType) => break,
+                Step::Eof => {
+                    return Err(MultistatusParser::<R>::unexpected_eof("in <resourcetype>"));
                 }
-                skip_element(xml, &local)?;
+                _ => {}
             }
-            Step::EmptyElement {
-                ns,
-                local,
-                ref attrs,
-            } if is(ns, &local, NsKind::Caldav, "comp") => {
-                if let Some(name) = attr_lookup(attrs, "name") {
-                    props.supported_components.push(name);
+        }
+        Ok(())
+    }
+
+    fn supported_components(&mut self, props: &mut ResourceProps) -> Result<(), ParseError> {
+        loop {
+            match self.next_step()? {
+                Step::Start(Element::Comp, name) => {
+                    props.supported_components.extend(name);
+                    self.skip()?;
                 }
-            }
-            Step::EndElement { ns, local }
-                if is(
-                    ns,
-                    &local,
-                    NsKind::Caldav,
-                    "supported-calendar-component-set",
-                ) =>
-            {
-                break;
-            }
-            Step::Eof => {
-                return Err(ParseError::Xml(
-                    "unexpected EOF in <supported-calendar-component-set>".into(),
-                ));
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn attr_lookup(attrs: &[(String, String)], key: &str) -> Option<String> {
-    attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
-}
-
-fn read_text<R: BufRead>(xml: &mut NsReader<R>) -> Result<String, ParseError> {
-    let mut buf = Vec::new();
-    let mut out = String::new();
-    loop {
-        let step = next_step(xml, &mut buf)?;
-        match step {
-            Step::Text(s) | Step::CData(s) => out.push_str(&s),
-            Step::Entity(c) => out.push(c),
-            Step::StartElement { local, .. } => skip_element(xml, &local)?,
-            Step::EndElement { .. } | Step::EmptyElement { .. } => break,
-            Step::Eof => return Err(ParseError::Xml("unexpected EOF reading text".into())),
-            _ => {}
-        }
-    }
-    Ok(out)
-}
-
-fn read_token<R: BufRead>(xml: &mut NsReader<R>) -> Result<String, ParseError> {
-    Ok(read_text(xml)?.trim().to_owned())
-}
-
-fn read_first_href<R: BufRead>(
-    xml: &mut NsReader<R>,
-    closing_local: &str,
-) -> Result<Option<String>, ParseError> {
-    let mut buf = Vec::new();
-    let mut out: Option<String> = None;
-    loop {
-        let step = next_step(xml, &mut buf)?;
-        match step {
-            Step::StartElement { ns, local, .. } => {
-                if out.is_none() && is(ns, &local, NsKind::Dav, "href") {
-                    out = Some(read_token(xml)?);
-                } else {
-                    skip_element(xml, &local)?;
+                Step::Empty(Element::Comp, name) => props.supported_components.extend(name),
+                Step::End(Element::SupportedCalendarComponentSet) => break,
+                Step::Eof => {
+                    return Err(MultistatusParser::<R>::unexpected_eof(
+                        "in <supported-calendar-component-set>",
+                    ));
                 }
+                _ => {}
             }
-            Step::EmptyElement { .. } => {}
-            Step::EndElement { local, .. } if local.eq_ignore_ascii_case(closing_local) => {
-                break;
+        }
+        Ok(())
+    }
+
+    fn text(&mut self) -> Result<String, ParseError> {
+        let mut out = String::new();
+        loop {
+            match self.next_step()? {
+                Step::Text(s) => out.push_str(&s),
+                Step::Char(c) => out.push(c),
+                Step::Start(..) => self.skip()?,
+                Step::End(_) | Step::Empty(..) => break,
+                Step::Eof => return Err(MultistatusParser::<R>::unexpected_eof("reading text")),
+                Step::Other => {}
             }
-            Step::Eof => return Err(ParseError::Xml("unexpected EOF reading href".into())),
-            _ => {}
+        }
+        Ok(out)
+    }
+
+    fn token(&mut self) -> Result<String, ParseError> {
+        let text = self.text()?;
+        let trimmed = text.trim();
+        Ok(if trimmed.len() == text.len() {
+            text
+        } else {
+            trimmed.to_owned()
+        })
+    }
+
+    fn first_href(&mut self, closing: Element) -> Result<Option<String>, ParseError> {
+        let mut out: Option<String> = None;
+        loop {
+            match self.next_step()? {
+                Step::Start(Element::Href, _) if out.is_none() => out = Some(self.token()?),
+                Step::Start(..) => self.skip()?,
+                Step::End(element) if element == closing => break,
+                Step::Eof => return Err(MultistatusParser::<R>::unexpected_eof("reading href")),
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    fn skip(&mut self) -> Result<(), ParseError> {
+        let mut depth: u32 = 1;
+        while depth > 0 {
+            match self.next_step()? {
+                Step::Start(..) => depth += 1,
+                Step::End(_) => depth -= 1,
+                Step::Eof => return Err(MultistatusParser::<R>::unexpected_eof("in skip")),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn http_status(text: &str) -> Option<u16> {
+        let mut parts = text.split_ascii_whitespace();
+        let _version = parts.next()?;
+        parts.next()?.parse::<u16>().ok()
+    }
+}
+
+pub struct ControlBytes;
+
+impl ControlBytes {
+    pub fn is_illegal(b: u8) -> bool {
+        matches!(b, 0x00..=0x08 | 0x0b | 0x0c | 0x0e..=0x1f)
+    }
+
+    pub fn strip(body: &[u8]) -> Cow<'_, [u8]> {
+        if body.iter().any(|&b| ControlBytes::is_illegal(b)) {
+            Cow::Owned(
+                body.iter()
+                    .copied()
+                    .filter(|&b| !ControlBytes::is_illegal(b))
+                    .collect(),
+            )
+        } else {
+            Cow::Borrowed(body)
         }
     }
-    Ok(out)
-}
 
-fn skip_element<R: BufRead>(xml: &mut NsReader<R>, target: &str) -> Result<(), ParseError> {
-    let mut buf = Vec::new();
-    let mut depth: i32 = 1;
-    while depth > 0 {
-        let step = next_step(xml, &mut buf)?;
-        match step {
-            Step::StartElement { .. } => depth += 1,
-            Step::EndElement { local, .. } => {
-                depth -= 1;
-                if depth == 0 && !local.eq_ignore_ascii_case(target) {
-                    return Ok(());
-                }
+    fn compact(filled: &mut [u8]) -> usize {
+        let mut write = 0;
+        let mut read = 0;
+        while let Some(rest) = filled.get(read..) {
+            let run = rest
+                .iter()
+                .position(|&b| ControlBytes::is_illegal(b))
+                .unwrap_or(rest.len());
+            if write != read {
+                filled.copy_within(read..read + run, write);
             }
-            Step::Eof => return Err(ParseError::Xml("unexpected EOF in skip".into())),
-            _ => {}
+            write += run;
+            read += run + 1;
         }
-    }
-    Ok(())
-}
-
-fn merge_props(target: &mut ResourceProps, src: ResourceProps) {
-    if src.is_collection {
-        target.is_collection = true;
-    }
-    if src.is_calendar {
-        target.is_calendar = true;
-    }
-    if src.is_addressbook {
-        target.is_addressbook = true;
-    }
-    overwrite_some(&mut target.displayname, src.displayname);
-    overwrite_some(
-        &mut target.current_user_principal,
-        src.current_user_principal,
-    );
-    overwrite_some(&mut target.calendar_home_set, src.calendar_home_set);
-    overwrite_some(&mut target.addressbook_home_set, src.addressbook_home_set);
-    overwrite_some(&mut target.etag, src.etag);
-    overwrite_some(&mut target.content_type, src.content_type);
-    overwrite_some(&mut target.last_modified, src.last_modified);
-    overwrite_some(&mut target.creation_date, src.creation_date);
-    overwrite_some(&mut target.content_length, src.content_length);
-    overwrite_some(&mut target.calendar_description, src.calendar_description);
-    overwrite_some(
-        &mut target.addressbook_description,
-        src.addressbook_description,
-    );
-    overwrite_some(&mut target.calendar_color, src.calendar_color);
-    overwrite_some(&mut target.calendar_order, src.calendar_order);
-    overwrite_some(&mut target.calendar_timezone, src.calendar_timezone);
-    overwrite_some(&mut target.calendar_data, src.calendar_data);
-    overwrite_some(&mut target.address_data, src.address_data);
-    if !src.supported_components.is_empty() {
-        target.supported_components = src.supported_components;
+        write
     }
 }
 
-fn overwrite_some<T>(target: &mut Option<T>, src: Option<T>) {
-    if src.is_some() {
-        *target = src;
-    }
-}
-
-fn parse_http_status(text: &str) -> Option<u16> {
-    let mut parts = text.split_ascii_whitespace();
-    let _version = parts.next()?;
-    let code = parts.next()?;
-    code.parse::<u16>().ok()
-}
-
-pub fn strip_ascii_control_chars(body: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-    if body.iter().any(|&b| is_xml_illegal_control(b)) {
-        let cleaned: Vec<u8> = body
-            .iter()
-            .copied()
-            .filter(|b| !is_xml_illegal_control(*b))
-            .collect();
-        std::borrow::Cow::Owned(cleaned)
-    } else {
-        std::borrow::Cow::Borrowed(body)
-    }
-}
-
-pub fn is_xml_illegal_control(b: u8) -> bool {
-    matches!(b, 0x00..=0x08 | 0x0b | 0x0c | 0x0e..=0x1f)
-}
-
-pub struct ControlStrippingReader<R: std::io::Read> {
+pub struct ControlStrippingReader<R> {
     inner: R,
 }
 
-impl<R: std::io::Read> ControlStrippingReader<R> {
+impl<R: Read> ControlStrippingReader<R> {
     pub fn new(inner: R) -> Self {
-        Self { inner }
+        ControlStrippingReader { inner }
     }
 }
 
-impl<R: std::io::Read> std::io::Read for ControlStrippingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+impl<R: Read> Read for ControlStrippingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             let n = self.inner.read(buf)?;
-            if n == 0 {
+            let Some(filled @ [_, ..]) = buf.get_mut(..n) else {
                 return Ok(0);
-            }
-            let mut write = 0;
-            for read in 0..n {
-                let b = buf[read];
-                if !is_xml_illegal_control(b) {
-                    buf[write] = b;
-                    write += 1;
-                }
-            }
-            if write > 0 {
-                return Ok(write);
+            };
+            let kept = ControlBytes::compact(filled);
+            if kept > 0 {
+                return Ok(kept);
             }
         }
     }
@@ -623,8 +575,35 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn gone_probe(status: Option<u16>, propstat_errors: Vec<u16>) -> DavResponse {
+        DavResponse {
+            href: Href::from_normalised("/dav/cal/u/d/e.ics".to_owned()),
+            status,
+            props: ResourceProps::default(),
+            propstat_errors,
+        }
+    }
+
+    #[test]
+    fn response_level_404_or_410_is_gone() {
+        assert!(gone_probe(Some(404), vec![]).is_gone());
+        assert!(gone_probe(Some(410), vec![]).is_gone());
+    }
+
+    #[test]
+    fn per_propstat_404_or_410_is_gone() {
+        assert!(gone_probe(None, vec![404]).is_gone());
+        assert!(gone_probe(None, vec![200, 410]).is_gone());
+    }
+
+    #[test]
+    fn other_propstat_errors_are_not_gone() {
+        assert!(!gone_probe(None, vec![403]).is_gone());
+        assert!(!gone_probe(None, vec![]).is_gone());
+    }
+
     fn parse(body: &str) -> Vec<DavResponse> {
-        parse_multistatus(Cursor::new(body), "https://x/").expect("parse")
+        MultistatusParser::parse(Cursor::new(body), "https://x/").expect("parse")
     }
 
     #[test]
@@ -808,17 +787,29 @@ END:VCALENDAR</c:calendar-data>
     #[test]
     fn strip_control_chars_removes_low_bytes() {
         let raw = b"<?xml version=\"1.0\"?>\x01<root/>";
-        let cleaned = strip_ascii_control_chars(raw);
+        let cleaned = ControlBytes::strip(raw);
         assert!(!cleaned.contains(&0x01));
+    }
+
+    #[test]
+    fn stripping_reader_drops_control_bytes_across_reads() {
+        let raw = b"\x01ab\x02\x03c\x1fd\x01";
+        for chunk in [1, 2, 3, 64] {
+            let mut reader =
+                ControlStrippingReader::new(io::BufReader::with_capacity(chunk, &raw[..]));
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).expect("read");
+            assert_eq!(out, b"abcd", "chunk {chunk}");
+        }
     }
 
     #[test]
     fn strip_control_chars_leaves_tab_newline_cr() {
         let raw = b"<?xml ?>\t\n\r";
-        let cleaned = strip_ascii_control_chars(raw);
+        let cleaned = ControlBytes::strip(raw);
         match cleaned {
-            std::borrow::Cow::Borrowed(_) => {}
-            std::borrow::Cow::Owned(_) => panic!("should not have allocated"),
+            Cow::Borrowed(_) => {}
+            Cow::Owned(_) => panic!("should not have allocated"),
         }
     }
 
@@ -878,7 +869,7 @@ END:VCALENDAR</c:calendar-data>
     }
 
     #[test]
-    fn merge_props_last_propstat_wins_for_duplicate_keys() {
+    fn last_propstat_wins_for_duplicate_keys() {
         let body = r#"<?xml version="1.0"?>
         <d:multistatus xmlns:d="DAV:">
           <d:response>

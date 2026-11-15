@@ -34,6 +34,16 @@ pub enum SieveError {
     Referral(String),
 }
 
+const TRANSIENT_MARKERS: &[&str] = &[
+    "temp",
+    "try again",
+    "try later",
+    "unavailable",
+    "throttle",
+    "rate limit",
+    "too many",
+];
+
 #[derive(Debug, Clone)]
 pub struct NoError {
     pub text: String,
@@ -49,53 +59,35 @@ impl NoError {
     }
 
     pub fn is_transient(&self) -> bool {
-        if let Some(c) = &self.code {
-            let cu = c.to_ascii_uppercase();
-            if cu == "TRYLATER" {
+        if let Some(code) = &self.code {
+            if code.eq_ignore_ascii_case("TRYLATER") {
                 return true;
             }
-            if matches!(
-                cu.as_str(),
-                "QUOTA"
-                    | "QUOTA/MAXSCRIPTS"
-                    | "AUTH-TOO-WEAK"
-                    | "ENCRYPT-NEEDED"
-                    | "TRANSITION-NEEDED"
-                    | "NONEXISTENT"
-                    | "ALREADYEXISTS"
-                    | "ACTIVE"
-                    | "SASL"
-                    | "TAG"
-                    | "WARNINGS"
+            if hashify::set_ignore_case!(
+                code.as_bytes(),
+                "QUOTA",
+                "QUOTA/MAXSCRIPTS",
+                "AUTH-TOO-WEAK",
+                "ENCRYPT-NEEDED",
+                "TRANSITION-NEEDED",
+                "NONEXISTENT",
+                "ALREADYEXISTS",
+                "ACTIVE",
+                "SASL",
+                "TAG",
+                "WARNINGS",
             ) {
                 return false;
             }
         }
         let lower = self.text.to_ascii_lowercase();
-        const TRANSIENT_MARKERS: &[&str] = &[
-            "temp",
-            "try again",
-            "try later",
-            "unavailable",
-            "throttle",
-            "rate limit",
-            "too many",
-        ];
         TRANSIENT_MARKERS.iter().any(|m| lower.contains(m))
     }
 
     pub fn is_referral(&self) -> bool {
-        matches!(
-            self.code.as_deref().map(str::to_ascii_uppercase).as_deref(),
-            Some("REFERRAL")
-        )
-    }
-
-    pub fn is_nonexistent(&self) -> bool {
-        matches!(
-            self.code.as_deref().map(str::to_ascii_uppercase).as_deref(),
-            Some("NONEXISTENT")
-        )
+        self.code
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case("REFERRAL"))
     }
 }
 
@@ -150,12 +142,6 @@ mod tests {
     fn referral_code_detected() {
         assert!(NoError::new("x", Some("REFERRAL".into())).is_referral());
         assert!(!NoError::new("x", None).is_referral());
-    }
-
-    #[test]
-    fn nonexistent_code_detected() {
-        assert!(NoError::new("x", Some("NONEXISTENT".into())).is_nonexistent());
-        assert!(NoError::new("x", Some("nonexistent".into())).is_nonexistent());
     }
 
     #[test]

@@ -4,16 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::{SyncBuilder, SyncRunner};
 use testcontainers::{Container, GenericBuildableImage, GenericImage, ImageExt};
 
-use super::data::{MboxMessage, load_mbox};
+use super::data::load_mbox;
 use super::error::{ContainerError, ContainerResult};
-use super::imap_client::{ImapSeed, full_path};
+use super::imap_client::{ImapSeed, MailboxSeed, SeedProbes};
 use super::layouts::{self};
 use super::{Account, Endpoint};
 
@@ -186,180 +185,28 @@ impl Cyrus {
             .unwrap_or(0)
             .max(1);
         let messages = load_mbox(limit)?;
+        let probes = SeedProbes {
+            flag: flag_probe_message(),
+            no_message_id: None,
+            shared_message_id: None,
+        };
         let mut out = Vec::new();
         for acct in &self.accounts {
-            let m = self.seed_account(acct, &messages)?;
-            out.push(m);
+            let mut client = ImapSeed::open(&self.imap, acct)?;
+            let mailbox = client.seed_layout(acct, &messages, &probes)?;
+            client.logout()?;
+            out.push(AccountSeed {
+                username: acct.username.clone(),
+                mailbox,
+            });
         }
         Ok(out)
     }
 
-    fn seed_account(
-        &self,
-        account: &Account,
-        messages: &[MboxMessage],
-    ) -> ContainerResult<AccountSeed> {
-        let mut client = ImapSeed::connect(&self.imap.host, self.imap.port)?;
-        client.login(&account.username, &account.password)?;
-        let sep = client.discover_separator().unwrap_or('/');
-
-        let mut paths = Vec::new();
-        for spec in account.layout.mailboxes {
-            let path = full_path(account.layout.mailboxes, spec.key, sep).ok_or_else(|| {
-                ContainerError::Seed(format!("missing mailbox key: {}", spec.key))
-            })?;
-            client.create(&path)?;
-            client.subscribe(&path)?;
-            paths.push(path);
-        }
-        let mut targets: Vec<String> = vec!["INBOX".to_owned()];
-        targets.extend(paths.iter().cloned());
-        let mut histogram: HashMap<String, usize> =
-            targets.iter().map(|t| (t.clone(), 0)).collect();
-        let mut appends: Vec<SeededAppend> = Vec::new();
-
-        let total = account.layout.email_count.min(messages.len());
-        if total < account.layout.email_count {
-            return Err(ContainerError::Seed(format!(
-                "{} only has {} messages but layout requires {}",
-                account.username,
-                messages.len(),
-                account.layout.email_count
-            )));
-        }
-        for (i, msg) in messages.iter().take(total).enumerate() {
-            let target = targets[i % targets.len()].clone();
-            client.append_with_flags(&target, &[], &msg.raw)?;
-            *histogram.entry(target.clone()).or_insert(0) += 1;
-            appends.push(SeededAppend {
-                raw: msg.raw.clone(),
-                target,
-                flags: Vec::new(),
-                tag: SeedTag::Bulk(i),
-            });
-        }
-
-        let mut dedup_target: Option<String> = None;
-        if targets.len() > 1 && !messages.is_empty() {
-            let target = targets[1].clone();
-            client.append_with_flags(&target, &[], &messages[0].raw)?;
-            *histogram.entry(target.clone()).or_insert(0) += 1;
-            appends.push(SeededAppend {
-                raw: messages[0].raw.clone(),
-                target: target.clone(),
-                flags: Vec::new(),
-                tag: SeedTag::Dedup,
-            });
-            dedup_target = Some(target);
-        }
-
-        let mut flagged_target: Option<String> = None;
-        if !messages.is_empty() {
-            let target = "INBOX".to_owned();
-            let probe = flag_probe_message();
-            client.append_with_flags(&target, &["\\Seen", "\\Flagged"], &probe)?;
-            *histogram.entry(target.clone()).or_insert(0) += 1;
-            appends.push(SeededAppend {
-                raw: probe,
-                target: target.clone(),
-                flags: vec!["$seen".to_owned(), "$flagged".to_owned()],
-                tag: SeedTag::FlagProbe,
-            });
-            flagged_target = Some(target);
-        }
-
-        client.logout()?;
-
-        let total_appends = histogram.values().sum();
-        Ok(AccountSeed {
-            username: account.username.clone(),
-            paths,
-            histogram,
-            total_appends,
-            dedup_target,
-            flagged_target,
-            appends,
-        })
-    }
-
-    pub fn create_non_ascii_mailbox(
-        &self,
-        account: &Account,
-        wire_name: &str,
-        message: &[u8],
-    ) -> ContainerResult<()> {
-        let mut client = ImapSeed::connect(&self.imap.host, self.imap.port)?;
-        client.login(&account.username, &account.password)?;
-        client.create(wire_name)?;
-        client.subscribe(wire_name)?;
-        client.append_with_flags(wire_name, &[], message)?;
-        client.logout()?;
-        Ok(())
-    }
-
-    pub fn delete_first_inbox_message(&self, account: &Account) -> ContainerResult<()> {
-        let mut client = ImapSeed::connect(&self.imap.host, self.imap.port)?;
-        client.login(&account.username, &account.password)?;
-        client.delete_and_expunge_first("INBOX")?;
-        client.logout()?;
-        Ok(())
-    }
-
-    pub fn append_new_message(
-        &self,
-        account: &Account,
-        mailbox: &str,
-        tag: &str,
-    ) -> ContainerResult<(Vec<u8>, String)> {
-        let mut client = ImapSeed::connect(&self.imap.host, self.imap.port)?;
-        client.login(&account.username, &account.password)?;
-        let message_id = format!("<cyrus-added-{tag}-{}@vandelay.test>", account.username);
-        let body = format!(
-            "From: cyrus-added-{tag}@vandelay.test\r\n\
-             To: {}@vandelay.test\r\n\
-             Subject: Cyrus added probe {tag}\r\n\
-             Message-ID: {message_id}\r\n\
-             Date: Wed, 01 Jan 2025 12:00:00 +0000\r\n\
-             \r\n\
-             Cyrus added probe body {tag}.\r\n",
-            account.username
-        );
-        let raw = body.into_bytes();
-        client.append_with_flags(mailbox, &[], &raw)?;
-        client.logout()?;
-        Ok((raw, message_id))
-    }
-
     pub fn verify_seed(&self, seeds: &[AccountSeed]) -> ContainerResult<()> {
         for (acct, seed) in self.accounts.iter().zip(seeds) {
-            let mut client = ImapSeed::connect(&self.imap.host, self.imap.port)?;
-            client.login(&acct.username, &acct.password)?;
-            let names = client.list_all()?;
-            let expected = acct.layout.mailboxes.len() + 1;
-            if names.len() < expected {
-                return Err(ContainerError::Seed(format!(
-                    "cyrus {}: expected >= {expected} mailboxes, got {}",
-                    acct.username,
-                    names.len()
-                )));
-            }
-            let inbox_n = client.select("INBOX")?;
-            if acct.layout.email_count > 0 && inbox_n == 0 {
-                return Err(ContainerError::Seed(format!(
-                    "cyrus {}: INBOX EXISTS = 0 after seed",
-                    acct.username
-                )));
-            }
-            for path in &seed.paths {
-                let n = client.select(path)?;
-                let want = seed.histogram.get(path).copied().unwrap_or(0);
-                if n < want {
-                    return Err(ContainerError::Seed(format!(
-                        "cyrus {}: mailbox {path} EXISTS={n} but {want} were appended",
-                        acct.username
-                    )));
-                }
-            }
+            let mut client = ImapSeed::open(&self.imap, acct)?;
+            client.verify_layout(acct, &seed.mailbox, &format!("cyrus {}", acct.username))?;
             client.logout()?;
         }
         Ok(())
@@ -385,25 +232,5 @@ pub fn flag_probe_message() -> Vec<u8> {
 #[derive(Debug, Clone)]
 pub struct AccountSeed {
     pub username: String,
-    pub paths: Vec<String>,
-    pub histogram: HashMap<String, usize>,
-    pub total_appends: usize,
-    pub dedup_target: Option<String>,
-    pub flagged_target: Option<String>,
-    pub appends: Vec<SeededAppend>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SeededAppend {
-    pub raw: Vec<u8>,
-    pub target: String,
-    pub flags: Vec<String>,
-    pub tag: SeedTag,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SeedTag {
-    Bulk(usize),
-    Dedup,
-    FlagProbe,
+    pub mailbox: MailboxSeed,
 }

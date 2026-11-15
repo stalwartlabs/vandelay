@@ -6,42 +6,28 @@
 
 use std::path::{Path, PathBuf};
 
+mod common;
+
+use common::{SessionJson, tmp_archive};
 use mockito::Matcher;
 use serde_json::{Value, json};
-use vandelay::db;
+use vandelay::archive::Archive;
+use vandelay::archive::sources::{SourceChange, SourceKey, SourceKind};
+use vandelay::error::ExitStatus;
+use vandelay::export::{Confirm, Export, Prune};
+use vandelay::import::jmap::JmapImport;
 use vandelay::jmap::account::AccountSelector;
-use vandelay::jmap::http::Auth;
-use vandelay::logging::Logger;
-use vandelay::sync::{self, CommonConfig, ConnectConfig, ExportConfig, ImportConfig};
+use vandelay::jmap::connect::ConnectConfig;
+use vandelay::logging::{Level, Logger};
+use vandelay::net::auth::Auth;
+use vandelay::net::http::TlsPolicy;
+use vandelay::sync::SummaryType;
+use vandelay::sync::emailmeta::EmailMeta;
+use vandelay::sync::{self, RunMode, RunOptions};
 use vandelay::types::ObjectType;
 
-fn tmp() -> PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "vandelay-mocksync-{}-{:?}-{n}.sqlite",
-        std::process::id(),
-        std::thread::current().id(),
-    ));
-    let _ = std::fs::remove_file(&p);
-    p
-}
-
 fn session_body(base: &str) -> String {
-    json!({
-        "apiUrl": format!("{base}/jmap/api"),
-        "uploadUrl": format!("{base}/jmap/upload/{{accountId}}/"),
-        "downloadUrl": format!("{base}/jmap/dl/{{accountId}}/{{blobId}}/{{type}}/{{name}}"),
-        "capabilities": { "urn:ietf:params:jmap:core": {
-            "maxObjectsInGet": 500, "maxObjectsInSet": 500, "maxCallsInRequest": 16,
-            "maxConcurrentRequests": 4, "maxConcurrentUpload": 4,
-            "maxSizeRequest": 10000000, "maxSizeUpload": 50000000
-        } },
-        "accounts": { "w": { "name": "alice",
-            "accountCapabilities": { "urn:ietf:params:jmap:mail": {} } } }
-    })
-    .to_string()
+    SessionJson::new(base).build()
 }
 
 #[test]
@@ -50,19 +36,21 @@ fn export_email_already_exists_is_matched_not_failed() {
     let base = server.url();
     let api = "/jmap/api";
 
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
             [],
         )
         .unwrap();
-        let blob = db::blobs::intern_blob(
-            &conn,
-            b"From: a@x\r\nSubject: hi\r\nMessage-ID: <m-1@h>\r\n\r\nbody",
-        )
-        .unwrap();
+        let blob = db
+            .store()
+            .blobs()
+            .intern(b"From: a@x\r\nSubject: hi\r\nMessage-ID: <m-1@h>\r\n\r\nbody")
+            .unwrap()
+            .get();
         conn.execute(
             "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
              VALUES (?1,'2020-01-01T00:00:00Z','[1]','[\"$seen\"]')",
@@ -134,35 +122,34 @@ fn export_email_already_exists_is_matched_not_failed() {
         .expect(1)
         .create();
 
-    let summary = sync::export::run(
-        CommonConfig {
-            archive: archive.clone(),
-            threads: 1,
-            dry_run: false,
-            max_retries: 1,
-            allow_invalid_certs: false,
-            logger: Logger::from_flags(true, 0),
-        },
-        ExportConfig {
-            connect: ConnectConfig {
-                url: base.clone(),
-                auth: Auth::Basic {
-                    user: "u".into(),
-                    password: "p".into(),
-                },
-                account: AccountSelector::Id("w".into()),
+    let summary = (Export {
+        connect: ConnectConfig {
+            url: base.clone(),
+            auth: Auth::Basic {
+                user: "u".into(),
+                password: "p".into(),
             },
-            objects: None,
-            prune: false,
-            yes: true,
+            account: AccountSelector::Id("w".into()),
         },
-    )
+        objects: None,
+        prune: Prune::Keep,
+        confirm: Confirm::Assume,
+    })
+    .run(RunOptions {
+        archive: archive.clone(),
+        threads: 1,
+        mode: RunMode::Apply,
+        max_retries: 1,
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
+    })
+    .into_result()
     .expect("export run");
 
     let email = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Email")
+        .find(|(t, _)| *t == ObjectType::Email)
         .map(|(_, c)| c.clone())
         .expect("email counts");
     assert_eq!(email.created, 0);
@@ -179,9 +166,10 @@ fn export_mailbox_name_collision_merges_without_create() {
     let base = server.url();
     let api = "/jmap/api";
 
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO mailboxes (id,name,parent_id,role) VALUES
                  (1,'Junk Email',NULL,'junk'),
@@ -189,11 +177,12 @@ fn export_mailbox_name_collision_merges_without_create() {
             [],
         )
         .unwrap();
-        let blob = db::blobs::intern_blob(
-            &conn,
-            b"From: a@x\r\nSubject: spam\r\nMessage-ID: <m-2@h>\r\n\r\nbody",
-        )
-        .unwrap();
+        let blob = db
+            .store()
+            .blobs()
+            .intern(b"From: a@x\r\nSubject: spam\r\nMessage-ID: <m-2@h>\r\n\r\nbody")
+            .unwrap()
+            .get();
         conn.execute(
             "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
              VALUES (?1,'2020-01-01T00:00:00Z','[2]','[\"$seen\"]')",
@@ -275,35 +264,34 @@ fn export_mailbox_name_collision_merges_without_create() {
         .expect(1)
         .create();
 
-    let summary = sync::export::run(
-        CommonConfig {
-            archive: archive.clone(),
-            threads: 1,
-            dry_run: false,
-            max_retries: 1,
-            allow_invalid_certs: false,
-            logger: Logger::from_flags(true, 0),
-        },
-        ExportConfig {
-            connect: ConnectConfig {
-                url: base.clone(),
-                auth: Auth::Basic {
-                    user: "u".into(),
-                    password: "p".into(),
-                },
-                account: AccountSelector::Id("w".into()),
+    let summary = (Export {
+        connect: ConnectConfig {
+            url: base.clone(),
+            auth: Auth::Basic {
+                user: "u".into(),
+                password: "p".into(),
             },
-            objects: None,
-            prune: false,
-            yes: true,
+            account: AccountSelector::Id("w".into()),
         },
-    )
+        objects: None,
+        prune: Prune::Keep,
+        confirm: Confirm::Assume,
+    })
+    .run(RunOptions {
+        archive: archive.clone(),
+        threads: 1,
+        mode: RunMode::Apply,
+        max_retries: 1,
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
+    })
+    .into_result()
     .expect("export run");
 
     let mailbox = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Mailbox")
+        .find(|(t, _)| *t == ObjectType::Mailbox)
         .map(|(_, c)| c.clone())
         .expect("mailbox counts");
     assert_eq!(mailbox.created, 0, "no mailbox is created");
@@ -316,7 +304,7 @@ fn export_mailbox_name_collision_merges_without_create() {
     let email = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Email")
+        .find(|(t, _)| *t == ObjectType::Email)
         .map(|(_, c)| c.clone())
         .expect("email counts");
     assert_eq!(email.created, 1, "the Junk Mail email lands on the target");
@@ -334,19 +322,21 @@ fn export_mailbox_already_exists_maps_existing_id() {
     let base = server.url();
     let api = "/jmap/api";
 
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Junk Mail',NULL,NULL)",
             [],
         )
         .unwrap();
-        let blob = db::blobs::intern_blob(
-            &conn,
-            b"From: a@x\r\nSubject: spam\r\nMessage-ID: <m-3@h>\r\n\r\nbody",
-        )
-        .unwrap();
+        let blob = db
+            .store()
+            .blobs()
+            .intern(b"From: a@x\r\nSubject: spam\r\nMessage-ID: <m-3@h>\r\n\r\nbody")
+            .unwrap()
+            .get();
         conn.execute(
             "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
              VALUES (?1,'2020-01-01T00:00:00Z','[1]','[\"$seen\"]')",
@@ -433,35 +423,34 @@ fn export_mailbox_already_exists_maps_existing_id() {
         .expect(1)
         .create();
 
-    let summary = sync::export::run(
-        CommonConfig {
-            archive: archive.clone(),
-            threads: 1,
-            dry_run: false,
-            max_retries: 1,
-            allow_invalid_certs: false,
-            logger: Logger::from_flags(true, 0),
-        },
-        ExportConfig {
-            connect: ConnectConfig {
-                url: base.clone(),
-                auth: Auth::Basic {
-                    user: "u".into(),
-                    password: "p".into(),
-                },
-                account: AccountSelector::Id("w".into()),
+    let summary = (Export {
+        connect: ConnectConfig {
+            url: base.clone(),
+            auth: Auth::Basic {
+                user: "u".into(),
+                password: "p".into(),
             },
-            objects: None,
-            prune: false,
-            yes: true,
+            account: AccountSelector::Id("w".into()),
         },
-    )
+        objects: None,
+        prune: Prune::Keep,
+        confirm: Confirm::Assume,
+    })
+    .run(RunOptions {
+        archive: archive.clone(),
+        threads: 1,
+        mode: RunMode::Apply,
+        max_retries: 1,
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
+    })
+    .into_result()
     .expect("export run");
 
     let mailbox = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Mailbox")
+        .find(|(t, _)| *t == ObjectType::Mailbox)
         .map(|(_, c)| c.clone())
         .expect("mailbox counts");
     assert_eq!(mailbox.created, 0, "the create collided");
@@ -474,7 +463,7 @@ fn export_mailbox_already_exists_maps_existing_id() {
     let email = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Email")
+        .find(|(t, _)| *t == ObjectType::Email)
         .map(|(_, c)| c.clone())
         .expect("email counts");
     assert_eq!(email.created, 1, "the email lands in the existing folder");
@@ -503,7 +492,8 @@ fn session_body_set_limit(base: &str, max_objects_in_set: u64) -> String {
 }
 
 fn seed_inbox_emails(archive: &Path, n: usize, shared_blob: bool) {
-    let conn = db::init::open(archive).unwrap();
+    let db = Archive::open(archive).unwrap();
+    let conn = db.connection();
     conn.execute(
         "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
         [],
@@ -515,7 +505,7 @@ fn seed_inbox_emails(archive: &Path, n: usize, shared_blob: bool) {
         } else {
             format!("From: a@x\r\nSubject: m{i}\r\nMessage-ID: <m-{i}@h>\r\n\r\nbody {i}")
         };
-        let blob = db::blobs::intern_blob(&conn, raw.as_bytes()).unwrap();
+        let blob = db.store().blobs().intern(raw.as_bytes()).unwrap().get();
         conn.execute(
             "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
              VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]')",
@@ -594,7 +584,7 @@ fn import_cids(body: &[u8]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn export_email_cfg(base: &str) -> ExportConfig {
+fn export_email_cfg(base: &str) -> Export {
     export_cfg_objects(base, vec![ObjectType::Mailbox, ObjectType::Email])
 }
 
@@ -606,7 +596,7 @@ fn email_export_batches_imports_by_max_objects_in_set() {
     // 5 emails with maxObjectsInSet 2 need ceil(5/2) = 3 Email/import calls, none above 2 items.
     let mut server = mockito::Server::new();
     let base = server.url();
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     seed_inbox_emails(&archive, 5, false);
     let _target = mock_empty_target_with_inbox(&mut server, session_body_set_limit(&base, 2));
 
@@ -651,7 +641,10 @@ fn email_export_batches_imports_by_max_objects_in_set() {
 
     let mut cfg = common(&archive);
     cfg.threads = 4;
-    let summary = sync::export::run(cfg, export_email_cfg(&base)).expect("export run");
+    let summary = export_email_cfg(&base)
+        .run(cfg)
+        .into_result()
+        .expect("export run");
 
     let email = email_counts(&summary);
     assert_eq!(email.created, 5);
@@ -669,7 +662,7 @@ fn email_export_counts_mixed_batch_outcomes_per_item() {
     // One batch: e1 created, e2 alreadyExists (skipped), e3 overQuota (failed), e4 omitted (failed).
     let mut server = mockito::Server::new();
     let base = server.url();
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     seed_inbox_emails(&archive, 4, false);
     let _target = mock_empty_target_with_inbox(&mut server, session_body(&base));
 
@@ -693,7 +686,10 @@ fn email_export_counts_mixed_batch_outcomes_per_item() {
         .expect(1)
         .create();
 
-    let summary = sync::export::run(common(&archive), export_email_cfg(&base)).expect("export run");
+    let summary = export_email_cfg(&base)
+        .run(common(&archive))
+        .into_result()
+        .expect("export run");
 
     let email = email_counts(&summary);
     assert_eq!(email.created, 1);
@@ -709,7 +705,7 @@ fn export_email_blob_not_found_reuploads_and_retries() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     seed_inbox_emails(&archive, 2, true);
     let _target = mock_empty_target_with_inbox(&mut server, session_body(&base));
 
@@ -759,7 +755,10 @@ fn export_email_blob_not_found_reuploads_and_retries() {
         .expect(1)
         .create();
 
-    let summary = sync::export::run(common(&archive), export_email_cfg(&base)).expect("export run");
+    let summary = export_email_cfg(&base)
+        .run(common(&archive))
+        .into_result()
+        .expect("export run");
 
     let email = email_counts(&summary);
     assert_eq!(email.created, 2, "both emails end up created");
@@ -778,19 +777,21 @@ fn export_against_divergent_target_key(parse_response: Value, imports: usize) ->
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
             [],
         )
         .unwrap();
-        let blob = db::blobs::intern_blob(
-            &conn,
-            b"Message-ID: <a@h>\r\nMessage-ID: <b@h>\r\nSubject: s\r\n\r\nbody",
-        )
-        .unwrap();
+        let blob = db
+            .store()
+            .blobs()
+            .intern(b"Message-ID: <a@h>\r\nMessage-ID: <b@h>\r\nSubject: s\r\n\r\nbody")
+            .unwrap()
+            .get();
         conn.execute(
             "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords,message_match)
              VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]',?2)",
@@ -837,7 +838,10 @@ fn export_against_divergent_target_key(parse_response: Value, imports: usize) ->
         .expect(imports)
         .create();
 
-    let summary = sync::export::run(common(&archive), export_email_cfg(&base)).expect("export run");
+    let summary = export_email_cfg(&base)
+        .run(common(&archive))
+        .into_result()
+        .expect("export run");
 
     parse.assert();
     import.assert();
@@ -870,29 +874,11 @@ fn export_email_parse_error_falls_back_to_import() {
 }
 
 fn session_body_full(base: &str) -> String {
-    json!({
-        "apiUrl": format!("{base}/jmap/api"),
-        "uploadUrl": format!("{base}/jmap/upload/{{accountId}}/"),
-        "downloadUrl": format!("{base}/jmap/dl/{{accountId}}/{{blobId}}/{{type}}/{{name}}"),
-        "capabilities": { "urn:ietf:params:jmap:core": {
-            "maxObjectsInGet": 500, "maxObjectsInSet": 500, "maxCallsInRequest": 16,
-            "maxConcurrentRequests": 4, "maxConcurrentUpload": 4,
-            "maxSizeRequest": 10000000, "maxSizeUpload": 50000000
-        } },
-        "accounts": { "w": { "name": "alice",
-            "accountCapabilities": {
-                "urn:ietf:params:jmap:mail": {},
-                "urn:ietf:params:jmap:sieve": {},
-                "urn:ietf:params:jmap:contacts": {},
-                "urn:ietf:params:jmap:calendars": {},
-                "urn:ietf:params:jmap:filenode": {}
-            } } }
-    })
-    .to_string()
+    SessionJson::new(base).all_capabilities().build()
 }
 
-fn import_cfg_objects(base: &str, objects: Vec<ObjectType>) -> ImportConfig {
-    ImportConfig {
+fn import_cfg_objects(base: &str, objects: Vec<ObjectType>) -> JmapImport {
+    JmapImport {
         connect: ConnectConfig {
             url: base.to_owned(),
             auth: Auth::Basic {
@@ -901,13 +887,13 @@ fn import_cfg_objects(base: &str, objects: Vec<ObjectType>) -> ImportConfig {
             },
             account: AccountSelector::Id("w".into()),
         },
-        objects: Some(objects),
-        allow_source_change: false,
+        objects: Some(objects.into()),
+        source_change: SourceChange::Reject,
     }
 }
 
-fn export_cfg_objects(base: &str, objects: Vec<ObjectType>) -> ExportConfig {
-    ExportConfig {
+fn export_cfg_objects(base: &str, objects: Vec<ObjectType>) -> Export {
+    Export {
         connect: ConnectConfig {
             url: base.to_owned(),
             auth: Auth::Basic {
@@ -916,26 +902,26 @@ fn export_cfg_objects(base: &str, objects: Vec<ObjectType>) -> ExportConfig {
             },
             account: AccountSelector::Id("w".into()),
         },
-        objects: Some(objects),
-        prune: false,
-        yes: true,
+        objects: Some(objects.into()),
+        prune: Prune::Keep,
+        confirm: Confirm::Assume,
     }
 }
 
-fn common(archive: &Path) -> CommonConfig {
-    CommonConfig {
+fn common(archive: &Path) -> RunOptions {
+    RunOptions {
         archive: archive.to_path_buf(),
         threads: 1,
-        dry_run: false,
+        mode: RunMode::Apply,
         max_retries: 1,
-        allow_invalid_certs: false,
-        logger: Logger::from_flags(true, 0),
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
     }
 }
 
-fn common_dry(archive: &Path) -> CommonConfig {
-    CommonConfig {
-        dry_run: true,
+fn common_dry(archive: &Path) -> RunOptions {
+    RunOptions {
+        mode: RunMode::DryRun,
         ..common(archive)
     }
 }
@@ -961,7 +947,7 @@ fn import_removes_vanished_mailbox_from_archive_on_second_pass() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
 
     let _root = server.mock("GET", "/").with_status(404).create();
     let _wk = server
@@ -995,15 +981,14 @@ fn import_removes_vanished_mailbox_from_archive_on_second_pass() {
         .expect(1)
         .create();
 
-    let s1 = sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
-    )
-    .expect("first import");
+    let s1 = import_cfg_objects(&base, vec![ObjectType::Mailbox])
+        .run(common(&archive))
+        .into_result()
+        .expect("first import");
     let mb1 = s1
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Mailbox")
+        .find(|(t, _)| *t == ObjectType::Mailbox)
         .map(|(_, c)| c.clone())
         .expect("mailbox counts");
     assert_eq!(mb1.fetched, 3, "first pass fetched all three mailboxes");
@@ -1036,15 +1021,14 @@ fn import_removes_vanished_mailbox_from_archive_on_second_pass() {
         .expect(1)
         .create();
 
-    let s2 = sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
-    )
-    .expect("second import");
+    let s2 = import_cfg_objects(&base, vec![ObjectType::Mailbox])
+        .run(common(&archive))
+        .into_result()
+        .expect("second import");
     let mb2 = s2
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Mailbox")
+        .find(|(t, _)| *t == ObjectType::Mailbox)
         .map(|(_, c)| c.clone())
         .expect("mailbox counts");
     assert_eq!(mb2.fetched, 0, "second pass fetches nothing");
@@ -1069,7 +1053,7 @@ fn import_present_item_change_is_propagated_via_changes() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
 
     let _root = server.mock("GET", "/").with_status(404).create();
     let _wk = server
@@ -1101,11 +1085,10 @@ fn import_present_item_change_is_propagated_via_changes() {
         .expect(1)
         .create();
 
-    sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
-    )
-    .expect("first import");
+    import_cfg_objects(&base, vec![ObjectType::Mailbox])
+        .run(common(&archive))
+        .into_result()
+        .expect("first import");
     {
         let conn = rusqlite::Connection::open(&archive).unwrap();
         let cursor: String = conn
@@ -1153,16 +1136,15 @@ fn import_present_item_change_is_propagated_via_changes() {
         .expect(1)
         .create();
 
-    let s2 = sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
-    )
-    .expect("second import");
+    let s2 = import_cfg_objects(&base, vec![ObjectType::Mailbox])
+        .run(common(&archive))
+        .into_result()
+        .expect("second import");
     changes.assert();
     let mb2 = s2
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Mailbox")
+        .find(|(t, _)| *t == ObjectType::Mailbox)
         .map(|(_, c)| c.clone())
         .expect("mailbox counts");
     assert_eq!(mb2.fetched, 0, "no new objects on the second pass");
@@ -1194,7 +1176,7 @@ fn import_removes_vanished_email_and_drops_cross_ref() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
 
     let _root = server.mock("GET", "/").with_status(404).create();
     let _wk = server
@@ -1259,11 +1241,10 @@ fn import_removes_vanished_email_and_drops_cross_ref() {
         .expect(1)
         .create();
 
-    sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
-    )
-    .expect("first import");
+    import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email])
+        .run(common(&archive))
+        .into_result()
+        .expect("first import");
     {
         let conn = rusqlite::Connection::open(&archive).unwrap();
         assert_eq!(
@@ -1314,15 +1295,14 @@ fn import_removes_vanished_email_and_drops_cross_ref() {
         .expect(1)
         .create();
 
-    let s2 = sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
-    )
-    .expect("second import");
+    let s2 = import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email])
+        .run(common(&archive))
+        .into_result()
+        .expect("second import");
     let em2 = s2
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Email")
+        .find(|(t, _)| *t == ObjectType::Email)
         .map(|(_, c)| c.clone())
         .expect("email counts");
     assert_eq!(em2.deleted, 1, "vanished email is deleted from archive");
@@ -1343,7 +1323,7 @@ fn import_unusable_received_at_falls_back_instead_of_dropping_the_email() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
 
     let _root = server.mock("GET", "/").with_status(404).create();
     let _wk = server
@@ -1409,16 +1389,15 @@ fn import_unusable_received_at_falls_back_instead_of_dropping_the_email() {
         .with_body("From: c@x\r\nMessage-ID: <3@h>\r\n\r\nthree")
         .create();
 
-    let summary = sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
-    )
-    .expect("import does not abort on an unusable receivedAt");
+    let summary = import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email])
+        .run(common(&archive))
+        .into_result()
+        .expect("import does not abort on an unusable receivedAt");
 
     let email = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Email")
+        .find(|(t, _)| *t == ObjectType::Email)
         .map(|(_, c)| c.clone())
         .expect("email counts");
     assert_eq!(email.fetched, 3, "no email is dropped over its receivedAt");
@@ -1456,7 +1435,7 @@ fn import_file_node_by_type_and_skips_unknown_type() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
 
     let _root = server.mock("GET", "/").with_status(404).create();
     let _wk = server
@@ -1498,17 +1477,14 @@ fn import_file_node_by_type_and_skips_unknown_type() {
         .with_body("file bytes")
         .create();
 
-    let outcome = sync::import_jmap::run_reporting(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::FileNode]),
-    );
+    let outcome = import_cfg_objects(&base, vec![ObjectType::FileNode]).run(common(&archive));
     assert!(outcome.error.is_none(), "{:?}", outcome.error);
 
     let nodes = outcome
         .summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "FileNode")
+        .find(|(t, _)| *t == ObjectType::FileNode)
         .map(|(_, c)| c.clone())
         .expect("file node counts");
     assert_eq!(nodes.fetched, 3);
@@ -1557,7 +1533,7 @@ fn import_missing_email_blob_is_skipped_and_counted_once() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
 
     let _root = server.mock("GET", "/").with_status(404).create();
     let _wk = server
@@ -1617,16 +1593,15 @@ fn import_missing_email_blob_is_skipped_and_counted_once() {
         .with_body(json!({"status":404,"title":"Not Found"}).to_string())
         .create();
 
-    let summary = sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
-    )
-    .expect("import does not abort on a missing blob");
+    let summary = import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email])
+        .run(common(&archive))
+        .into_result()
+        .expect("import does not abort on a missing blob");
 
     let email = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Email")
+        .find(|(t, _)| *t == ObjectType::Email)
         .map(|(_, c)| c.clone())
         .expect("email counts");
     assert_eq!(
@@ -1665,7 +1640,7 @@ fn import_writes_each_email_blob_before_later_downloads_complete() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     let wal = PathBuf::from(format!("{}-wal", archive.display()));
 
     let _root = server.mock("GET", "/").with_status(404).create();
@@ -1749,11 +1724,10 @@ fn import_writes_each_email_blob_before_later_downloads_complete() {
         );
     }
 
-    let summary = sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
-    )
-    .expect("import succeeds");
+    let summary = import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email])
+        .run(common(&archive))
+        .into_result()
+        .expect("import succeeds");
     assert!(!summary.any_failed());
 
     let seen = wal_seen.lock().unwrap().clone();
@@ -1776,9 +1750,10 @@ fn export_missing_target_email_is_created_on_rerun() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
             [],
@@ -1787,10 +1762,8 @@ fn export_missing_target_email_is_created_on_rerun() {
         for n in 1..=2 {
             let raw =
                 format!("From: a@x\r\nSubject: m{n}\r\nMessage-ID: <m-{n}@h>\r\n\r\nbody {n}",);
-            let blob = db::blobs::intern_blob(&conn, raw.as_bytes()).unwrap();
-            let mm = vandelay::sync::keys::index_to_json(
-                &vandelay::sync::emailmeta::email_index_from_blob(raw.as_bytes()),
-            );
+            let blob = db.store().blobs().intern(raw.as_bytes()).unwrap().get();
+            let mm = EmailMeta::from_blob(raw.as_bytes()).index.to_json();
             conn.execute(
                 "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords,message_match)
                  VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]', ?2)",
@@ -1879,15 +1852,14 @@ fn export_missing_target_email_is_created_on_rerun() {
         .expect(1)
         .create();
 
-    let summary = sync::export::run(
-        common(&archive),
-        export_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
-    )
-    .expect("export");
+    let summary = export_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email])
+        .run(common(&archive))
+        .into_result()
+        .expect("export");
     let email = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Email")
+        .find(|(t, _)| *t == ObjectType::Email)
         .map(|(_, c)| c.clone())
         .expect("email counts");
     assert_eq!(email.skipped, 1, "Message-ID match with X1 skips it");
@@ -1904,19 +1876,18 @@ fn export_email_blake3_fallback_matches_when_no_message_id() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     let raw = "From: a@x\r\nSubject: hello\r\n\r\nno-msg-id-body";
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
             [],
         )
         .unwrap();
-        let blob = db::blobs::intern_blob(&conn, raw.as_bytes()).unwrap();
-        let mm = vandelay::sync::keys::index_to_json(
-            &vandelay::sync::emailmeta::email_index_from_blob(raw.as_bytes()),
-        );
+        let blob = db.store().blobs().intern(raw.as_bytes()).unwrap().get();
+        let mm = EmailMeta::from_blob(raw.as_bytes()).index.to_json();
         conn.execute(
             "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords,message_match)
              VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]', ?2)",
@@ -1925,7 +1896,7 @@ fn export_email_blake3_fallback_matches_when_no_message_id() {
         .unwrap();
     }
 
-    let local_idx = vandelay::sync::emailmeta::email_index_from_blob(raw.as_bytes());
+    let local_idx = EmailMeta::from_blob(raw.as_bytes()).index;
     assert!(local_idx.mids.is_empty(), "blob must lack Message-ID");
 
     let _root = server.mock("GET", "/").with_status(404).create();
@@ -2006,17 +1977,16 @@ fn export_email_blake3_fallback_matches_when_no_message_id() {
         .expect(0)
         .create();
 
-    let summary = sync::export::run(
-        common(&archive),
-        export_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
-    )
-    .expect("export");
+    let summary = export_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email])
+        .run(common(&archive))
+        .into_result()
+        .expect("export");
     no_upload.assert();
     no_import.assert();
     let email = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Email")
+        .find(|(t, _)| *t == ObjectType::Email)
         .map(|(_, c)| c.clone())
         .expect("email counts");
     assert_eq!(email.skipped, 1, "BLAKE3 fallback matched target");
@@ -2030,9 +2000,10 @@ fn export_leaves_an_existing_target_default_address_book_alone() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO address_books (id,name,description,is_default)
              VALUES (1,'Contacts',NULL,1)",
@@ -2080,11 +2051,10 @@ fn export_leaves_an_existing_target_default_address_book_alone() {
         .expect(1)
         .create();
 
-    sync::export::run(
-        common(&archive),
-        export_cfg_objects(&base, vec![ObjectType::AddressBook]),
-    )
-    .expect("export");
+    export_cfg_objects(&base, vec![ObjectType::AddressBook])
+        .run(common(&archive))
+        .into_result()
+        .expect("export");
     create.assert();
     no_default_set.assert();
     let _ = std::fs::remove_file(&archive);
@@ -2095,9 +2065,10 @@ fn export_claims_the_default_address_book_when_the_target_has_none() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO address_books (id,name,description,is_default)
              VALUES (1,'Contacts',NULL,1)",
@@ -2145,13 +2116,63 @@ fn export_claims_the_default_address_book_when_the_target_has_none() {
         .expect(1)
         .create();
 
-    sync::export::run(
-        common(&archive),
-        export_cfg_objects(&base, vec![ObjectType::AddressBook]),
-    )
-    .expect("export");
+    export_cfg_objects(&base, vec![ObjectType::AddressBook])
+        .run(common(&archive))
+        .into_result()
+        .expect("export");
     create.assert();
     default_set.assert();
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_dry_run_does_not_claim_the_default_address_book() {
+    // A dry run must not send onSuccessSetIsDefault for a synthetic dry-run id.
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp_archive("mocksync");
+    {
+        let archive = Archive::open(&archive).unwrap();
+        archive
+            .connection()
+            .execute(
+                "INSERT INTO address_books (id,name,description,is_default)
+                 VALUES (1,'Contacts',NULL,1)",
+                [],
+            )
+            .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _g = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("AddressBook/get".into()))
+        .with_body(
+            json!({"methodResponses":[["AddressBook/get",{"accountId":"w","list":[
+                {"id":"P","name":"Personal","isDefault":false,"myRights":{"mayDelete":true}}
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let no_set = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("/set".into()))
+        .expect(0)
+        .create();
+
+    let summary = export_cfg_objects(&base, vec![ObjectType::AddressBook])
+        .run(common_dry(&archive))
+        .into_result()
+        .expect("dry-run export");
+    assert!(!summary.any_failed(), "{summary:?}");
+    no_set.assert();
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -2160,7 +2181,7 @@ fn import_never_stores_two_default_address_books() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
 
     let _root = server.mock("GET", "/").with_status(404).create();
     let _wk = server
@@ -2180,15 +2201,14 @@ fn import_never_stores_two_default_address_books() {
         )
         .create();
 
-    let summary = sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::AddressBook]),
-    )
-    .expect("import");
+    let summary = import_cfg_objects(&base, vec![ObjectType::AddressBook])
+        .run(common(&archive))
+        .into_result()
+        .expect("import");
     let books = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "AddressBook")
+        .find(|(t, _)| *t == ObjectType::AddressBook)
         .map(|(_, c)| c.clone())
         .expect("address book counts");
     assert_eq!(books.fetched, 2, "both address books are imported");
@@ -2221,9 +2241,10 @@ fn export_address_book_creates_only_missing() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO address_books (id,name,description,is_default)
              VALUES (1,'Personal',NULL,1)",
@@ -2270,16 +2291,15 @@ fn export_address_book_creates_only_missing() {
         .expect(1)
         .create();
 
-    let summary = sync::export::run(
-        common(&archive),
-        export_cfg_objects(&base, vec![ObjectType::AddressBook]),
-    )
-    .expect("export");
+    let summary = export_cfg_objects(&base, vec![ObjectType::AddressBook])
+        .run(common(&archive))
+        .into_result()
+        .expect("export");
     create.assert();
     let counts = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "AddressBook")
+        .find(|(t, _)| *t == ObjectType::AddressBook)
         .map(|(_, c)| c.clone())
         .expect("address book counts");
     assert_eq!(counts.skipped, 1, "Personal matches existing (case-fold)");
@@ -2293,9 +2313,10 @@ fn export_calendar_creates_only_missing() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO calendars (id,name,is_default) VALUES (1,'Family',1)",
             [],
@@ -2339,16 +2360,15 @@ fn export_calendar_creates_only_missing() {
         .expect(1)
         .create();
 
-    let summary = sync::export::run(
-        common(&archive),
-        export_cfg_objects(&base, vec![ObjectType::Calendar]),
-    )
-    .expect("export");
+    let summary = export_cfg_objects(&base, vec![ObjectType::Calendar])
+        .run(common(&archive))
+        .into_result()
+        .expect("export");
     create.assert();
     let counts = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Calendar")
+        .find(|(t, _)| *t == ObjectType::Calendar)
         .map(|(_, c)| c.clone())
         .expect("calendar counts");
     assert_eq!(counts.skipped, 1, "Family matches existing (case-fold)");
@@ -2363,9 +2383,10 @@ fn export_calendar_normalizes_colors() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO calendars (id,name,color,is_default) VALUES
                 (1,'Sogo','#AAAAAAFF',0), (2,'Short','#abcd',0), (3,'Odd','rgba(1,2,3,0.5)',0)",
@@ -2407,16 +2428,15 @@ fn export_calendar_normalizes_colors() {
         .expect(1)
         .create();
 
-    let summary = sync::export::run(
-        common(&archive),
-        export_cfg_objects(&base, vec![ObjectType::Calendar]),
-    )
-    .expect("export");
+    let summary = export_cfg_objects(&base, vec![ObjectType::Calendar])
+        .run(common(&archive))
+        .into_result()
+        .expect("export");
     create.assert();
     let counts = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Calendar")
+        .find(|(t, _)| *t == ObjectType::Calendar)
         .map(|(_, c)| c.clone())
         .expect("calendar counts");
     assert_eq!(counts.created, 3);
@@ -2429,11 +2449,12 @@ fn export_contact_and_event_blobs_are_inlined_never_blob_ids() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     let photo: &[u8] = b"\x89PNG\r\n\x1a\nfake-photo-bytes";
     let agenda: &[u8] = b"agenda for the review meeting";
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO address_books (id,name,is_default) VALUES (1,'Personal',1)",
             [],
@@ -2444,8 +2465,8 @@ fn export_contact_and_event_blobs_are_inlined_never_blob_ids() {
             [],
         )
         .unwrap();
-        let photo_blob = db::blobs::intern_blob(&conn, photo).unwrap();
-        let agenda_blob = db::blobs::intern_blob(&conn, agenda).unwrap();
+        let photo_blob = db.store().blobs().intern(photo).unwrap().get();
+        let agenda_blob = db.store().blobs().intern(agenda).unwrap().get();
         let card = json!({
             "@type": "Card",
             "version": "1.0",
@@ -2603,18 +2624,17 @@ fn export_contact_and_event_blobs_are_inlined_never_blob_ids() {
         .expect(1)
         .create();
 
-    let summary = sync::export::run(
-        common(&archive),
-        export_cfg_objects(
-            &base,
-            vec![
-                ObjectType::AddressBook,
-                ObjectType::Calendar,
-                ObjectType::ContactCard,
-                ObjectType::CalendarEvent,
-            ],
-        ),
+    let summary = export_cfg_objects(
+        &base,
+        vec![
+            ObjectType::AddressBook,
+            ObjectType::Calendar,
+            ObjectType::ContactCard,
+            ObjectType::CalendarEvent,
+        ],
     )
+    .run(common(&archive))
+    .into_result()
     .expect("export");
 
     no_blob_id_in_card.assert();
@@ -2622,15 +2642,15 @@ fn export_contact_and_event_blobs_are_inlined_never_blob_ids() {
     card_inlined.assert();
     event_inlined.assert();
 
-    for name in ["ContactCard", "CalendarEvent"] {
+    for name in [ObjectType::ContactCard, ObjectType::CalendarEvent] {
         let counts = summary
             .per_type
             .iter()
             .find(|(t, _)| *t == name)
             .map(|(_, c)| c.clone())
-            .unwrap_or_else(|| panic!("{name} counts"));
-        assert_eq!(counts.created, 1, "{name} created: {counts:?}");
-        assert_eq!(counts.failed, 0, "{name} failed: {counts:?}");
+            .unwrap_or_else(|| panic!("{name:?} counts"));
+        assert_eq!(counts.created, 1, "{name:?} created: {counts:?}");
+        assert_eq!(counts.failed, 0, "{name:?} failed: {counts:?}");
     }
     let _ = std::fs::remove_file(&archive);
 }
@@ -2660,16 +2680,17 @@ fn export_oversized_contact_card_fails_alone_and_the_type_keeps_going() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO address_books (id,name,is_default) VALUES (1,'Personal',1)",
             [],
         )
         .unwrap();
         let photo = vec![b'P'; 8000];
-        let photo_blob = db::blobs::intern_blob(&conn, &photo).unwrap();
+        let photo_blob = db.store().blobs().intern(&photo).unwrap().get();
         let huge = json!({
             "@type": "Card",
             "name": { "full": "Photo Person" },
@@ -2770,16 +2791,15 @@ fn export_oversized_contact_card_fails_alone_and_the_type_keeps_going() {
         .expect(1)
         .create();
 
-    let summary = sync::export::run(
-        common(&archive),
-        ExportConfig {
-            prune: true,
-            ..export_cfg_objects(
-                &base,
-                vec![ObjectType::AddressBook, ObjectType::ContactCard],
-            )
-        },
-    )
+    let summary = (Export {
+        prune: Prune::Destroy,
+        ..export_cfg_objects(
+            &base,
+            vec![ObjectType::AddressBook, ObjectType::ContactCard],
+        )
+    })
+    .run(common(&archive))
+    .into_result()
     .expect("the oversized card must not abort the run");
 
     created.assert();
@@ -2787,7 +2807,7 @@ fn export_oversized_contact_card_fails_alone_and_the_type_keeps_going() {
     let counts = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "ContactCard")
+        .find(|(t, _)| *t == ObjectType::ContactCard)
         .map(|(_, c)| c.clone())
         .expect("ContactCard counts");
     assert_eq!(counts.created, 1, "{counts:?}");
@@ -2804,15 +2824,16 @@ fn export_archive_read_failure_while_inlining_exits_seven() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO address_books (id,name,is_default) VALUES (1,'Personal',1)",
             [],
         )
         .unwrap();
-        let photo_blob = db::blobs::intern_blob(&conn, b"photo-bytes").unwrap();
+        let photo_blob = db.store().blobs().intern(b"photo-bytes").unwrap().get();
         let card = json!({
             "@type": "Card",
             "media": { "photo": { "@type": "Media", "kind": "photo",
@@ -2855,15 +2876,92 @@ fn export_archive_read_failure_while_inlining_exits_seven() {
         .expect(0)
         .create();
 
-    let err = sync::export::run(
-        common(&archive),
-        export_cfg_objects(&base, vec![ObjectType::ContactCard]),
-    )
-    .expect_err("an unreadable blobs table must abort the run");
+    let err = export_cfg_objects(&base, vec![ObjectType::ContactCard])
+        .run(common(&archive))
+        .into_result()
+        .expect_err("an unreadable blobs table must abort the run");
 
     no_create.assert();
     assert!(err.aborts_run(), "{err}");
-    assert_eq!(err.exit_code(), 7, "{err}");
+    assert_eq!(err.exit_status(), ExitStatus::Archive, "{err}");
+    let _ = std::fs::remove_file(&archive);
+}
+
+// An export abort keeps the per-type counts of the types already reconciled (R15).
+#[test]
+fn export_abort_keeps_the_counts_of_finished_types() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp_archive("mocksync");
+    {
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
+        conn.execute(
+            "INSERT INTO address_books (id,name,is_default) VALUES (1,'Personal',1)",
+            [],
+        )
+        .unwrap();
+        let photo_blob = db.store().blobs().intern(b"photo-bytes").unwrap().get();
+        let card = json!({
+            "@type": "Card",
+            "media": { "photo": { "@type": "Media", "kind": "photo",
+                "@blob": photo_blob, "mediaType": "image/png" } }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO contact_cards (id,uid,address_book_ids,data)
+             VALUES (1,'card-uid-1','[1]',?1)",
+            [card.as_str()],
+        )
+        .unwrap();
+        conn.execute("ALTER TABLE blobs RENAME COLUMN data TO payload", [])
+            .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _ab_get = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("AddressBook/get".into()))
+        .with_body(
+            json!({"methodResponses":[["AddressBook/get",{"accountId":"w","state":"s1",
+                "list":[{"id":"TAB","name":"Personal","isDefault":true}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let _cc_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("ContactCard/query".into()))
+        .with_body(
+            json!({"methodResponses":[["ContactCard/query",{"accountId":"w","ids":[]},"q"]]})
+                .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+
+    let outcome = export_cfg_objects(
+        &base,
+        vec![ObjectType::AddressBook, ObjectType::ContactCard],
+    )
+    .run(common(&archive));
+
+    let err = outcome
+        .error
+        .as_ref()
+        .expect("the unreadable blobs table aborts");
+    assert_eq!(err.exit_status(), ExitStatus::Archive, "{err}");
+    let books = outcome
+        .summary
+        .get(ObjectType::AddressBook)
+        .expect("finished type keeps its counts");
+    assert_eq!(books.skipped, 1);
+    assert!(outcome.summary.get(ObjectType::ContactCard).is_some());
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -2873,9 +2971,10 @@ fn export_skips_participant_identities() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO participant_identities (id,name,calendar_address,is_default)
              VALUES (1,'Bob','mailto:bob@example.org',1)",
@@ -2918,14 +3017,14 @@ fn export_skips_participant_identities() {
         vec![ObjectType::ParticipantIdentity],
     ] {
         let mut config = export_cfg_objects(&base, objects);
-        config.prune = true;
-        let summary = sync::export::run(common(&archive), config).expect("export");
+        config.prune = Prune::Destroy;
+        let summary = config.run(common(&archive)).into_result().expect("export");
         assert!(!summary.any_failed(), "{:?}", summary.per_type);
         assert!(
             summary
                 .per_type
                 .iter()
-                .all(|(t, _)| *t != "ParticipantIdentity")
+                .all(|(t, _)| *t != ObjectType::ParticipantIdentity)
         );
     }
     participant.assert();
@@ -2938,13 +3037,14 @@ fn export_sieve_script_matches_by_name_not_content() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     let keepall_local = b"require [\"fileinto\"];\nkeep;\n";
     let reject_local = b"require [\"reject\"];\nreject \"go away\";\n";
     {
-        let conn = db::init::open(&archive).unwrap();
-        let blob1 = db::blobs::intern_blob(&conn, keepall_local).unwrap();
-        let blob2 = db::blobs::intern_blob(&conn, reject_local).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
+        let blob1 = db.store().blobs().intern(keepall_local).unwrap().get();
+        let blob2 = db.store().blobs().intern(reject_local).unwrap().get();
         conn.execute(
             "INSERT INTO sieve_scripts (id,name,is_active,blob_id) VALUES (1,'keepall',1,?1)",
             rusqlite::params![blob1],
@@ -3006,18 +3106,17 @@ fn export_sieve_script_matches_by_name_not_content() {
         .expect(1)
         .create();
 
-    let summary = sync::export::run(
-        common(&archive),
-        export_cfg_objects(&base, vec![ObjectType::SieveScript]),
-    )
-    .expect("export");
+    let summary = export_cfg_objects(&base, vec![ObjectType::SieveScript])
+        .run(common(&archive))
+        .into_result()
+        .expect("export");
     upload.assert();
     create.assert();
     no_download.assert();
     let counts = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "SieveScript")
+        .find(|(t, _)| *t == ObjectType::SieveScript)
         .map(|(_, c)| c.clone())
         .expect("sieve counts");
     assert_eq!(
@@ -3044,10 +3143,11 @@ fn export_sieve_prune_destroys_stale_active_script() {
 fn prune_sieve_with_archive_active(archive_active: bool, expected_active: Option<&str>) {
     let mut server = mockito::Server::new();
     let base = server.url();
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let conn = db::init::open(&archive).unwrap();
-        let blob = db::blobs::intern_blob(&conn, b"keep;\n").unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
+        let blob = db.store().blobs().intern(b"keep;\n").unwrap().get();
         conn.execute(
             "INSERT INTO sieve_scripts (id,name,is_active,blob_id) VALUES (1,'main',?1,?2)",
             rusqlite::params![archive_active, blob],
@@ -3101,8 +3201,8 @@ fn prune_sieve_with_archive_active(archive_active: bool, expected_active: Option
     });
 
     let mut config = export_cfg_objects(&base, vec![ObjectType::SieveScript]);
-    config.prune = true;
-    let summary = sync::export::run(common(&archive), config).expect("export");
+    config.prune = Prune::Destroy;
+    let summary = config.run(common(&archive)).into_result().expect("export");
     assert!(!summary.any_failed(), "{:?}", summary.per_type);
     let destroyed: Vec<Value> = log
         .lock()
@@ -3120,11 +3220,12 @@ fn export_sieve_scripts_identical_content_different_names_both_created() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     let shared = b"require [\"fileinto\"];\nfileinto \"Archive\";\n";
     {
-        let conn = db::init::open(&archive).unwrap();
-        let blob = db::blobs::intern_blob(&conn, shared).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
+        let blob = db.store().blobs().intern(shared).unwrap().get();
         conn.execute(
             "INSERT INTO sieve_scripts (id,name,is_active,blob_id) VALUES (1,'duplicate-A',0,?1)",
             rusqlite::params![blob],
@@ -3201,18 +3302,17 @@ fn export_sieve_scripts_identical_content_different_names_both_created() {
         .expect(1)
         .create();
 
-    let summary = sync::export::run(
-        common(&archive),
-        export_cfg_objects(&base, vec![ObjectType::SieveScript]),
-    )
-    .expect("export");
+    let summary = export_cfg_objects(&base, vec![ObjectType::SieveScript])
+        .run(common(&archive))
+        .into_result()
+        .expect("export");
     upload.assert();
     create_a.assert();
     create_b.assert();
     let counts = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "SieveScript")
+        .find(|(t, _)| *t == ObjectType::SieveScript)
         .map(|(_, c)| c.clone())
         .expect("sieve counts");
     assert_eq!(
@@ -3232,11 +3332,12 @@ fn export_sieve_blob_not_found_on_dedup_reuse_reuploads_and_retries() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     let shared = b"require [\"fileinto\"];\nfileinto \"Archive\";\n";
     {
-        let conn = db::init::open(&archive).unwrap();
-        let blob = db::blobs::intern_blob(&conn, shared).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
+        let blob = db.store().blobs().intern(shared).unwrap().get();
         conn.execute(
             "INSERT INTO sieve_scripts (id,name,is_active,blob_id) VALUES (1,'dup-A',0,?1)",
             rusqlite::params![blob],
@@ -3325,11 +3426,10 @@ fn export_sieve_blob_not_found_on_dedup_reuse_reuploads_and_retries() {
         .expect(1)
         .create();
 
-    let summary = sync::export::run(
-        common(&archive),
-        export_cfg_objects(&base, vec![ObjectType::SieveScript]),
-    )
-    .expect("export");
+    let summary = export_cfg_objects(&base, vec![ObjectType::SieveScript])
+        .run(common(&archive))
+        .into_result()
+        .expect("export");
     up1.assert();
     up2.assert();
     create_a.assert();
@@ -3338,7 +3438,7 @@ fn export_sieve_blob_not_found_on_dedup_reuse_reuploads_and_retries() {
     let counts = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "SieveScript")
+        .find(|(t, _)| *t == ObjectType::SieveScript)
         .map(|(_, c)| c.clone())
         .expect("sieve counts");
     assert_eq!(
@@ -3357,7 +3457,7 @@ fn import_deeply_nested_mailbox_tree_orders_correctly() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     const DEPTH: usize = 10;
 
     let ids: Vec<String> = (0..DEPTH).map(|i| format!("L{i}")).collect();
@@ -3404,11 +3504,10 @@ fn import_deeply_nested_mailbox_tree_orders_correctly() {
         .expect(1)
         .create();
 
-    let summary = sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
-    )
-    .expect("import");
+    let summary = import_cfg_objects(&base, vec![ObjectType::Mailbox])
+        .run(common(&archive))
+        .into_result()
+        .expect("import");
     assert!(!summary.any_failed(), "import had failures: {summary:?}");
 
     let conn = rusqlite::Connection::open(&archive).unwrap();
@@ -3444,9 +3543,10 @@ fn export_dry_run_sends_no_mutating_calls() {
     let base = server.url();
     let api = "/jmap/api";
 
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
             [],
@@ -3457,11 +3557,12 @@ fn export_dry_run_sends_no_mutating_calls() {
             [],
         )
         .unwrap();
-        let blob = db::blobs::intern_blob(
-            &conn,
-            b"From: a@x\r\nSubject: hi\r\nMessage-ID: <m-1@h>\r\n\r\nbody",
-        )
-        .unwrap();
+        let blob = db
+            .store()
+            .blobs()
+            .intern(b"From: a@x\r\nSubject: hi\r\nMessage-ID: <m-1@h>\r\n\r\nbody")
+            .unwrap()
+            .get();
         conn.execute(
             "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
              VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]')",
@@ -3506,11 +3607,10 @@ fn export_dry_run_sends_no_mutating_calls() {
         .expect(0)
         .create();
 
-    let summary = sync::export::run(
-        common_dry(&archive),
-        export_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
-    )
-    .expect("dry-run export must succeed");
+    let summary = export_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email])
+        .run(common_dry(&archive))
+        .into_result()
+        .expect("dry-run export must succeed");
     assert!(
         !summary.any_failed(),
         "dry-run summary should not record failures: {summary:?}"
@@ -3527,9 +3627,9 @@ fn import_dry_run_does_not_write_archive_or_download_blobs() {
     let base = server.url();
     let api = "/jmap/api";
 
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let _ = db::init::open(&archive).unwrap();
+        let _ = Archive::open(&archive).unwrap();
     }
 
     let _root = server.mock("GET", "/").with_status(404).create();
@@ -3564,11 +3664,10 @@ fn import_dry_run_does_not_write_archive_or_download_blobs() {
         .expect(0)
         .create();
 
-    let summary = sync::import_jmap::run(
-        common_dry(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
-    )
-    .expect("dry-run import must succeed");
+    let summary = import_cfg_objects(&base, vec![ObjectType::Mailbox])
+        .run(common_dry(&archive))
+        .into_result()
+        .expect("dry-run import must succeed");
     assert!(
         !summary.any_failed(),
         "dry-run import should not record failures: {summary:?}"
@@ -3590,12 +3689,86 @@ fn import_dry_run_does_not_write_archive_or_download_blobs() {
     let _ = std::fs::remove_file(&archive);
 }
 
+// A per-type failure in a JMAP import dry run is kept in the summary, so the run exits 5.
+#[test]
+fn import_dry_run_keeps_per_type_failures() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp_archive("mocksync");
+    {
+        let _ = Archive::open(&archive).unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .create();
+    let _mq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(json!({"methodResponses":[["error",{"type":"forbidden"},"q"]]}).to_string())
+        .create();
+
+    let outcome = import_cfg_objects(&base, vec![ObjectType::Mailbox]).run(common_dry(&archive));
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    assert_eq!(
+        outcome.summary.get(ObjectType::Mailbox).map(|c| c.failed),
+        Some(1),
+        "{:?}",
+        outcome.summary
+    );
+    assert_eq!(outcome.summary.failed(), 1);
+    let _ = std::fs::remove_file(&archive);
+}
+
+// A per-type failure in a JMAP export dry run is kept in the summary, so the run exits 5.
+#[test]
+fn export_dry_run_keeps_per_type_failures() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp_archive("mocksync");
+    {
+        let db = Archive::open(&archive).unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
+                [],
+            )
+            .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .create();
+    let _mq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/".into()))
+        .with_body(json!({"methodResponses":[["error",{"type":"forbidden"},"q"]]}).to_string())
+        .create();
+
+    let outcome = export_cfg_objects(&base, vec![ObjectType::Mailbox]).run(common_dry(&archive));
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    assert_eq!(
+        outcome.summary.get(ObjectType::Mailbox).map(|c| c.failed),
+        Some(1),
+        "{:?}",
+        outcome.summary
+    );
+    assert_eq!(outcome.summary.failed(), 1);
+    let _ = std::fs::remove_file(&archive);
+}
+
 #[test]
 fn import_email_keyword_change_is_propagated_without_blob_refetch() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
 
     let _root = server.mock("GET", "/").with_status(404).create();
     let _wk = server
@@ -3646,11 +3819,10 @@ fn import_email_keyword_change_is_propagated_without_blob_refetch() {
         .expect(1)
         .create();
 
-    sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
-    )
-    .expect("first import");
+    import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email])
+        .run(common(&archive))
+        .into_result()
+        .expect("first import");
 
     let _mbq2 = server
         .mock("POST", api)
@@ -3699,17 +3871,16 @@ fn import_email_keyword_change_is_propagated_without_blob_refetch() {
         .expect(0)
         .create();
 
-    let s2 = sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
-    )
-    .expect("second import");
+    let s2 = import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email])
+        .run(common(&archive))
+        .into_result()
+        .expect("second import");
     echanges.assert();
     no_blob_refetch.assert();
     let em2 = s2
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Email")
+        .find(|(t, _)| *t == ObjectType::Email)
         .map(|(_, c)| c.clone())
         .expect("email counts");
     assert_eq!(em2.updated, 1, "the changed email is refreshed");
@@ -3737,7 +3908,7 @@ fn import_cannot_calculate_changes_falls_back_to_full_refresh() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
 
     let _root = server.mock("GET", "/").with_status(404).create();
     let _wk = server
@@ -3765,11 +3936,10 @@ fn import_cannot_calculate_changes_falls_back_to_full_refresh() {
         .expect(1)
         .create();
 
-    sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
-    )
-    .expect("first import");
+    import_cfg_objects(&base, vec![ObjectType::Mailbox])
+        .run(common(&archive))
+        .into_result()
+        .expect("first import");
 
     let _q2 = server
         .mock("POST", api)
@@ -3810,18 +3980,17 @@ fn import_cannot_calculate_changes_falls_back_to_full_refresh() {
         .expect(1)
         .create();
 
-    let s2 = sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
-    )
-    .expect("second import");
+    let s2 = import_cfg_objects(&base, vec![ObjectType::Mailbox])
+        .run(common(&archive))
+        .into_result()
+        .expect("second import");
     cannot.assert();
     capture_state.assert();
     refresh_get.assert();
     let mb2 = s2
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Mailbox")
+        .find(|(t, _)| *t == ObjectType::Mailbox)
         .map(|(_, c)| c.clone())
         .expect("mailbox counts");
     assert_eq!(mb2.updated, 1, "fallback refreshes the present object");
@@ -3849,7 +4018,7 @@ fn import_failed_update_holds_cursor_for_retry() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
 
     let _root = server.mock("GET", "/").with_status(404).create();
     let _wk = server
@@ -3900,11 +4069,10 @@ fn import_failed_update_holds_cursor_for_retry() {
         .expect(1)
         .create();
 
-    sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
-    )
-    .expect("first import");
+    import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email])
+        .run(common(&archive))
+        .into_result()
+        .expect("first import");
 
     let _mbq2 = server
         .mock("POST", api)
@@ -3948,16 +4116,15 @@ fn import_failed_update_holds_cursor_for_retry() {
         .expect(1)
         .create();
 
-    let s2 = sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
-    )
-    .expect("second import");
+    let s2 = import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email])
+        .run(common(&archive))
+        .into_result()
+        .expect("second import");
     bad_update.assert();
     let em2 = s2
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Email")
+        .find(|(t, _)| *t == ObjectType::Email)
         .map(|(_, c)| c.clone())
         .expect("email counts");
     assert_eq!(
@@ -3985,7 +4152,7 @@ fn import_unknown_method_changes_falls_back_to_full_refresh() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
 
     let _root = server.mock("GET", "/").with_status(404).create();
     let _wk = server
@@ -4013,11 +4180,10 @@ fn import_unknown_method_changes_falls_back_to_full_refresh() {
         .expect(1)
         .create();
 
-    sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
-    )
-    .expect("first import");
+    import_cfg_objects(&base, vec![ObjectType::Mailbox])
+        .run(common(&archive))
+        .into_result()
+        .expect("first import");
 
     let _q2 = server
         .mock("POST", api)
@@ -4055,17 +4221,16 @@ fn import_unknown_method_changes_falls_back_to_full_refresh() {
         .expect(1)
         .create();
 
-    let s2 = sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
-    )
-    .expect("second import");
+    let s2 = import_cfg_objects(&base, vec![ObjectType::Mailbox])
+        .run(common(&archive))
+        .into_result()
+        .expect("second import");
     unknown.assert();
     refresh_get.assert();
     let mb2 = s2
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Mailbox")
+        .find(|(t, _)| *t == ObjectType::Mailbox)
         .map(|(_, c)| c.clone())
         .expect("mailbox counts");
     assert_eq!(
@@ -4092,7 +4257,7 @@ fn import_sieve_script_reimport_unchanged_is_convergent() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
 
     let _root = server.mock("GET", "/").with_status(404).create();
     let _wk = server
@@ -4122,11 +4287,10 @@ fn import_sieve_script_reimport_unchanged_is_convergent() {
         .expect(1)
         .create();
 
-    sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::SieveScript]),
-    )
-    .expect("first import");
+    import_cfg_objects(&base, vec![ObjectType::SieveScript])
+        .run(common(&archive))
+        .into_result()
+        .expect("first import");
 
     let _q2 = server
         .mock("POST", api)
@@ -4144,15 +4308,14 @@ fn import_sieve_script_reimport_unchanged_is_convergent() {
         .expect(1)
         .create();
 
-    let s2 = sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::SieveScript]),
-    )
-    .expect("second import");
+    let s2 = import_cfg_objects(&base, vec![ObjectType::SieveScript])
+        .run(common(&archive))
+        .into_result()
+        .expect("second import");
     let ss = s2
         .per_type
         .iter()
-        .find(|(t, _)| *t == "SieveScript")
+        .find(|(t, _)| *t == ObjectType::SieveScript)
         .map(|(_, c)| c.clone())
         .expect("sieve counts");
     assert_eq!(ss.created, 0, "no new scripts");
@@ -4168,7 +4331,7 @@ fn import_sieve_script_content_change_is_propagated() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
 
     let _root = server.mock("GET", "/").with_status(404).create();
     let _wk = server
@@ -4202,11 +4365,10 @@ fn import_sieve_script_content_change_is_propagated() {
         .expect(1)
         .create();
 
-    sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::SieveScript]),
-    )
-    .expect("first import");
+    import_cfg_objects(&base, vec![ObjectType::SieveScript])
+        .run(common(&archive))
+        .into_result()
+        .expect("first import");
 
     let _q2 = server
         .mock("POST", api)
@@ -4224,15 +4386,14 @@ fn import_sieve_script_content_change_is_propagated() {
         .expect(1)
         .create();
 
-    let s2 = sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::SieveScript]),
-    )
-    .expect("second import");
+    let s2 = import_cfg_objects(&base, vec![ObjectType::SieveScript])
+        .run(common(&archive))
+        .into_result()
+        .expect("second import");
     let ss = s2
         .per_type
         .iter()
-        .find(|(t, _)| *t == "SieveScript")
+        .find(|(t, _)| *t == ObjectType::SieveScript)
         .map(|(_, c)| c.clone())
         .expect("sieve counts");
     assert_eq!(
@@ -4260,7 +4421,7 @@ fn first_run_cursor_is_captured_up_front_not_from_the_fetch() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
 
     let _root = server.mock("GET", "/").with_status(404).create();
     let _wk = server
@@ -4302,11 +4463,10 @@ fn first_run_cursor_is_captured_up_front_not_from_the_fetch() {
         .expect(1)
         .create();
 
-    sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
-    )
-    .expect("import");
+    import_cfg_objects(&base, vec![ObjectType::Mailbox])
+        .run(common(&archive))
+        .into_result()
+        .expect("import");
     let cursor: String = rusqlite::Connection::open(&archive)
         .unwrap()
         .query_row(
@@ -4327,9 +4487,10 @@ fn export_duplicate_role_mailbox_created_as_plain_folder_keeping_subtree() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
             [],
@@ -4425,11 +4586,10 @@ fn export_duplicate_role_mailbox_created_as_plain_folder_keeping_subtree() {
         .expect(1)
         .create();
 
-    let summary = sync::export::run(
-        common(&archive),
-        export_cfg_objects(&base, vec![ObjectType::Mailbox]),
-    )
-    .expect("export");
+    let summary = export_cfg_objects(&base, vec![ObjectType::Mailbox])
+        .run(common(&archive))
+        .into_result()
+        .expect("export");
 
     role_create.assert();
     folder_create.assert();
@@ -4438,7 +4598,7 @@ fn export_duplicate_role_mailbox_created_as_plain_folder_keeping_subtree() {
     let counts = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Mailbox")
+        .find(|(t, _)| *t == ObjectType::Mailbox)
         .map(|(_, c)| c.clone())
         .expect("mailbox counts");
     assert_eq!(
@@ -4458,7 +4618,7 @@ fn import_jmap_duplicate_role_is_deduplicated_to_single_mailbox() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
 
     let _root = server.mock("GET", "/").with_status(404).create();
     let _wk = server
@@ -4492,11 +4652,10 @@ fn import_jmap_duplicate_role_is_deduplicated_to_single_mailbox() {
         .expect(1)
         .create();
 
-    sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
-    )
-    .expect("import");
+    import_cfg_objects(&base, vec![ObjectType::Mailbox])
+        .run(common(&archive))
+        .into_result()
+        .expect("import");
 
     let conn = rusqlite::Connection::open(&archive).unwrap();
     let total: i64 = conn
@@ -4529,9 +4688,10 @@ fn export_aborts_with_exit_two_when_the_advertised_api_url_is_unreachable() {
     let mut api_host = mockito::Server::new();
     let session_base = session_host.url();
     let api_base = api_host.url();
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     {
-        let conn = db::init::open(&archive).unwrap();
+        let db = Archive::open(&archive).unwrap();
+        let conn = db.connection();
         conn.execute(
             "INSERT INTO mailboxes (id,name,parent_id,role,sort_order,is_subscribed)
              VALUES (1,'Inbox',NULL,'inbox',0,1)",
@@ -4560,27 +4720,30 @@ fn export_aborts_with_exit_two_when_the_advertised_api_url_is_unreachable() {
         .expect(1)
         .create();
 
-    let err = sync::export::run(
-        CommonConfig {
-            archive: archive.clone(),
-            threads: 1,
-            dry_run: false,
-            max_retries: 0,
-            allow_invalid_certs: false,
-            logger: Logger::from_flags(true, 0),
-        },
-        export_cfg_objects(
-            &session_base,
-            vec![ObjectType::Mailbox, ObjectType::AddressBook],
-        ),
+    let err = export_cfg_objects(
+        &session_base,
+        vec![ObjectType::Mailbox, ObjectType::AddressBook],
     )
+    .run(RunOptions {
+        archive: archive.clone(),
+        threads: 1,
+        mode: RunMode::Apply,
+        max_retries: 0,
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
+    })
+    .into_result()
     .expect_err("an unreachable apiUrl must abort the run");
 
     assert!(
         matches!(err, vandelay::error::Error::Connection(_)),
         "a 404 from the advertised apiUrl is a whole-run connection failure, got {err:?}"
     );
-    assert_eq!(err.exit_code(), 2, "must not report a partial failure");
+    assert_eq!(
+        err.exit_status(),
+        ExitStatus::Connection,
+        "must not report a partial failure"
+    );
     nginx.assert();
     let _ = std::fs::remove_file(&archive);
 }
@@ -4590,7 +4753,7 @@ fn aborting_import_still_reports_the_types_that_finished() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
 
     let _root = server.mock("GET", "/").with_status(404).create();
     let _wk = server
@@ -4630,10 +4793,8 @@ fn aborting_import_still_reports_the_types_that_finished() {
         .expect_at_least(1)
         .create();
 
-    let outcome = sync::import_jmap::run_reporting(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
-    );
+    let outcome = import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email])
+        .run(common(&archive));
 
     let err = outcome
         .error
@@ -4643,35 +4804,41 @@ fn aborting_import_still_reports_the_types_that_finished() {
         matches!(err, vandelay::error::Error::Connection(_)),
         "the abort must keep its own exit code, got {err:?}"
     );
-    assert_eq!(err.exit_code(), 2);
+    assert_eq!(err.exit_status(), ExitStatus::Connection);
 
     let mailbox = outcome
         .summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Mailbox")
+        .find(|(t, _)| *t == ObjectType::Mailbox)
         .map(|(_, c)| c.clone())
         .expect("the type that finished before the abort must still be reported");
     assert_eq!(mailbox.fetched, 1);
     assert!(
-        !outcome.summary.per_type.iter().any(|(t, _)| *t == "Email"),
+        !outcome
+            .summary
+            .per_type
+            .iter()
+            .any(|(t, _)| *t == ObjectType::Email),
         "the type that aborted contributes no counts"
     );
     let _ = std::fs::remove_file(&archive);
 }
 
 fn seed_single_email(archive: &Path) {
-    let conn = db::init::open(archive).unwrap();
+    let db = Archive::open(archive).unwrap();
+    let conn = db.connection();
     conn.execute(
         "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
         [],
     )
     .unwrap();
-    let blob = db::blobs::intern_blob(
-        &conn,
-        b"From: a@x\r\nSubject: hi\r\nMessage-ID: <m-9@h>\r\n\r\nbody",
-    )
-    .unwrap();
+    let blob = db
+        .store()
+        .blobs()
+        .intern(b"From: a@x\r\nSubject: hi\r\nMessage-ID: <m-9@h>\r\n\r\nbody")
+        .unwrap()
+        .get();
     conn.execute(
         "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
          VALUES (?1,'2020-01-01T00:00:00Z','[1]','[\"$seen\"]')",
@@ -4730,29 +4897,28 @@ fn mock_reconcile_for_single_email(server: &mut mockito::ServerGuard, base: &str
 }
 
 fn run_export(archive: &Path, base: &str, max_retries: u32) -> sync::Summary {
-    sync::export::run(
-        CommonConfig {
-            archive: archive.to_path_buf(),
-            threads: 1,
-            dry_run: false,
-            max_retries,
-            allow_invalid_certs: false,
-            logger: Logger::from_flags(true, 0),
-        },
-        ExportConfig {
-            connect: ConnectConfig {
-                url: base.to_owned(),
-                auth: Auth::Basic {
-                    user: "u".into(),
-                    password: "p".into(),
-                },
-                account: AccountSelector::Id("w".into()),
+    (Export {
+        connect: ConnectConfig {
+            url: base.to_owned(),
+            auth: Auth::Basic {
+                user: "u".into(),
+                password: "p".into(),
             },
-            objects: None,
-            prune: false,
-            yes: true,
+            account: AccountSelector::Id("w".into()),
         },
-    )
+        objects: None,
+        prune: Prune::Keep,
+        confirm: Confirm::Assume,
+    })
+    .run(RunOptions {
+        archive: archive.to_path_buf(),
+        threads: 1,
+        mode: RunMode::Apply,
+        max_retries,
+        tls: TlsPolicy::Verify,
+        logger: Logger::new(Level::Quiet),
+    })
+    .into_result()
     .expect("export run")
 }
 
@@ -4760,7 +4926,7 @@ fn email_counts(summary: &sync::Summary) -> sync::TypeCounts {
     summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "Email")
+        .find(|(t, _)| *t == ObjectType::Email)
         .map(|(_, c)| c.clone())
         .expect("email counts")
 }
@@ -4780,7 +4946,7 @@ fn export_email_server_unavailable_is_retried_not_dropped() {
     let base = server.url();
     let api = "/jmap/api";
 
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     seed_single_email(&archive);
     mock_reconcile_for_single_email(&mut server, &base, api);
 
@@ -4828,7 +4994,7 @@ fn export_email_exhausted_method_retries_stay_per_message() {
     let base = server.url();
     let api = "/jmap/api";
 
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     seed_single_email(&archive);
     mock_reconcile_for_single_email(&mut server, &base, api);
 
@@ -4864,7 +5030,7 @@ fn export_email_fatal_method_error_is_not_retried() {
     let base = server.url();
     let api = "/jmap/api";
 
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     seed_single_email(&archive);
     mock_reconcile_for_single_email(&mut server, &base, api);
 
@@ -4926,7 +5092,8 @@ fn jmap_dispatch(
 }
 
 fn vacation_row(archive: &Path) -> Option<(bool, Option<String>, Option<String>)> {
-    let conn = db::init::open(archive).unwrap();
+    let db = Archive::open(archive).unwrap();
+    let conn = db.connection();
     conn.query_row(
         "SELECT is_enabled, subject, from_date FROM vacation_response",
         [],
@@ -4940,7 +5107,7 @@ fn vacation_row(archive: &Path) -> Option<(bool, Option<String>, Option<String>)
 fn import_vacation_response_from_stalwart_016_source() {
     let mut server = mockito::Server::new();
     let base = server.url();
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     let vacation = std::sync::Arc::new(std::sync::Mutex::new(json!({
         "id": "singleton", "isEnabled": true, "fromDate": "2026-10-01T00:00:00Z",
         "toDate": null, "subject": "Away", "textBody": "Back soon", "htmlBody": null
@@ -4974,16 +5141,15 @@ fn import_vacation_response_from_stalwart_016_source() {
         other => panic!("unexpected {other}"),
     });
 
-    let summary = sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::SieveScript]),
-    )
-    .expect("import");
+    let summary = import_cfg_objects(&base, vec![ObjectType::SieveScript])
+        .run(common(&archive))
+        .into_result()
+        .expect("import");
     assert!(!summary.any_failed());
     let counts = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "VacationResponse")
+        .find(|(t, _)| *t == SummaryType::VacationResponse)
         .map(|(_, c)| c.clone())
         .expect("vacation counts");
     assert_eq!(counts.fetched, 1);
@@ -4995,29 +5161,28 @@ fn import_vacation_response_from_stalwart_016_source() {
             Some("2026-10-01T00:00:00Z".to_owned())
         ))
     );
-    let scripts: i64 = db::init::open(&archive)
+    let scripts: i64 = Archive::open(&archive)
         .unwrap()
+        .connection()
         .query_row("SELECT count(*) FROM sieve_scripts", [], |r| r.get(0))
         .unwrap();
     assert_eq!(scripts, 2, "the vacation script is still archived");
 
     *vacation.lock().unwrap() = json!({"id": "singleton", "isEnabled": false, "subject": "Later"});
-    sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::SieveScript]),
-    )
-    .expect("catch-up import");
+    import_cfg_objects(&base, vec![ObjectType::SieveScript])
+        .run(common(&archive))
+        .into_result()
+        .expect("catch-up import");
     assert_eq!(
         vacation_row(&archive),
         Some((false, Some("Later".to_owned()), None))
     );
 
     *vacation.lock().unwrap() = json!({"id": "singleton", "isEnabled": false});
-    sync::import_jmap::run(
-        common(&archive),
-        import_cfg_objects(&base, vec![ObjectType::SieveScript]),
-    )
-    .expect("second catch-up import");
+    import_cfg_objects(&base, vec![ObjectType::SieveScript])
+        .run(common(&archive))
+        .into_result()
+        .expect("second catch-up import");
     assert_eq!(
         vacation_row(&archive),
         None,
@@ -5027,9 +5192,15 @@ fn import_vacation_response_from_stalwart_016_source() {
 }
 
 fn seed_vacation_archive(archive: &Path) {
-    let conn = db::init::open(archive).unwrap();
-    let filters = db::blobs::intern_blob(&conn, b"keep;\n").unwrap();
-    let vacation = db::blobs::intern_blob(&conn, b"vacation \"Back soon\";\n").unwrap();
+    let db = Archive::open(archive).unwrap();
+    let conn = db.connection();
+    let filters = db.store().blobs().intern(b"keep;\n").unwrap().get();
+    let vacation = db
+        .store()
+        .blobs()
+        .intern(b"vacation \"Back soon\";\n")
+        .unwrap()
+        .get();
     conn.execute(
         "INSERT INTO sources (id,kind,session_url,account_id,username)
          VALUES (1,'jmap','http://src','a','bob')",
@@ -5055,7 +5226,7 @@ fn seed_vacation_archive(archive: &Path) {
 fn export_vacation_script_becomes_vacation_response() {
     let mut server = mockito::Server::new();
     let base = server.url();
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     seed_vacation_archive(&archive);
 
     let _root = server.mock("GET", "/").with_status(404).create();
@@ -5093,8 +5264,8 @@ fn export_vacation_script_becomes_vacation_response() {
     });
     let export = || {
         let mut config = export_cfg_objects(&base, vec![ObjectType::SieveScript]);
-        config.prune = true;
-        let summary = sync::export::run(common(&archive), config).expect("export");
+        config.prune = Prune::Destroy;
+        let summary = config.run(common(&archive)).into_result().expect("export");
         assert!(!summary.any_failed(), "{:?}", summary.per_type);
         let calls = std::mem::take(&mut *log.lock().unwrap());
         (summary, calls)
@@ -5120,7 +5291,7 @@ fn export_vacation_script_becomes_vacation_response() {
     let (last_name, last_args) = calls.last().unwrap();
     assert_eq!(last_name, "VacationResponse/set");
     assert_eq!(last_args["update"]["singleton"], expected_vacation);
-    let counts = |ty: &str| {
+    let counts = |ty: SummaryType| {
         summary
             .per_type
             .iter()
@@ -5128,9 +5299,9 @@ fn export_vacation_script_becomes_vacation_response() {
             .map(|(_, c)| c.clone())
             .unwrap()
     };
-    assert_eq!(counts("SieveScript").created, 1);
-    assert_eq!(counts("SieveScript").skipped, 1);
-    assert_eq!(counts("VacationResponse").updated, 1);
+    assert_eq!(counts(ObjectType::SieveScript.into()).created, 1);
+    assert_eq!(counts(ObjectType::SieveScript.into()).skipped, 1);
+    assert_eq!(counts(SummaryType::VacationResponse).updated, 1);
 
     second_run.store(true, std::sync::atomic::Ordering::Relaxed);
     let (_, calls) = export();
@@ -5150,7 +5321,7 @@ fn export_vacation_script_becomes_vacation_response() {
 fn export_vacation_script_unchanged_without_target_capability() {
     let mut server = mockito::Server::new();
     let base = server.url();
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     seed_vacation_archive(&archive);
 
     let _root = server.mock("GET", "/").with_status(404).create();
@@ -5180,11 +5351,10 @@ fn export_vacation_script_unchanged_without_target_capability() {
         other => panic!("unexpected {other}"),
     });
 
-    let summary = sync::export::run(
-        common(&archive),
-        export_cfg_objects(&base, vec![ObjectType::SieveScript]),
-    )
-    .expect("export");
+    let summary = export_cfg_objects(&base, vec![ObjectType::SieveScript])
+        .run(common(&archive))
+        .into_result()
+        .expect("export");
     assert!(!summary.any_failed(), "{:?}", summary.per_type);
     let calls = log.lock().unwrap().clone();
     let names: Vec<&Value> = calls
@@ -5202,7 +5372,7 @@ fn export_vacation_script_unchanged_without_target_capability() {
         summary
             .per_type
             .iter()
-            .all(|(t, _)| *t != "VacationResponse")
+            .all(|(t, _)| *t != SummaryType::VacationResponse)
     );
     let _ = std::fs::remove_file(&archive);
 }
@@ -5234,7 +5404,7 @@ fn principal_bob(name: &str) -> Option<Value> {
 fn export_vacation_response_for_unlisted_account_of_admin_session() {
     let mut server = mockito::Server::new();
     let base = server.url();
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
     seed_vacation_archive(&archive);
 
     let _root = server.mock("GET", "/").with_status(404).create();
@@ -5265,7 +5435,7 @@ fn export_vacation_response_for_unlisted_account_of_admin_session() {
 
     let mut config = export_cfg_objects(&base, vec![ObjectType::SieveScript]);
     config.connect.account = AccountSelector::Name("bob".into());
-    let summary = sync::export::run(common(&archive), config).expect("export");
+    let summary = config.run(common(&archive)).into_result().expect("export");
     assert!(!summary.any_failed(), "{:?}", summary.per_type);
     let calls = log.lock().unwrap().clone();
     let names: Vec<&Value> = calls
@@ -5286,7 +5456,7 @@ fn export_vacation_response_for_unlisted_account_of_admin_session() {
 fn import_vacation_response_for_unlisted_account_of_admin_session() {
     let mut server = mockito::Server::new();
     let base = server.url();
-    let archive = tmp();
+    let archive = tmp_archive("mocksync");
 
     let _root = server.mock("GET", "/").with_status(404).create();
     let _wk = server
@@ -5321,12 +5491,12 @@ fn import_vacation_response_for_unlisted_account_of_admin_session() {
 
     let mut config = import_cfg_objects(&base, vec![ObjectType::SieveScript]);
     config.connect.account = AccountSelector::Name("bob".into());
-    let summary = sync::import_jmap::run(common(&archive), config).expect("import");
+    let summary = config.run(common(&archive)).into_result().expect("import");
     assert!(!summary.any_failed(), "{:?}", summary.per_type);
     let fetched = summary
         .per_type
         .iter()
-        .find(|(t, _)| *t == "VacationResponse")
+        .find(|(t, _)| *t == SummaryType::VacationResponse)
         .map(|(_, c)| c.fetched);
     assert_eq!(fetched, Some(1));
     assert_eq!(
@@ -5340,4 +5510,44 @@ fn import_vacation_response_for_unlisted_account_of_admin_session() {
             .any(|(n, args)| n == "VacationResponse/get" && args["accountId"] == json!("w"))
     );
     let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn import_dry_run_reports_source_change_like_the_real_run() {
+    // R6: the dry run applies the source-change guard and exits 4, as the real run would.
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let archive = tmp_archive("mocksync-dry-guard");
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let api_calls = server.mock("POST", "/jmap/api").expect(0).create();
+
+    {
+        let a = Archive::open(&archive).unwrap();
+        a.store()
+            .sources()
+            .upsert(
+                &SourceKey {
+                    kind: SourceKind::Jmap,
+                    url: "https://other.example",
+                    account_id: "x",
+                },
+                None,
+                "someone",
+            )
+            .unwrap();
+    }
+
+    let outcome = import_cfg_objects(&base, vec![ObjectType::Mailbox]).run(common_dry(&archive));
+    let err = outcome
+        .error
+        .expect("dry run must refuse the source change");
+    assert_eq!(err.exit_status(), ExitStatus::SourceChange, "{err}");
+    assert!(err.to_string().contains("https://other.example"), "{err}");
+    api_calls.assert();
 }

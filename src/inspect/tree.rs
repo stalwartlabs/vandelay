@@ -4,235 +4,292 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::Write;
 
-use rusqlite::Connection;
+use rusqlite::{OptionalExtension, params};
 
-use super::{blob_summary, format_count};
+use super::View;
+use crate::archive::rows::NodeType;
+use crate::archive::{BlobId, LocalId};
+use crate::console::{ByteSize, Counted, Grouped, Initial, Tone};
 use crate::error::Error;
+use crate::types::ObjectType;
+
+const DEFAULT_MEDIA_TYPE: &str = "application/octet-stream";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Branch {
+    Middle,
+    Last,
+}
+
+impl Branch {
+    fn connector(self) -> &'static str {
+        match self {
+            Branch::Middle => "├── ",
+            Branch::Last => "└── ",
+        }
+    }
+
+    fn indent(self) -> &'static str {
+        match self {
+            Branch::Middle => "│   ",
+            Branch::Last => "    ",
+        }
+    }
+}
 
 struct MailboxNode {
-    id: i64,
-    parent_id: Option<i64>,
+    id: LocalId,
+    parent_id: Option<LocalId>,
     name: String,
     role: Option<String>,
     sort_order: i64,
     msg_count: u64,
 }
 
-pub fn write_mailboxes(conn: &Connection, out: &mut impl Write) -> Result<(), Error> {
-    let nodes = load_mailboxes(conn)?;
-    writeln!(out, "Mailboxes ({})", format_count(nodes.len() as u64))?;
-    if nodes.is_empty() {
-        writeln!(out, "(none)")?;
-        return Ok(());
-    }
-    let by_id: HashMap<i64, &MailboxNode> = nodes.iter().map(|n| (n.id, n)).collect();
-    let mut by_parent: HashMap<Option<i64>, Vec<i64>> = HashMap::new();
-    for n in &nodes {
-        by_parent.entry(n.parent_id).or_default().push(n.id);
-    }
-    for ids in by_parent.values_mut() {
-        ids.sort_by(|a, b| {
-            let na = by_id[a];
-            let nb = by_id[b];
-            na.sort_order
-                .cmp(&nb.sort_order)
-                .then_with(|| na.name.cmp(&nb.name))
-        });
-    }
-    let roots: Vec<i64> = by_parent.get(&None).cloned().unwrap_or_default();
-    let last = roots.len().saturating_sub(1);
-    for (i, id) in roots.iter().enumerate() {
-        write_mailbox(out, &by_id, &by_parent, *id, "", i == last)?;
-    }
-    Ok(())
-}
-
-fn write_mailbox(
-    out: &mut impl Write,
-    by_id: &HashMap<i64, &MailboxNode>,
-    by_parent: &HashMap<Option<i64>, Vec<i64>>,
-    id: i64,
-    prefix: &str,
-    is_last: bool,
-) -> Result<(), Error> {
-    let node = by_id[&id];
-    let connector = if is_last { "└── " } else { "├── " };
-    let mut tags: Vec<String> = Vec::new();
-    if let Some(role) = &node.role {
-        tags.push(format!("role={role}"));
-    }
-    tags.push(format!("{} msgs", format_count(node.msg_count)));
-    writeln!(
-        out,
-        "{prefix}{connector}{}  [{}]",
-        node.name,
-        tags.join(", ")
-    )?;
-    let child_prefix = format!("{prefix}{}", if is_last { "    " } else { "│   " });
-    if let Some(children) = by_parent.get(&Some(id)) {
-        let last = children.len() - 1;
-        for (i, child) in children.iter().enumerate() {
-            write_mailbox(out, by_id, by_parent, *child, &child_prefix, i == last)?;
-        }
-    }
-    Ok(())
-}
-
-fn load_mailboxes(conn: &Connection) -> Result<Vec<MailboxNode>, Error> {
-    let mut stmt = conn.prepare(
-        "SELECT m.id, m.parent_id, m.name, m.role, m.sort_order,
-                (SELECT COUNT(*) FROM emails e
-                 WHERE EXISTS (SELECT 1 FROM json_each(e.mailbox_ids) j
-                                WHERE CAST(j.value AS INTEGER) = m.id))
-           FROM mailboxes m",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok(MailboxNode {
-            id: r.get(0)?,
-            parent_id: r.get(1)?,
-            name: r.get(2)?,
-            role: r.get(3)?,
-            sort_order: r.get(4)?,
-            msg_count: r.get::<_, i64>(5)? as u64,
-        })
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
-struct FileNodeRow {
-    id: i64,
-    parent_id: Option<i64>,
-    node_type: String,
-    blob_id: Option<i64>,
+struct FileNode {
+    id: LocalId,
+    parent_id: Option<LocalId>,
+    node_type: Option<NodeType>,
+    blob_id: Option<BlobId>,
     name: String,
     media_type: Option<String>,
     target: Option<String>,
     child_count: u64,
 }
 
-pub fn write_file_nodes(conn: &Connection, out: &mut impl Write) -> Result<(), Error> {
-    let nodes = load_file_nodes(conn)?;
-    writeln!(out, "File nodes ({})", format_count(nodes.len() as u64))?;
-    if nodes.is_empty() {
-        writeln!(out, "(none)")?;
-        return Ok(());
+impl FileNode {
+    fn is_directory(&self) -> bool {
+        self.node_type == Some(NodeType::Directory)
     }
-    let by_id: HashMap<i64, &FileNodeRow> = nodes.iter().map(|n| (n.id, n)).collect();
-    let mut by_parent: HashMap<Option<i64>, Vec<i64>> = HashMap::new();
-    for n in &nodes {
-        by_parent.entry(n.parent_id).or_default().push(n.id);
-    }
-    for ids in by_parent.values_mut() {
-        ids.sort_by(|a, b| {
-            let na = by_id[a];
-            let nb = by_id[b];
-            (na.node_type != "directory")
-                .cmp(&(nb.node_type != "directory"))
-                .then_with(|| na.name.cmp(&nb.name))
-        });
-    }
-    let roots: Vec<i64> = by_parent.get(&None).cloned().unwrap_or_default();
-    let last = roots.len().saturating_sub(1);
-    for (i, id) in roots.iter().enumerate() {
-        write_file_node(conn, out, &by_id, &by_parent, *id, "", i == last)?;
-    }
-    Ok(())
 }
 
-fn write_file_node(
-    conn: &Connection,
-    out: &mut impl Write,
-    by_id: &HashMap<i64, &FileNodeRow>,
-    by_parent: &HashMap<Option<i64>, Vec<i64>>,
-    id: i64,
-    prefix: &str,
-    is_last: bool,
-) -> Result<(), Error> {
-    let node = by_id[&id];
-    let connector = if is_last { "└── " } else { "├── " };
-    let display = match node.node_type.as_str() {
-        "directory" => format!("{}/", node.name),
-        _ => node.name.clone(),
-    };
-    let detail = match node.node_type.as_str() {
-        "directory" => format!("({} children)", format_count(node.child_count)),
-        "symlink" => {
-            let target = node.target.as_deref().unwrap_or("[]");
-            format!("symlink -> {target}")
+trait TreeNode {
+    fn id(&self) -> LocalId;
+    fn parent(&self) -> Option<LocalId>;
+}
+
+impl TreeNode for MailboxNode {
+    fn id(&self) -> LocalId {
+        self.id
+    }
+
+    fn parent(&self) -> Option<LocalId> {
+        self.parent_id
+    }
+}
+
+impl TreeNode for FileNode {
+    fn id(&self) -> LocalId {
+        self.id
+    }
+
+    fn parent(&self) -> Option<LocalId> {
+        self.parent_id
+    }
+}
+
+struct Forest<'n, N> {
+    children: HashMap<Option<LocalId>, Vec<&'n N>>,
+}
+
+impl<'n, N: TreeNode> Forest<'n, N> {
+    fn new(nodes: &'n [N], order: impl Fn(&&'n N, &&'n N) -> Ordering) -> Forest<'n, N> {
+        let mut children: HashMap<Option<LocalId>, Vec<&'n N>> = HashMap::new();
+        for n in nodes {
+            children.entry(n.parent()).or_default().push(n);
         }
-        _ => {
-            let media = node
-                .media_type
-                .as_deref()
-                .unwrap_or("application/octet-stream");
-            match node.blob_id {
-                Some(bid) => format!("{media}, {}", blob_summary(conn, bid)?),
-                None => format!("{media}, (no blob)"),
-            }
+        for siblings in children.values_mut() {
+            siblings.sort_by(&order);
         }
-    };
-    writeln!(out, "{prefix}{connector}{display}  {detail}")?;
-    let child_prefix = format!("{prefix}{}", if is_last { "    " } else { "│   " });
-    if let Some(children) = by_parent.get(&Some(id)) {
-        let last = children.len() - 1;
-        for (i, child) in children.iter().enumerate() {
-            write_file_node(
-                conn,
+        Forest { children }
+    }
+
+    fn walk(
+        &self,
+        parent: Option<LocalId>,
+        prefix: &mut String,
+        visit: &mut impl FnMut(&'n N, &str, Branch) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let Some((last, rest)) = self.children.get(&parent).and_then(|c| c.split_last()) else {
+            return Ok(());
+        };
+        let siblings = rest
+            .iter()
+            .map(|n| (*n, Branch::Middle))
+            .chain([(*last, Branch::Last)]);
+        for (node, branch) in siblings {
+            visit(node, prefix, branch)?;
+            let len = prefix.len();
+            prefix.push_str(branch.indent());
+            self.walk(Some(node.id()), prefix, visit)?;
+            prefix.truncate(len);
+        }
+        Ok(())
+    }
+}
+
+impl View<'_> {
+    pub(super) fn write_mailboxes(self, out: &mut impl Write) -> Result<(), Error> {
+        let styled = self.styled;
+        let nodes = self.mailboxes()?;
+        self.tree_header(out, ObjectType::Mailbox, nodes.len())?;
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let forest = Forest::new(&nodes, |a, b| {
+            a.sort_order
+                .cmp(&b.sort_order)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        let mut meta = String::new();
+        forest.walk(None, &mut String::new(), &mut |node, prefix, branch| {
+            meta.clear();
+            let messages = Counted::new(node.msg_count, "message", "messages");
+            let _ = match &node.role {
+                Some(role) => write!(meta, "({role}, {messages})"),
+                None => write!(meta, "({messages})"),
+            };
+            writeln!(
                 out,
-                by_id,
-                by_parent,
-                *child,
-                &child_prefix,
-                i == last,
+                "{}{}  {}",
+                styled.paint(Tone::Dim, format_args!("{prefix}{}", branch.connector())),
+                node.name,
+                styled.paint(Tone::Dim, &meta)
+            )?;
+            Ok(())
+        })
+    }
+
+    pub(super) fn write_file_nodes(self, out: &mut impl Write) -> Result<(), Error> {
+        let styled = self.styled;
+        let nodes = self.file_nodes()?;
+        self.tree_header(out, ObjectType::FileNode, nodes.len())?;
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let forest = Forest::new(&nodes, |a, b| {
+            (!a.is_directory())
+                .cmp(&!b.is_directory())
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        let mut meta = String::new();
+        forest.walk(None, &mut String::new(), &mut |node, prefix, branch| {
+            meta.clear();
+            match node.node_type {
+                Some(NodeType::Directory) => {
+                    let _ = write!(
+                        meta,
+                        "({})",
+                        Counted::new(node.child_count, "item", "items")
+                    );
+                }
+                Some(NodeType::SymLink) => {
+                    let _ = write!(meta, "-> {}", node.target.as_deref().unwrap_or("?"));
+                }
+                Some(NodeType::File) | None => {
+                    let media = node.media_type.as_deref().unwrap_or(DEFAULT_MEDIA_TYPE);
+                    let _ = match node.blob_id.map(|b| self.blob_len(b)).transpose()? {
+                        Some(Some(len)) => write!(meta, "({media}, {})", ByteSize(len)),
+                        Some(None) => write!(meta, "({media}, missing content)"),
+                        None => write!(meta, "({media}, no content)"),
+                    };
+                }
+            }
+            let slash = if node.is_directory() { "/" } else { "" };
+            writeln!(
+                out,
+                "{}{}{slash}  {}",
+                styled.paint(Tone::Dim, format_args!("{prefix}{}", branch.connector())),
+                node.name,
+                styled.paint(Tone::Dim, &meta)
+            )?;
+            Ok(())
+        })
+    }
+
+    fn tree_header(self, out: &mut impl Write, ty: ObjectType, n: usize) -> Result<(), Error> {
+        writeln!(
+            out,
+            "{}  ({})",
+            self.styled.paint(Tone::Title, ty.label()),
+            Grouped(n as u64)
+        )?;
+        if n == 0 {
+            writeln!(
+                out,
+                "{}",
+                self.styled.paint(
+                    Tone::Dim,
+                    format_args!("No {} in the archive", Initial::Lower(ty.label()))
+                )
             )?;
         }
+        Ok(())
     }
-    Ok(())
-}
 
-fn load_file_nodes(conn: &Connection) -> Result<Vec<FileNodeRow>, Error> {
-    let mut stmt = conn.prepare(
-        "SELECT f.id, f.parent_id, f.node_type, f.blob_id, f.name, f.media_type, f.target,
-                (SELECT COUNT(*) FROM file_nodes c WHERE c.parent_id = f.id)
-           FROM file_nodes f",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok(FileNodeRow {
-            id: r.get(0)?,
-            parent_id: r.get(1)?,
-            node_type: r.get(2)?,
-            blob_id: r.get(3)?,
-            name: r.get(4)?,
-            media_type: r.get(5)?,
-            target: r.get(6)?,
-            child_count: r.get::<_, i64>(7)? as u64,
-        })
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
+    fn blob_len(self, blob: BlobId) -> Result<Option<u64>, Error> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT length(data) FROM blobs WHERE id = ?1")?
+            .query_row(params![blob], |r| r.get::<_, i64>(0))
+            .optional()?
+            .map(|len| len.max(0) as u64))
     }
-    Ok(out)
+
+    fn mailboxes(self) -> Result<Vec<MailboxNode>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.parent_id, m.name, m.role, m.sort_order,
+                    (SELECT COUNT(*) FROM emails e
+                     WHERE EXISTS (SELECT 1 FROM json_each(e.mailbox_ids) j
+                                    WHERE CAST(j.value AS INTEGER) = m.id))
+               FROM mailboxes m",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(MailboxNode {
+                id: r.get(0)?,
+                parent_id: r.get(1)?,
+                name: r.get(2)?,
+                role: r.get(3)?,
+                sort_order: r.get(4)?,
+                msg_count: r.get::<_, i64>(5)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    fn file_nodes(self) -> Result<Vec<FileNode>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.id, f.parent_id, f.node_type, f.blob_id, f.name, f.media_type, f.target,
+                    (SELECT COUNT(*) FROM file_nodes c WHERE c.parent_id = f.id)
+               FROM file_nodes f",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(FileNode {
+                id: r.get(0)?,
+                parent_id: r.get(1)?,
+                node_type: NodeType::parse(r.get_ref(2)?.as_str()?),
+                blob_id: r.get(3)?,
+                name: r.get(4)?,
+                media_type: r.get(5)?,
+                target: r.get(6)?,
+                child_count: r.get::<_, i64>(7)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{blobs, init};
-    use rusqlite::params;
-
-    fn mem() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        init::apply_schema(&c).unwrap();
-        c
-    }
+    use crate::archive::Archive;
+    use crate::console::Styled;
+    use rusqlite::{Connection, params};
 
     fn insert_mailbox(
         c: &Connection,
@@ -250,58 +307,70 @@ mod tests {
         c.last_insert_rowid()
     }
 
-    fn insert_email_in(c: &Connection, mailbox_id: i64) {
-        let blob = blobs::intern_blob(c, format!("seed-{mailbox_id}").as_bytes()).unwrap();
-        c.execute(
-            "INSERT INTO emails (blob_id, received_at, mailbox_ids, keywords)
-             VALUES (?1, '2024-01-01T00:00:00Z', ?2, '[]')",
-            params![blob, format!("[{mailbox_id}]")],
-        )
-        .unwrap();
+    fn insert_email_in(a: &Archive, mailbox_id: i64) {
+        let blob = a
+            .store()
+            .blobs()
+            .intern(format!("seed-{mailbox_id}").as_bytes())
+            .unwrap();
+        a.connection()
+            .execute(
+                "INSERT INTO emails (blob_id, received_at, mailbox_ids, keywords)
+                 VALUES (?1, '2024-01-01T00:00:00Z', ?2, '[]')",
+                params![blob, format!("[{mailbox_id}]")],
+            )
+            .unwrap();
     }
 
     #[test]
-    fn mailbox_tree_draws_box_characters_and_msg_counts() {
-        let c = mem();
-        let inbox = insert_mailbox(&c, "Inbox", None, Some("inbox"), 0);
-        let _archived = insert_mailbox(&c, "Archived", Some(inbox), None, 0);
-        let _y2024 = insert_mailbox(&c, "2024", Some(inbox), None, 1);
-        let _sent = insert_mailbox(&c, "Sent", None, Some("sent"), 1);
-        insert_email_in(&c, inbox);
-        insert_email_in(&c, inbox);
+    fn mailbox_tree_draws_box_characters_and_message_counts() {
+        let a = Archive::open_in_memory().unwrap();
+        let c = a.connection();
+        let inbox = insert_mailbox(c, "Inbox", None, Some("inbox"), 0);
+        let _archived = insert_mailbox(c, "Archived", Some(inbox), None, 0);
+        let _y2024 = insert_mailbox(c, "2024", Some(inbox), None, 1);
+        let _sent = insert_mailbox(c, "Sent", None, Some("sent"), 1);
+        insert_email_in(&a, inbox);
+        insert_email_in(&a, inbox);
         let mut buf = Vec::new();
-        write_mailboxes(&c, &mut buf).unwrap();
+        View::new(c, Styled::Plain)
+            .write_mailboxes(&mut buf)
+            .unwrap();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("Mailboxes (4)"), "header missing: {s}");
-        assert!(s.contains("├── Inbox  [role=inbox, 2 msgs]"), "got:\n{s}");
-        assert!(s.contains("│   ├── Archived"), "got:\n{s}");
-        assert!(s.contains("│   └── 2024"), "got:\n{s}");
-        assert!(s.contains("└── Sent  [role=sent, 0 msgs]"), "got:\n{s}");
+        assert_eq!(
+            s,
+            "Mailboxes  (4)\n\
+             ├── Inbox  (inbox, 2 messages)\n\
+             │   ├── Archived  (0 messages)\n\
+             │   └── 2024  (0 messages)\n\
+             └── Sent  (sent, 0 messages)\n"
+        );
     }
 
     #[test]
     fn mailbox_tree_empty_says_none() {
-        let c = mem();
+        let a = Archive::open_in_memory().unwrap();
         let mut buf = Vec::new();
-        write_mailboxes(&c, &mut buf).unwrap();
+        View::new(a.connection(), Styled::Plain)
+            .write_mailboxes(&mut buf)
+            .unwrap();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("Mailboxes (0)"));
-        assert!(s.contains("(none)"));
+        assert!(s.contains("Mailboxes  (0)"));
+        assert!(s.contains("No mailboxes in the archive"));
     }
 
     #[test]
     fn file_node_tree_distinguishes_dirs_files_symlinks() {
-        let c = mem();
-        let docs: i64 = {
-            c.execute(
-                "INSERT INTO file_nodes (parent_id, node_type, name, created)
-                 VALUES (NULL, 'directory', 'Documents', '2024-01-01T00:00:00Z')",
-                [],
-            )
-            .unwrap();
-            c.last_insert_rowid()
-        };
-        let blob = blobs::intern_blob(&c, b"hello world").unwrap();
+        let a = Archive::open_in_memory().unwrap();
+        let c = a.connection();
+        c.execute(
+            "INSERT INTO file_nodes (parent_id, node_type, name, created)
+             VALUES (NULL, 'directory', 'Documents', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let docs = c.last_insert_rowid();
+        let blob = a.store().blobs().intern(b"hello world").unwrap();
         c.execute(
             "INSERT INTO file_nodes (parent_id, node_type, blob_id, name, media_type, created)
              VALUES (?1, 'file', ?2, 'note.txt', 'text/plain', '2024-01-01T00:00:00Z')",
@@ -315,13 +384,19 @@ mod tests {
         )
         .unwrap();
         let mut buf = Vec::new();
-        write_file_nodes(&c, &mut buf).unwrap();
+        View::new(c, Styled::Plain)
+            .write_file_nodes(&mut buf)
+            .unwrap();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("File nodes (3)"));
-        assert!(s.contains("Documents/"));
-        assert!(s.contains("(2 children)"));
-        assert!(s.contains("note.txt"));
-        assert!(s.contains("text/plain, 11 B blake3="));
-        assert!(s.contains("symlink -> [\"..\",\"etc\"]"));
+        assert!(s.contains("File nodes  (3)"));
+        assert!(s.contains("└── Documents/  (2 items)"), "got:\n{s}");
+        assert!(
+            s.contains("    ├── note.txt  (text/plain, 11 B)"),
+            "got:\n{s}"
+        );
+        assert!(
+            s.contains("    └── shortcut  -> [\"..\",\"etc\"]"),
+            "got:\n{s}"
+        );
     }
 }

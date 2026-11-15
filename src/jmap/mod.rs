@@ -12,6 +12,5 @@ pub mod error;
 pub mod http;
 pub mod inflight;
 pub mod request;
-pub mod retry;
 pub mod session;
 pub mod wire;

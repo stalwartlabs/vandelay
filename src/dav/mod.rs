@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod discover;
+pub mod error;
 pub mod href;
 pub mod parse;
 pub mod retry;

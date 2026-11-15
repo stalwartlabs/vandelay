@@ -8,18 +8,25 @@ mod integration;
 mod seeder;
 
 use integration::stalwart::shared as shared_stalwart;
-use vandelay::jmap::account::{self, AccountSelector};
-use vandelay::jmap::http::{Auth, HttpClient, RetryPolicy};
+use vandelay::jmap::account::AccountSelector;
+use vandelay::jmap::http::JmapClient;
 use vandelay::jmap::session::Session;
+use vandelay::logging::{Level, Logger};
+use vandelay::net::auth::Auth;
+use vandelay::net::http::{ClientOptions, TlsPolicy};
+use vandelay::net::retry::RetryPolicy;
 
-fn admin_client() -> HttpClient {
-    HttpClient::new(
+fn admin_client() -> JmapClient {
+    JmapClient::new(
         Auth::Basic {
             user: seeder::ADMIN_USER.into(),
             password: seeder::ADMIN_PASSWORD.into(),
         },
-        RetryPolicy::new(5),
-        true,
+        ClientOptions {
+            retry: RetryPolicy::new(5),
+            tls: TlsPolicy::AcceptInvalid,
+            logger: Logger::new(Level::Quiet),
+        },
     )
 }
 
@@ -96,12 +103,9 @@ fn session_discovery_and_admin_principal_resolution() {
         "test1 layout activates a sieve script"
     );
 
-    let resolved = account::resolve(
-        &AccountSelector::Name(target.email.clone()),
-        &session,
-        &client,
-    )
-    .expect("admin principal resolution");
+    let resolved = AccountSelector::Name(target.email.clone())
+        .resolve(&session, &client)
+        .expect("admin principal resolution");
     assert_eq!(
         resolved, target.account_id,
         "{} must resolve to the seeded account id {}",

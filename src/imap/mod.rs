@@ -11,7 +11,7 @@ pub mod error;
 pub mod name;
 pub mod response;
 pub mod retry;
-pub mod transport;
+pub mod session;
 
-pub use client::{CollectedResponse, ConnectMode, Greeting, ImapClient};
+pub use client::{Capabilities, Capability, CollectedResponse, ImapClient};
 pub use error::ImapError;

@@ -4,115 +4,110 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-pub fn role_from_special_use(attributes: &[String]) -> Option<&'static str> {
-    for attr in attributes {
-        match attr.to_ascii_lowercase().as_str() {
-            "\\all" => return Some("all"),
-            "\\archive" => return Some("archive"),
-            "\\drafts" => return Some("drafts"),
-            "\\flagged" => return Some("flagged"),
-            "\\important" => return Some("important"),
-            "\\junk" => return Some("junk"),
-            "\\sent" => return Some("sent"),
-            "\\trash" => return Some("trash"),
-            _ => {}
+type Role = &'static str;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Automap {
+    Enabled,
+    Disabled,
+}
+
+pub struct SpecialUse;
+
+impl SpecialUse {
+    pub fn role(attributes: &[String]) -> Option<&'static str> {
+        attributes.iter().find_map(|attr| {
+            hashify::map_ignore_case!(attr.as_bytes(), Role,
+                "\\all" => "all",
+                "\\archive" => "archive",
+                "\\drafts" => "drafts",
+                "\\flagged" => "flagged",
+                "\\important" => "important",
+                "\\junk" => "junk",
+                "\\sent" => "sent",
+                "\\trash" => "trash",
+            )
+            .copied()
+        })
+    }
+}
+
+impl Automap {
+    pub fn role(
+        self,
+        folder_name: &str,
+        attributes: &[String],
+        namespace_prefix: &str,
+    ) -> Option<&'static str> {
+        if folder_name.eq_ignore_ascii_case("INBOX") {
+            return Some("inbox");
         }
-    }
-    None
-}
-
-pub fn role_for_folder(
-    folder_name: &str,
-    attributes: &[String],
-    namespace_prefix: &str,
-    automap_enabled: bool,
-) -> Option<&'static str> {
-    if folder_name.eq_ignore_ascii_case("INBOX") {
-        return Some("inbox");
-    }
-    if let Some(r) = role_from_special_use(attributes) {
-        return Some(r);
-    }
-    if !automap_enabled {
-        return None;
-    }
-    let stripped = strip_prefix_case_insensitive(folder_name, namespace_prefix);
-    let leaf = leaf_component(stripped);
-    role_from_name(stripped, leaf)
-}
-
-fn role_from_name(full: &str, leaf: &str) -> Option<&'static str> {
-    for (role, patterns) in ROLE_PATTERNS {
-        for p in *patterns {
-            if leaf.eq_ignore_ascii_case(p) || full.eq_ignore_ascii_case(p) {
-                return Some(role);
-            }
+        if let Some(role) = SpecialUse::role(attributes) {
+            return Some(role);
         }
+        if self == Automap::Disabled {
+            return None;
+        }
+        let stripped = folder_name
+            .get(..namespace_prefix.len())
+            .filter(|head| head.eq_ignore_ascii_case(namespace_prefix))
+            .and_then(|_| folder_name.get(namespace_prefix.len()..))
+            .unwrap_or(folder_name);
+        let leaf = stripped
+            .rsplit_once(['/', '.'])
+            .map_or(stripped, |(_, leaf)| leaf);
+        Automap::role_from_name(leaf).or_else(|| Automap::role_from_name(stripped))
     }
-    None
-}
 
-fn strip_prefix_case_insensitive<'a>(name: &'a str, prefix: &str) -> &'a str {
-    if prefix.is_empty() {
-        return name;
-    }
-    if name.len() < prefix.len() {
-        return name;
-    }
-    if name[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        &name[prefix.len()..]
-    } else {
-        name
+    fn role_from_name(name: &str) -> Option<&'static str> {
+        hashify::map_ignore_case!(name.as_bytes(), Role,
+            "Sent" => "sent",
+            "Sent Mail" => "sent",
+            "Sent Items" => "sent",
+            "Sent Messages" => "sent",
+            "Sent-Mail" => "sent",
+            "[Gmail]/Sent Mail" => "sent",
+            "[Gmail]/Sent" => "sent",
+            "Drafts" => "drafts",
+            "Draft" => "drafts",
+            "Brouillons" => "drafts",
+            "[Gmail]/Drafts" => "drafts",
+            "Trash" => "trash",
+            "Deleted" => "trash",
+            "Deleted Items" => "trash",
+            "Deleted Messages" => "trash",
+            "[Gmail]/Trash" => "trash",
+            "[Gmail]/Bin" => "trash",
+            "Junk" => "junk",
+            "Spam" => "junk",
+            "Junk E-mail" => "junk",
+            "Junk Email" => "junk",
+            "[Gmail]/Spam" => "junk",
+            "[Gmail]/All Mail" => "all",
+            "Archive" => "archive",
+            "Archives" => "archive",
+        )
+        .copied()
     }
 }
-
-fn leaf_component(name: &str) -> &str {
-    if let Some(idx) = name.rfind(['/', '.']) {
-        &name[idx + 1..]
-    } else {
-        name
-    }
-}
-
-const ROLE_PATTERNS: &[(&str, &[&str])] = &[
-    (
-        "sent",
-        &[
-            "Sent",
-            "Sent Mail",
-            "Sent Items",
-            "Sent Messages",
-            "Sent-Mail",
-            "[Gmail]/Sent Mail",
-            "[Gmail]/Sent",
-        ],
-    ),
-    (
-        "drafts",
-        &["Drafts", "Draft", "Brouillons", "[Gmail]/Drafts"],
-    ),
-    (
-        "trash",
-        &[
-            "Trash",
-            "Deleted",
-            "Deleted Items",
-            "Deleted Messages",
-            "[Gmail]/Trash",
-            "[Gmail]/Bin",
-        ],
-    ),
-    (
-        "junk",
-        &["Junk", "Spam", "Junk E-mail", "Junk Email", "[Gmail]/Spam"],
-    ),
-    ("all", &["[Gmail]/All Mail"]),
-    ("archive", &["Archive", "Archives"]),
-];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn role_for_folder(
+        name: &str,
+        attributes: &[String],
+        prefix: &str,
+        enabled: bool,
+    ) -> Option<&'static str> {
+        let automap = if enabled {
+            Automap::Enabled
+        } else {
+            Automap::Disabled
+        };
+        automap.role(name, attributes, prefix)
+    }
 
     fn attrs(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| (*x).to_owned()).collect()
@@ -145,7 +140,7 @@ mod tests {
             ("\\Sent", "sent"),
             ("\\Trash", "trash"),
         ] {
-            let r = role_from_special_use(&attrs(&[attr]));
+            let r = SpecialUse::role(&attrs(&[attr]));
             assert_eq!(r, Some(expected), "for {attr}");
         }
     }
@@ -162,7 +157,7 @@ mod tests {
             "\\Noinferiors",
             "\\Remote",
         ] {
-            assert_eq!(role_from_special_use(&attrs(&[s])), None);
+            assert_eq!(SpecialUse::role(&attrs(&[s])), None);
         }
     }
 
@@ -232,5 +227,11 @@ mod tests {
     fn plain_archive_name_resolves_to_archive() {
         assert_eq!(role_for_folder("Archive", &[], "", true), Some("archive"));
         assert_eq!(role_for_folder("Archives", &[], "", true), Some("archive"));
+    }
+
+    #[test]
+    fn namespace_prefix_inside_a_multibyte_char_does_not_panic() {
+        assert_eq!(role_for_folder("a日本", &[], "INBOX.", true), None);
+        assert_eq!(role_for_folder("日本/Sent", &[], "日", true), Some("sent"));
     }
 }

@@ -4,12 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+use super::data::MboxMessage;
 use super::error::{ContainerError, ContainerResult};
 use super::layouts::MailboxSpec;
+use super::{Account, Endpoint};
 
 pub struct ImapSeed {
     reader: BufReader<TcpStream>,
@@ -228,6 +231,210 @@ impl ImapSeed {
         let _ = self.reader.read_to_string(&mut buf);
         Ok(())
     }
+
+    pub fn open(imap: &Endpoint, account: &Account) -> ContainerResult<Self> {
+        let mut client = Self::connect(&imap.host, imap.port)?;
+        client.login(&account.username, &account.password)?;
+        Ok(client)
+    }
+
+    pub fn seed_layout(
+        &mut self,
+        account: &Account,
+        messages: &[MboxMessage],
+        probes: &SeedProbes,
+    ) -> ContainerResult<MailboxSeed> {
+        let sep = self.discover_separator().unwrap_or('/');
+
+        let mut paths = Vec::new();
+        for spec in account.layout.mailboxes {
+            let path = full_path(account.layout.mailboxes, spec.key, sep).ok_or_else(|| {
+                ContainerError::Seed(format!("missing mailbox key: {}", spec.key))
+            })?;
+            self.create(&path)?;
+            self.subscribe(&path)?;
+            paths.push(path);
+        }
+
+        let mut targets: Vec<String> = vec!["INBOX".to_owned()];
+        targets.extend(paths.iter().cloned());
+
+        let total = account.layout.email_count.min(messages.len());
+        if total < account.layout.email_count {
+            return Err(ContainerError::Seed(format!(
+                "{} only has {} messages but layout requires {}",
+                account.username,
+                messages.len(),
+                account.layout.email_count
+            )));
+        }
+
+        let mut seed = MailboxSeed {
+            histogram: targets.iter().map(|t| (t.clone(), 0)).collect(),
+            paths,
+            total_appends: 0,
+            extras: ExtraAppends::default(),
+            appends: Vec::new(),
+        };
+
+        for ((i, msg), target) in messages
+            .iter()
+            .take(total)
+            .enumerate()
+            .zip(targets.iter().cycle())
+        {
+            self.append_with_flags(target, &[], &msg.raw)?;
+            seed.record(target, msg.raw.clone(), Vec::new(), SeedTag::Bulk(i));
+        }
+
+        if let (Some(target), Some(first)) = (targets.get(1), messages.first()) {
+            self.append_with_flags(target, &[], &first.raw)?;
+            seed.record(target, first.raw.clone(), Vec::new(), SeedTag::Dedup);
+            seed.extras.dedup_target = Some(target.clone());
+        }
+
+        if !messages.is_empty() {
+            self.append_with_flags("INBOX", &["\\Seen", "\\Flagged"], &probes.flag)?;
+            seed.record(
+                "INBOX",
+                probes.flag.clone(),
+                vec!["$seen".to_owned(), "$flagged".to_owned()],
+                SeedTag::FlagProbe,
+            );
+            seed.extras.flagged_target = Some("INBOX".to_owned());
+        }
+
+        if let Some(probe) = &probes.no_message_id
+            && !messages.is_empty()
+        {
+            self.append_with_flags("INBOX", &[], probe)?;
+            seed.record("INBOX", probe.clone(), Vec::new(), SeedTag::NoMessageId);
+            seed.extras.nomid_target = Some("INBOX".to_owned());
+        }
+
+        if let (Some(body), [_, a, b, ..]) = (&probes.shared_message_id, targets.as_slice()) {
+            self.append_with_flags(a, &[], body)?;
+            self.append_with_flags(b, &[], body)?;
+            seed.record(a, body.clone(), Vec::new(), SeedTag::SharedMid);
+            seed.record(b, body.clone(), Vec::new(), SeedTag::SharedMid);
+            seed.extras.mid_dedup_targets = Some((a.clone(), b.clone()));
+        }
+
+        Ok(seed)
+    }
+
+    pub fn verify_layout(
+        &mut self,
+        account: &Account,
+        seed: &MailboxSeed,
+        who: &str,
+    ) -> ContainerResult<()> {
+        let names = self.list_all()?;
+        let expected = account.layout.mailboxes.len() + 1;
+        if names.len() < expected {
+            return Err(ContainerError::Seed(format!(
+                "{who}: expected >= {expected} mailboxes, got {}",
+                names.len()
+            )));
+        }
+        let inbox_n = self.select("INBOX")?;
+        if account.layout.email_count > 0 && inbox_n == 0 {
+            return Err(ContainerError::Seed(format!(
+                "{who}: INBOX EXISTS = 0 after seed"
+            )));
+        }
+        for path in &seed.paths {
+            let n = self.select(path)?;
+            let want = seed.histogram.get(path).copied().unwrap_or(0);
+            if n < want {
+                return Err(ContainerError::Seed(format!(
+                    "{who}: mailbox {path} EXISTS={n} but {want} were appended"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn append_probe(
+        &mut self,
+        account: &Account,
+        mailbox: &str,
+        tag: &str,
+    ) -> ContainerResult<(Vec<u8>, String)> {
+        let message_id = format!("<added-{tag}-{}@vandelay.test>", account.username);
+        let body = format!(
+            "From: added-{tag}@vandelay.test\r\n\
+             To: {}@vandelay.test\r\n\
+             Subject: Added probe {tag}\r\n\
+             Message-ID: {message_id}\r\n\
+             Date: Wed, 01 Jan 2025 12:00:00 +0000\r\n\
+             \r\n\
+             Added probe body {tag}.\r\n",
+            account.username
+        );
+        let raw = body.into_bytes();
+        self.append_with_flags(mailbox, &[], &raw)?;
+        Ok((raw, message_id))
+    }
+
+    pub fn create_with_message(&mut self, wire_name: &str, message: &[u8]) -> ContainerResult<()> {
+        self.create(wire_name)?;
+        self.subscribe(wire_name)?;
+        self.append_with_flags(wire_name, &[], message)
+    }
+}
+
+pub struct SeedProbes {
+    pub flag: Vec<u8>,
+    pub no_message_id: Option<Vec<u8>>,
+    pub shared_message_id: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MailboxSeed {
+    pub paths: Vec<String>,
+    pub histogram: HashMap<String, usize>,
+    pub total_appends: usize,
+    pub extras: ExtraAppends,
+    pub appends: Vec<SeededAppend>,
+}
+
+impl MailboxSeed {
+    fn record(&mut self, target: &str, raw: Vec<u8>, flags: Vec<String>, tag: SeedTag) {
+        *self.histogram.entry(target.to_owned()).or_insert(0) += 1;
+        self.total_appends += 1;
+        self.appends.push(SeededAppend {
+            raw,
+            target: target.to_owned(),
+            flags,
+            tag,
+        });
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SeededAppend {
+    pub raw: Vec<u8>,
+    pub target: String,
+    pub flags: Vec<String>,
+    pub tag: SeedTag,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeedTag {
+    Bulk(usize),
+    Dedup,
+    FlagProbe,
+    NoMessageId,
+    SharedMid,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExtraAppends {
+    pub dedup_target: Option<String>,
+    pub flagged_target: Option<String>,
+    pub nomid_target: Option<String>,
+    pub mid_dedup_targets: Option<(String, String)>,
 }
 
 pub fn full_path(specs: &[MailboxSpec], key: &str, separator: char) -> Option<String> {

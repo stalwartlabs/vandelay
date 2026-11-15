@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 pub struct Semaphore {
     state: Mutex<u64>,
@@ -20,20 +20,25 @@ impl Semaphore {
     }
 
     pub fn acquire(&self) -> Permit<'_> {
-        let mut guard = lock(&self.state);
-        loop {
-            if *guard > 0 {
-                *guard -= 1;
-                return Permit { sem: self };
-            }
-            guard = wait(&self.cond, guard);
+        let mut guard = self.lock();
+        while *guard == 0 {
+            guard = self
+                .cond
+                .wait(guard)
+                .unwrap_or_else(PoisonError::into_inner);
         }
+        *guard -= 1;
+        Permit { sem: self }
     }
 
     fn release(&self) {
-        let mut guard = lock(&self.state);
+        let mut guard = self.lock();
         *guard = guard.saturating_add(1);
         self.cond.notify_one();
+    }
+
+    fn lock(&self) -> MutexGuard<'_, u64> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -44,20 +49,6 @@ pub struct Permit<'a> {
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
         self.sem.release();
-    }
-}
-
-fn lock(m: &Mutex<u64>) -> std::sync::MutexGuard<'_, u64> {
-    match m.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    }
-}
-
-fn wait<'a>(cv: &Condvar, g: std::sync::MutexGuard<'a, u64>) -> std::sync::MutexGuard<'a, u64> {
-    match cv.wait(g) {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
     }
 }
 

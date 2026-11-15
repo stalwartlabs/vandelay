@@ -4,11 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+mod common;
 mod integration;
 mod seeder;
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 
 use integration::stalwart::shared as shared_stalwart;
 use rusqlite::Connection;
@@ -16,42 +16,17 @@ use rusqlite::Connection;
 fn base_url() -> &'static str {
     shared_stalwart().base_url()
 }
-use vandelay::jmap::account::AccountSelector;
-use vandelay::jmap::http::Auth;
-use vandelay::logging::Logger;
-use vandelay::sync::import_dav::{DavAuth, DavImportConfig, DavKindArg, SourceChange};
-use vandelay::sync::{self, CommonConfig, ConnectConfig, ExportConfig, ImportConfig};
+use vandelay::archive::sources::SourceChange;
+use vandelay::export::Prune;
+use vandelay::import::dav::{DavImport, DavKindArg};
+use vandelay::net::auth::Auth;
+use vandelay::types::ObjectType;
 
-fn tmp_archive(tag: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "vandelay-{tag}-{}-{}.sqlite",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_file(&p);
-    p
-}
-
-fn common(archive: &Path) -> CommonConfig {
-    CommonConfig {
-        archive: archive.to_path_buf(),
-        threads: 4,
-        dry_run: false,
-        max_retries: 5,
-        allow_invalid_certs: true,
-        logger: Logger::from_flags(false, 0),
-    }
-}
-
-fn webdav_cfg(root_url: String, domain: &str, localpart: &str) -> DavImportConfig {
-    DavImportConfig {
+fn webdav_cfg(root_url: String, domain: &str, localpart: &str) -> DavImport {
+    DavImport {
         kind: DavKindArg::Webdav,
         url: root_url,
-        auth: DavAuth::Basic {
+        auth: Auth::Basic {
             user: format!("{localpart}@{domain}"),
             password: seeder::USER_PASSWORD.to_owned(),
         },
@@ -59,48 +34,6 @@ fn webdav_cfg(root_url: String, domain: &str, localpart: &str) -> DavImportConfi
         dav_connections: 4,
         multiget_batch: 50,
         source_change: SourceChange::Reject,
-    }
-}
-
-fn count(conn: &Connection, table: &str) -> i64 {
-    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
-        .unwrap()
-}
-
-fn jmap_basic(localpart: &str, domain: &str) -> Auth {
-    Auth::Basic {
-        user: format!("{localpart}@{domain}"),
-        password: seeder::USER_PASSWORD.to_owned(),
-    }
-}
-
-fn export_cfg(base_url: &str, domain: &str, localpart: &str, account_id: &str) -> ExportConfig {
-    ExportConfig {
-        connect: ConnectConfig {
-            url: base_url.to_owned(),
-            auth: jmap_basic(localpart, domain),
-            account: AccountSelector::Id(account_id.to_owned()),
-        },
-        objects: None,
-        prune: false,
-        yes: true,
-    }
-}
-
-fn jmap_import_cfg(
-    base_url: &str,
-    domain: &str,
-    localpart: &str,
-    account_id: &str,
-) -> ImportConfig {
-    ImportConfig {
-        connect: ConnectConfig {
-            url: base_url.to_owned(),
-            auth: jmap_basic(localpart, domain),
-            account: AccountSelector::Id(account_id.to_owned()),
-        },
-        objects: None,
-        allow_source_change: false,
     }
 }
 
@@ -125,7 +58,7 @@ fn file_blob_hashes(conn: &Connection) -> HashSet<Vec<u8>> {
 fn webdav_import_test1_walks_directory_tree() {
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test1").expect("test1");
-    let archive = tmp_archive("webdav");
+    let archive = common::tmp_archive("webdav");
 
     assert_eq!(fx.domain, seeder::DOMAIN);
     assert!(!fx.domain_id.is_empty(), "domain id resolved");
@@ -156,15 +89,14 @@ fn webdav_import_test1_walks_directory_tree() {
     );
 
     let root = format!("{}/dav/file/", fx.base_url);
-    let summary = sync::import_dav::run(
-        common(&archive),
-        webdav_cfg(root, &fx.domain, &acc.localpart),
-    )
-    .expect("import");
+    let summary = webdav_cfg(root, &fx.domain, &acc.localpart)
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("import");
     assert!(!summary.any_failed(), "import had failures: {summary:?}");
 
     let conn = Connection::open(&archive).unwrap();
-    let nodes = count(&conn, "file_nodes") as usize;
+    let nodes = common::count(&conn, "file_nodes") as usize;
     assert!(
         nodes >= seeded.file_nodes,
         "imported file_nodes ({nodes}) covers seeded layout ({})",
@@ -180,14 +112,13 @@ fn webdav_round_trip_via_jmap_export_converges() {
     let fx = seeder::provision(base_url()).expect("provision");
     let src = fx.account("test1").expect("test1");
     let tgt = fx.account("test4").expect("test4");
-    let archive = tmp_archive("webdav-rt");
+    let archive = common::tmp_archive("webdav-rt");
 
     let root = format!("{}/dav/file/", fx.base_url);
-    let imp = sync::import_dav::run(
-        common(&archive),
-        webdav_cfg(root, &fx.domain, &src.localpart),
-    )
-    .expect("dav import");
+    let imp = webdav_cfg(root, &fx.domain, &src.localpart)
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("dav import");
     assert!(!imp.any_failed(), "dav import had failures: {imp:?}");
 
     let conn = Connection::open(&archive).unwrap();
@@ -201,16 +132,23 @@ fn webdav_round_trip_via_jmap_export_converges() {
     assert!(local_files > 0, "DAV import landed files in the archive");
     drop(conn);
 
-    let e1 = sync::export::run(
-        common(&archive),
-        export_cfg(&fx.base_url, &fx.domain, &tgt.localpart, &tgt.account_id),
+    let e1 = common::export(
+        common::connect(
+            &fx.base_url,
+            common::basic(&tgt.email, &tgt.password),
+            &tgt.account_id,
+        ),
+        None,
+        Prune::Keep,
     )
+    .run(common::live_options(&archive))
+    .into_result()
     .expect("export 1");
     assert!(!e1.any_failed(), "export 1 had failures: {e1:?}");
     let created_files_1: u64 = e1
         .per_type
         .iter()
-        .filter(|(t, _)| *t == "FileNode")
+        .filter(|(t, _)| *t == ObjectType::FileNode)
         .map(|(_, c)| c.created)
         .sum();
     assert!(
@@ -218,10 +156,17 @@ fn webdav_round_trip_via_jmap_export_converges() {
         "first export created FileNode rows on the target: {e1:?}"
     );
 
-    let e2 = sync::export::run(
-        common(&archive),
-        export_cfg(&fx.base_url, &fx.domain, &tgt.localpart, &tgt.account_id),
+    let e2 = common::export(
+        common::connect(
+            &fx.base_url,
+            common::basic(&tgt.email, &tgt.password),
+            &tgt.account_id,
+        ),
+        None,
+        Prune::Keep,
     )
+    .run(common::live_options(&archive))
+    .into_result()
     .expect("export 2");
     let created_2: u64 = e2.per_type.iter().map(|(_, c)| c.created).sum();
     assert_eq!(
@@ -243,21 +188,26 @@ fn webdav_cross_protocol_parity_with_jmap_matches_blob_hashes() {
     let fx = seeder::provision(base_url()).expect("provision");
     let src = fx.account("test1").expect("test1");
 
-    let archive_jmap = tmp_archive("webdav-parity-jmap");
-    let s_jmap = sync::import_jmap::run(
-        common(&archive_jmap),
-        jmap_import_cfg(&fx.base_url, &fx.domain, &src.localpart, &src.account_id),
+    let archive_jmap = common::tmp_archive("webdav-parity-jmap");
+    let s_jmap = common::jmap_import(
+        common::connect(
+            &fx.base_url,
+            common::basic(&src.email, &src.password),
+            &src.account_id,
+        ),
+        None,
     )
+    .run(common::live_options(&archive_jmap))
+    .into_result()
     .expect("jmap import");
     assert!(!s_jmap.any_failed(), "jmap import failures: {s_jmap:?}");
 
-    let archive_dav = tmp_archive("webdav-parity-dav");
+    let archive_dav = common::tmp_archive("webdav-parity-dav");
     let root = format!("{}/dav/file/", fx.base_url);
-    let s_dav = sync::import_dav::run(
-        common(&archive_dav),
-        webdav_cfg(root, &fx.domain, &src.localpart),
-    )
-    .expect("dav import");
+    let s_dav = webdav_cfg(root, &fx.domain, &src.localpart)
+        .run(common::live_options(&archive_dav))
+        .into_result()
+        .expect("dav import");
     assert!(!s_dav.any_failed(), "dav import failures: {s_dav:?}");
 
     let conn_jmap = Connection::open(&archive_jmap).unwrap();
@@ -295,27 +245,25 @@ fn webdav_import_is_idempotent_on_second_run() {
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test1").expect("test1");
     assert!(!acc.admin_role);
-    let archive = tmp_archive("webdav-idem");
+    let archive = common::tmp_archive("webdav-idem");
 
     let root = format!("{}/dav/file/", fx.base_url);
-    sync::import_dav::run(
-        common(&archive),
-        webdav_cfg(root.clone(), &fx.domain, &acc.localpart),
-    )
-    .expect("import 1");
+    webdav_cfg(root.clone(), &fx.domain, &acc.localpart)
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("import 1");
     let conn1 = Connection::open(&archive).unwrap();
-    let n1 = count(&conn1, "file_nodes");
-    let b1 = count(&conn1, "blobs");
+    let n1 = common::count(&conn1, "file_nodes");
+    let b1 = common::count(&conn1, "blobs");
     drop(conn1);
 
-    sync::import_dav::run(
-        common(&archive),
-        webdav_cfg(root, &fx.domain, &acc.localpart),
-    )
-    .expect("import 2");
+    webdav_cfg(root, &fx.domain, &acc.localpart)
+        .run(common::live_options(&archive))
+        .into_result()
+        .expect("import 2");
     let conn2 = Connection::open(&archive).unwrap();
-    let n2 = count(&conn2, "file_nodes");
-    let b2 = count(&conn2, "blobs");
+    let n2 = common::count(&conn2, "file_nodes");
+    let b2 = common::count(&conn2, "blobs");
     assert_eq!(n1, n2, "second import does not duplicate file_nodes");
     assert_eq!(
         b1, b2,

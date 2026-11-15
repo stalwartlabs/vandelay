@@ -15,15 +15,16 @@ use integration::validate::{
 use integration::webdav::{AccountSeed, WebDav};
 use integration::{Account, Endpoint};
 
+use vandelay::archive::sources::SourceChange;
 use vandelay::error::Error;
-use vandelay::sync::import_dav;
-use vandelay::sync::import_dav::{DavAuth, DavImportConfig, DavKindArg, SourceChange};
+use vandelay::import::dav::{DavImport, DavKindArg};
+use vandelay::net::auth::Auth;
 
-fn webdav_config(account: &Account, http: &Endpoint) -> DavImportConfig {
-    DavImportConfig {
+fn webdav_config(account: &Account, http: &Endpoint) -> DavImport {
+    DavImport {
         kind: DavKindArg::Webdav,
         url: format!("http://{}:{}/{}/", http.host, http.port, account.username),
-        auth: DavAuth::Basic {
+        auth: Auth::Basic {
             user: account.username.clone(),
             password: account.password.clone(),
         },
@@ -65,7 +66,9 @@ fn webdav_starts_seeds_and_imports() {
             .find(|a| a.username == seed.username)
             .expect("account lookup");
         let archive = tmp_archive(&format!("webdav-{}", seed.username));
-        let summary = import_dav::run(common(&archive), webdav_config(account, &w.http))
+        let summary = webdav_config(account, &w.http)
+            .run(common(&archive))
+            .into_result()
             .expect("webdav import");
         assert!(
             !summary.any_failed(),
@@ -269,7 +272,9 @@ fn webdav_starts_seeds_and_imports() {
 
         drop(conn);
 
-        let summary2 = import_dav::run(common(&archive), webdav_config(account, &w.http))
+        let summary2 = webdav_config(account, &w.http)
+            .run(common(&archive))
+            .into_result()
             .expect("idempotent webdav re-import");
         assert!(
             !summary2.any_failed(),
@@ -289,7 +294,9 @@ fn webdav_starts_seeds_and_imports() {
         let vanish = seed.files.first().expect("at least one file seeded");
         w.delete_resource(account, &vanish.href)
             .expect("webdav delete file");
-        let summary_after = import_dav::run(common(&archive), webdav_config(account, &w.http))
+        let summary_after = webdav_config(account, &w.http)
+            .run(common(&archive))
+            .into_result()
             .expect("re-import after delete");
         assert!(
             !summary_after.any_failed(),
@@ -327,7 +334,9 @@ fn webdav_starts_seeds_and_imports() {
         let _added_href = w
             .add_file(account, &[], &added_name, &new_payload_bytes)
             .expect("webdav add file");
-        let summary_after_add = import_dav::run(common(&archive), webdav_config(account, &w.http))
+        let summary_after_add = webdav_config(account, &w.http)
+            .run(common(&archive))
+            .into_result()
             .expect("re-import after add");
         assert!(
             !summary_after_add.any_failed(),
@@ -388,9 +397,13 @@ fn webdav_starts_seeds_and_imports() {
     let primary = &w.accounts[0];
     let other = &w.accounts[1];
     let shared_archive = tmp_archive("webdav-source-change");
-    import_dav::run(common(&shared_archive), webdav_config(primary, &w.http))
+    webdav_config(primary, &w.http)
+        .run(common(&shared_archive))
+        .into_result()
         .expect("seed archive with primary user");
-    let err = import_dav::run(common(&shared_archive), webdav_config(other, &w.http))
+    let err = webdav_config(other, &w.http)
+        .run(common(&shared_archive))
+        .into_result()
         .expect_err("expected source-change abort");
     assert!(
         matches!(err, Error::SourceChange(_)),

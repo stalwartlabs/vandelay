@@ -15,6 +15,11 @@ use super::data::{RawFixture, load_icals, load_vcards, malformed_ical, rewrite_u
 use super::dav_client::DavSeed;
 use super::error::{ContainerError, ContainerResult};
 use super::layouts::{self, Layout};
+pub use super::layouts::{AccountSeed, CollectionPlan, SeededItem};
+use super::layouts::{
+    collection_segment, contacts_offset, contacts_per_book, events_offset, events_per_calendar,
+};
+
 use super::{Account, Endpoint};
 
 const IMAGE_NAME: &str = "tomsquest/docker-radicale";
@@ -278,69 +283,6 @@ impl Radicale {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct SeededItem {
-    pub uid: String,
-    pub href: String,
-    pub source: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CollectionPlan {
-    pub display_name: String,
-    pub base_href: String,
-    pub items: Vec<SeededItem>,
-}
-
-impl CollectionPlan {
-    fn new(display_name: String, base_href: String) -> Self {
-        Self {
-            display_name,
-            base_href,
-            items: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct AccountSeed {
-    pub username: String,
-    pub calendars: Vec<CollectionPlan>,
-    pub address_books: Vec<CollectionPlan>,
-}
-
-impl AccountSeed {
-    fn new(username: String) -> Self {
-        Self {
-            username,
-            calendars: Vec::new(),
-            address_books: Vec::new(),
-        }
-    }
-
-    pub fn total_events(&self) -> usize {
-        self.calendars.iter().map(|c| c.items.len()).sum()
-    }
-
-    pub fn total_contacts(&self) -> usize {
-        self.address_books.iter().map(|c| c.items.len()).sum()
-    }
-
-    pub fn event_uids(&self) -> HashSet<String> {
-        self.calendars
-            .iter()
-            .flat_map(|c| c.items.iter().map(|i| i.uid.clone()))
-            .collect()
-    }
-
-    pub fn contact_uids(&self) -> HashSet<String> {
-        self.address_books
-            .iter()
-            .flat_map(|c| c.items.iter().map(|i| i.uid.clone()))
-            .collect()
-    }
-}
-
 fn wait_ready(base: &str, total: Duration) -> ContainerResult<()> {
     let agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
@@ -359,50 +301,4 @@ fn wait_ready(base: &str, total: Duration) -> ContainerResult<()> {
     Err(ContainerError::Protocol(format!(
         "radicale did not become ready in {total:?}: {last_err}"
     )))
-}
-
-fn collection_segment(prefix: &str, idx: usize, name: &str) -> String {
-    let mut out = format!("{prefix}-{:02}-", idx);
-    for c in name.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-        } else if !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    out.trim_end_matches('-').to_owned()
-}
-
-fn events_per_calendar(layout: &Layout, idx: usize) -> usize {
-    if layout.calendars.is_empty() {
-        return 0;
-    }
-    let base = layout.event_count / layout.calendars.len().max(1);
-    let extra = if idx == 0 {
-        layout.event_count % layout.calendars.len()
-    } else {
-        0
-    };
-    base + extra
-}
-
-fn events_offset(layout: &Layout, idx: usize) -> usize {
-    (0..idx).map(|i| events_per_calendar(layout, i)).sum()
-}
-
-fn contacts_per_book(layout: &Layout, idx: usize) -> usize {
-    if layout.address_books.is_empty() {
-        return 0;
-    }
-    let base = layout.contact_count / layout.address_books.len().max(1);
-    let extra = if idx == 0 {
-        layout.contact_count % layout.address_books.len()
-    } else {
-        0
-    };
-    base + extra
-}
-
-fn contacts_offset(layout: &Layout, idx: usize) -> usize {
-    (0..idx).map(|i| contacts_per_book(layout, i)).sum()
 }

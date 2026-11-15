@@ -4,34 +4,42 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+use std::thread;
+
 use indexmap::IndexSet;
 use serde::de::DeserializeOwned;
-use serde_json::{Map, Value, json};
+use serde::ser::{Serialize, SerializeMap, Serializer};
+use serde_json::{Map, Value};
 
+use crate::jmap::connect::JmapAccount;
 use crate::jmap::error::JmapError;
-use crate::jmap::http::{HttpClient, format_retry_wait};
-use crate::jmap::retry::{Disposition, MethodCallKind, backoff_delay, jmap_method_disposition};
+use crate::jmap::http::JmapClient;
 use crate::jmap::session::Limits;
 use crate::jmap::wire::JmapId;
-use crate::logging::Logger;
+use crate::net::retry::{Disposition, RetryWait};
 
 pub const URN_CORE: &str = "urn:ietf:params:jmap:core";
 
 pub const URN_VACATION_RESPONSE: &str = "urn:ietf:params:jmap:vacationresponse";
 
-pub fn using_urn(method: &str) -> &'static str {
-    let prefix = method.split('/').next().unwrap_or(method);
-    match prefix {
-        "Mailbox" | "Email" => "urn:ietf:params:jmap:mail",
-        "Identity" => "urn:ietf:params:jmap:submission",
-        "SieveScript" => "urn:ietf:params:jmap:sieve",
-        "AddressBook" | "ContactCard" => "urn:ietf:params:jmap:contacts",
-        "Calendar" | "CalendarEvent" | "ParticipantIdentity" => "urn:ietf:params:jmap:calendars",
-        "FileNode" => "urn:ietf:params:jmap:filenode",
-        "Principal" => "urn:ietf:params:jmap:principals",
-        "VacationResponse" => URN_VACATION_RESPONSE,
-        "x:Account" | "x:Domain" => "urn:stalwart:jmap",
-        _ => URN_CORE,
+const ANCHOR_RESTARTS: u32 = 2;
+
+type CapabilityUrn = &'static str;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethodCallKind {
+    Read,
+    SingleObjectWrite,
+}
+
+impl MethodCallKind {
+    pub fn disposition(self, error_type: &str) -> Disposition {
+        match (error_type, self) {
+            ("serverUnavailable", _) | ("serverPartialFail", MethodCallKind::Read) => {
+                Disposition::Retry
+            }
+            _ => Disposition::Fatal,
+        }
     }
 }
 
@@ -42,9 +50,138 @@ pub struct MethodCall {
     pub call_id: String,
 }
 
+impl Serialize for MethodCall {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (&self.name, &self.args, &self.call_id).serialize(serializer)
+    }
+}
+
+impl MethodCall {
+    pub fn check_error(&self) -> Result<(), JmapError> {
+        if self.name != "error" {
+            return Ok(());
+        }
+        let error_type = self
+            .args
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if let Some(known) = hashify::map!(
+            error_type.as_bytes(),
+            KnownMethodError,
+            "anchorNotFound" => KnownMethodError::AnchorNotFound,
+            "cannotCalculateChanges" => KnownMethodError::CannotCalculateChanges,
+            "unknownMethod" => KnownMethodError::UnknownMethod,
+        ) {
+            return Err(known.error());
+        }
+        Err(JmapError::Method {
+            call_id: self.call_id.clone(),
+            error_type: error_type.to_owned(),
+            description: self
+                .args
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        })
+    }
+
+    fn decode_get<T: DeserializeOwned>(&self, out: &mut GetResult<T>) -> Result<(), JmapError> {
+        let list = self
+            .args
+            .get("list")
+            .and_then(Value::as_array)
+            .ok_or_else(|| JmapError::malformed("get response has no list array"))?;
+        out.list.reserve(list.len());
+        for item in list {
+            out.list.push(T::deserialize(item)?);
+        }
+        if let Some(not_found) = self.args.get("notFound").and_then(Value::as_array) {
+            out.not_found.extend(
+                not_found
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| JmapId(s.to_owned())),
+            );
+        }
+        if let Some(state) = self.args.get("state").and_then(Value::as_str) {
+            out.state = Some(state.to_owned());
+        }
+        Ok(())
+    }
+
+    fn decode_set(&self) -> SetOutcome {
+        let pairs = |key: &str| -> Vec<(String, Value)> {
+            self.args
+                .get(key)
+                .and_then(Value::as_object)
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default()
+        };
+        SetOutcome {
+            created: pairs("created"),
+            updated: self
+                .args
+                .get("updated")
+                .and_then(Value::as_object)
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default(),
+            destroyed: self
+                .args
+                .get("destroyed")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            not_created: pairs("notCreated"),
+            not_updated: pairs("notUpdated"),
+            not_destroyed: pairs("notDestroyed"),
+        }
+    }
+
+    fn append_ids(&self, key: &str, out: &mut Vec<JmapId>) {
+        if let Some(arr) = self.args.get(key).and_then(Value::as_array) {
+            out.extend(
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| JmapId(s.to_owned())),
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum KnownMethodError {
+    AnchorNotFound,
+    CannotCalculateChanges,
+    UnknownMethod,
+}
+
+impl KnownMethodError {
+    fn error(self) -> JmapError {
+        match self {
+            KnownMethodError::AnchorNotFound => JmapError::AnchorNotFound,
+            KnownMethodError::CannotCalculateChanges => JmapError::CannotCalculateChanges,
+            KnownMethodError::UnknownMethod => JmapError::UnknownMethod,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Request {
     calls: Vec<MethodCall>,
+}
+
+impl Serialize for Request {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("methodCalls", &self.calls)?;
+        map.serialize_entry("using", &self.using())?;
+        map.end()
+    }
 }
 
 impl Request {
@@ -74,38 +211,66 @@ impl Request {
         self.calls.is_empty()
     }
 
-    pub fn using(&self) -> Vec<String> {
-        let mut set: IndexSet<String> = IndexSet::new();
-        set.insert(URN_CORE.to_owned());
-        for c in &self.calls {
-            set.insert(using_urn(&c.name).to_owned());
+    pub fn using(&self) -> IndexSet<&'static str> {
+        let mut set = IndexSet::with_capacity(self.calls.len() + 1);
+        set.insert(URN_CORE);
+        for call in &self.calls {
+            set.insert(Request::capability_of(&call.name));
         }
-        set.into_iter().collect()
+        set
     }
 
-    fn envelope(&self) -> Value {
-        let method_calls: Vec<Value> = self
-            .calls
-            .iter()
-            .map(|c| json!([c.name, c.args, c.call_id]))
-            .collect();
-        json!({ "using": self.using(), "methodCalls": method_calls })
+    pub fn capability_of(method: &str) -> &'static str {
+        let prefix = method.split_once('/').map_or(method, |(prefix, _)| prefix);
+        hashify::map!(
+            prefix.as_bytes(),
+            CapabilityUrn,
+            "Mailbox" => "urn:ietf:params:jmap:mail",
+            "Email" => "urn:ietf:params:jmap:mail",
+            "Identity" => "urn:ietf:params:jmap:submission",
+            "SieveScript" => "urn:ietf:params:jmap:sieve",
+            "AddressBook" => "urn:ietf:params:jmap:contacts",
+            "ContactCard" => "urn:ietf:params:jmap:contacts",
+            "Calendar" => "urn:ietf:params:jmap:calendars",
+            "CalendarEvent" => "urn:ietf:params:jmap:calendars",
+            "ParticipantIdentity" => "urn:ietf:params:jmap:calendars",
+            "FileNode" => "urn:ietf:params:jmap:filenode",
+            "Principal" => "urn:ietf:params:jmap:principals",
+            "VacationResponse" => URN_VACATION_RESPONSE,
+            "x:Account" => "urn:stalwart:jmap",
+            "x:Domain" => "urn:stalwart:jmap",
+        )
+        .copied()
+        .unwrap_or(URN_CORE)
+    }
+
+    fn encode(&self, limits: Option<&Limits>) -> Result<Vec<u8>, JmapError> {
+        if let Some(limits) = limits
+            && u64::try_from(self.calls.len()).unwrap_or(u64::MAX) > limits.max_calls_in_request
+        {
+            return Err(JmapError::RequestTooLarge);
+        }
+        let payload = serde_json::to_vec(self)?;
+        if let Some(limits) = limits
+            && u64::try_from(payload.len()).unwrap_or(u64::MAX) > limits.max_size_request
+        {
+            return Err(JmapError::RequestTooLarge);
+        }
+        Ok(payload)
     }
 
     pub fn fits(&self, limits: &Limits) -> Result<(), JmapError> {
-        if self.calls.len() as u64 > limits.max_calls_in_request {
-            return Err(JmapError::RequestTooLarge);
-        }
-        let size = serde_json::to_vec(&self.envelope())?.len() as u64;
-        if size > limits.max_size_request {
-            return Err(JmapError::RequestTooLarge);
-        }
-        Ok(())
+        self.encode(Some(limits)).map(drop)
     }
 
-    pub fn send(&self, client: &HttpClient, api_url: &str) -> Result<Response, JmapError> {
-        let value = client.post_json(api_url, &self.envelope())?;
-        Response::parse(value)
+    pub fn send(&self, client: &JmapClient, api_url: &str) -> Result<Response, JmapError> {
+        let payload = self.encode(None)?;
+        Response::parse(client.post_payload(api_url, &payload)?)
+    }
+
+    fn send_within(&self, account: &JmapAccount, limits: &Limits) -> Result<Response, JmapError> {
+        let payload = self.encode(Some(limits))?;
+        Response::parse(account.client().post_payload(account.api_url(), &payload)?)
     }
 }
 
@@ -115,33 +280,37 @@ pub struct Response {
 }
 
 impl Response {
-    fn parse(value: Value) -> Result<Response, JmapError> {
-        let arr = value
-            .get("methodResponses")
-            .and_then(Value::as_array)
-            .ok_or_else(|| JmapError::malformed("response has no methodResponses array"))?;
-        let mut out = Vec::with_capacity(arr.len());
-        for entry in arr {
-            let triple = entry.as_array().filter(|t| t.len() == 3).ok_or_else(|| {
-                JmapError::malformed("methodResponse is not a [name,args,id] triple")
-            })?;
-            let name = triple[0]
-                .as_str()
-                .ok_or_else(|| JmapError::malformed("methodResponse name is not a string"))?
-                .to_owned();
-            let call_id = triple[2]
-                .as_str()
-                .ok_or_else(|| JmapError::malformed("methodResponse callId is not a string"))?
-                .to_owned();
-            out.push(MethodCall {
+    fn parse(mut value: Value) -> Result<Response, JmapError> {
+        let Some(Value::Array(entries)) = value.get_mut("methodResponses").map(Value::take) else {
+            return Err(JmapError::malformed(
+                "response has no methodResponses array",
+            ));
+        };
+        let mut method_responses = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let Ok([name, args, call_id]) = <[Value; 3]>::try_from(match entry {
+                Value::Array(triple) => triple,
+                _ => Vec::new(),
+            }) else {
+                return Err(JmapError::malformed(
+                    "methodResponse is not a [name,args,id] triple",
+                ));
+            };
+            let Value::String(name) = name else {
+                return Err(JmapError::malformed("methodResponse name is not a string"));
+            };
+            let Value::String(call_id) = call_id else {
+                return Err(JmapError::malformed(
+                    "methodResponse callId is not a string",
+                ));
+            };
+            method_responses.push(MethodCall {
                 name,
-                args: triple[1].clone(),
+                args,
                 call_id,
             });
         }
-        Ok(Response {
-            method_responses: out,
-        })
+        Ok(Response { method_responses })
     }
 
     pub fn first(&self) -> Result<&MethodCall, JmapError> {
@@ -158,154 +327,38 @@ impl Response {
     }
 }
 
-pub fn check_method_error(mr: &MethodCall) -> Result<(), JmapError> {
-    if mr.name != "error" {
-        return Ok(());
-    }
-    let error_type = mr
-        .args
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_owned();
-    if error_type == "anchorNotFound" {
-        return Err(JmapError::AnchorNotFound);
-    }
-    if error_type == "cannotCalculateChanges" {
-        return Err(JmapError::CannotCalculateChanges);
-    }
-    if error_type == "unknownMethod" {
-        return Err(JmapError::UnknownMethod);
-    }
-    let description = mr
-        .args
-        .get("description")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    Err(JmapError::Method {
-        call_id: mr.call_id.clone(),
-        error_type,
-        description,
-    })
-}
-
-fn method_error_is_retryable(err: &JmapError, kind: MethodCallKind) -> bool {
-    match err {
-        JmapError::Method { error_type, .. } => {
-            jmap_method_disposition(error_type, kind) == Disposition::Retryable
-        }
-        _ => false,
-    }
-}
-
-pub fn retry_method_call<T>(
-    client: &HttpClient,
-    kind: MethodCallKind,
-    logger: &Logger,
-    mut attempt: impl FnMut() -> Result<T, JmapError>,
-) -> Result<T, JmapError> {
-    let policy = *client.retry();
-    let mut tries = 0u32;
-    loop {
-        let err = match attempt() {
-            Ok(value) => return Ok(value),
-            Err(e) => e,
-        };
-        if tries >= policy.max_retries || !method_error_is_retryable(&err, kind) {
-            return Err(err);
-        }
-        tries += 1;
-        let delay = backoff_delay(&policy, tries);
-        client.rate_limit().cooldown().arm(delay);
-        logger.warn(&format!(
-            "{err}; retrying in {} ({tries}/{})",
-            format_retry_wait(delay),
-            policy.max_retries
-        ));
-        std::thread::sleep(delay);
-    }
-}
-
-fn ids_array(ids: &[JmapId]) -> Value {
-    Value::Array(ids.iter().map(|i| Value::String(i.0.clone())).collect())
-}
-
-pub fn query_all_ids(
-    client: &HttpClient,
-    api_url: &str,
-    account_id: &str,
-    type_name: &str,
-    limits: &Limits,
-) -> Result<Vec<JmapId>, JmapError> {
-    let mut restarts = 0u32;
-    loop {
-        match query_pages(client, api_url, account_id, type_name, limits) {
-            Ok(ids) => return Ok(ids),
-            Err(JmapError::AnchorNotFound) if restarts < 2 => {
-                restarts += 1;
+impl JmapClient {
+    pub fn retry_method<T>(
+        &self,
+        kind: MethodCallKind,
+        mut attempt: impl FnMut() -> Result<T, JmapError>,
+    ) -> Result<T, JmapError> {
+        let policy = *self.retry();
+        let mut tries = 0u32;
+        loop {
+            let err = match attempt() {
+                Ok(value) => return Ok(value),
+                Err(e) => e,
+            };
+            let retryable = matches!(
+                &err,
+                JmapError::Method { error_type, .. }
+                    if kind.disposition(error_type) == Disposition::Retry
+            );
+            if tries >= policy.max_retries || !retryable {
+                return Err(err);
             }
-            Err(e) => return Err(e),
+            tries += 1;
+            let delay = self.backoff(tries);
+            self.rate_limit().cooldown().arm(delay);
+            self.logger().warn(format_args!(
+                "{err}; retrying in {} ({tries}/{})",
+                RetryWait(delay),
+                policy.max_retries
+            ));
+            thread::sleep(delay);
         }
     }
-}
-
-fn query_pages(
-    client: &HttpClient,
-    api_url: &str,
-    account_id: &str,
-    type_name: &str,
-    limits: &Limits,
-) -> Result<Vec<JmapId>, JmapError> {
-    let limit = limits.max_objects_in_get.max(1);
-    let mut collected: Vec<JmapId> = Vec::new();
-    let mut page_size: Option<usize> = None;
-    let mut anchor: Option<String> = None;
-
-    loop {
-        let mut args = Map::new();
-        args.insert("accountId".to_owned(), Value::String(account_id.to_owned()));
-        args.insert("limit".to_owned(), Value::from(limit));
-        if let Some(a) = &anchor {
-            args.insert("anchor".to_owned(), Value::String(a.clone()));
-            args.insert("anchorOffset".to_owned(), Value::from(1));
-        }
-        let mut req = Request::new();
-        req.call(format!("{type_name}/query"), Value::Object(args), "q");
-        let resp = req.send(client, api_url)?;
-        let mr = resp.first()?;
-        check_method_error(mr)?;
-        let ids = mr
-            .args
-            .get("ids")
-            .and_then(Value::as_array)
-            .ok_or_else(|| JmapError::malformed("query response has no ids array"))?;
-        let this_len = ids.len();
-        for v in ids {
-            let s = v
-                .as_str()
-                .ok_or_else(|| JmapError::malformed("query id is not a string"))?;
-            collected.push(JmapId(s.to_owned()));
-        }
-        match page_size {
-            None => {
-                if this_len == 0 {
-                    break;
-                }
-                page_size = Some(this_len);
-            }
-            Some(full) => {
-                if this_len == 0 || this_len < full {
-                    break;
-                }
-            }
-        }
-        let last = collected
-            .last()
-            .map(|i| i.0.clone())
-            .ok_or_else(|| JmapError::malformed("non-empty page yielded no anchor"))?;
-        anchor = Some(last);
-    }
-    Ok(collected)
 }
 
 #[derive(Debug)]
@@ -325,131 +378,6 @@ impl<T> Default for GetResult<T> {
     }
 }
 
-struct GetCtx<'a> {
-    client: &'a HttpClient,
-    api_url: &'a str,
-    account_id: &'a str,
-    type_name: &'a str,
-    properties: Option<&'a [&'a str]>,
-    limits: &'a Limits,
-}
-
-pub fn get_objects<T: DeserializeOwned>(
-    client: &HttpClient,
-    api_url: &str,
-    account_id: &str,
-    type_name: &str,
-    ids: &[JmapId],
-    properties: Option<&[&str]>,
-    limits: &Limits,
-) -> Result<GetResult<T>, JmapError> {
-    let ctx = GetCtx {
-        client,
-        api_url,
-        account_id,
-        type_name,
-        properties,
-        limits,
-    };
-    let mut out = GetResult::default();
-    let chunk = limits.max_objects_in_get.max(1) as usize;
-    let mut start = 0;
-    while start < ids.len() {
-        let end = (start + chunk).min(ids.len());
-        get_chunk(&ctx, &ids[start..end], &mut out)?;
-        start = end;
-    }
-    Ok(out)
-}
-
-fn get_chunk<T: DeserializeOwned>(
-    ctx: &GetCtx<'_>,
-    ids: &[JmapId],
-    out: &mut GetResult<T>,
-) -> Result<(), JmapError> {
-    let mut args = Map::new();
-    args.insert(
-        "accountId".to_owned(),
-        Value::String(ctx.account_id.to_owned()),
-    );
-    args.insert("ids".to_owned(), ids_array(ids));
-    if let Some(props) = ctx.properties {
-        let mut p: Vec<Value> = props
-            .iter()
-            .map(|s| Value::String((*s).to_owned()))
-            .collect();
-        p.push(Value::String("id".to_owned()));
-        args.insert("properties".to_owned(), Value::Array(p));
-    }
-    let mut req = Request::new();
-    req.call(format!("{}/get", ctx.type_name), Value::Object(args), "g");
-    let send_result: Result<(), JmapError> = if req.fits(ctx.limits).is_err() {
-        Err(JmapError::RequestTooLarge)
-    } else {
-        match req.send(ctx.client, ctx.api_url) {
-            Ok(resp) => {
-                let mr = resp.first()?;
-                check_method_error(mr)?;
-                decode_get(mr, out)
-            }
-            Err(e) => Err(e),
-        }
-    };
-    match send_result {
-        Ok(()) => Ok(()),
-        Err(JmapError::RequestTooLarge) => {
-            if ids.len() <= 1 {
-                return Err(JmapError::SingleObjectTooLarge(format!(
-                    "{}/get of a single id exceeds maxSizeRequest",
-                    ctx.type_name
-                )));
-            }
-            let mid = ids.len() / 2;
-            get_chunk(ctx, &ids[..mid], out)?;
-            get_chunk(ctx, &ids[mid..], out)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-pub fn get_all<T: DeserializeOwned>(
-    client: &HttpClient,
-    api_url: &str,
-    account_id: &str,
-    type_name: &str,
-) -> Result<GetResult<T>, JmapError> {
-    let mut args = Map::new();
-    args.insert("accountId".to_owned(), Value::String(account_id.to_owned()));
-    args.insert("ids".to_owned(), Value::Null);
-    let mut req = Request::new();
-    req.call(format!("{type_name}/get"), Value::Object(args), "g");
-    let resp = req.send(client, api_url)?;
-    let mr = resp.first()?;
-    check_method_error(mr)?;
-    let mut out = GetResult::default();
-    decode_get(mr, &mut out)?;
-    Ok(out)
-}
-
-pub fn get_state(
-    client: &HttpClient,
-    api_url: &str,
-    account_id: &str,
-    type_name: &str,
-) -> Result<Option<String>, JmapError> {
-    let mut args = Map::new();
-    args.insert("accountId".to_owned(), Value::String(account_id.to_owned()));
-    args.insert("ids".to_owned(), Value::Array(Vec::new()));
-    let mut req = Request::new();
-    req.call(format!("{type_name}/get"), Value::Object(args), "g");
-    let resp = req.send(client, api_url)?;
-    let mr = resp.first()?;
-    check_method_error(mr)?;
-    let mut out: GetResult<Value> = GetResult::default();
-    decode_get(mr, &mut out)?;
-    Ok(out.state)
-}
-
 #[derive(Debug, Default)]
 pub struct ChangesResult {
     pub created: Vec<JmapId>,
@@ -458,93 +386,13 @@ pub struct ChangesResult {
     pub new_state: String,
 }
 
-pub fn get_changes(
-    client: &HttpClient,
-    api_url: &str,
-    account_id: &str,
-    type_name: &str,
-    since_state: &str,
-    limits: &Limits,
-) -> Result<ChangesResult, JmapError> {
-    let mut out = ChangesResult::default();
-    let mut since = since_state.to_owned();
-    loop {
-        let mut args = Map::new();
-        args.insert("accountId".to_owned(), Value::String(account_id.to_owned()));
-        args.insert("sinceState".to_owned(), Value::String(since.clone()));
-        args.insert(
-            "maxChanges".to_owned(),
-            Value::from(limits.max_objects_in_get.max(1)),
-        );
-        let mut req = Request::new();
-        req.call(format!("{type_name}/changes"), Value::Object(args), "c");
-        let resp = req.send(client, api_url)?;
-        let mr = resp.first()?;
-        check_method_error(mr)?;
-        let new_state = mr
-            .args
-            .get("newState")
-            .and_then(Value::as_str)
-            .ok_or_else(|| JmapError::malformed("changes response has no newState"))?
-            .to_owned();
-        append_id_array(&mr.args, "created", &mut out.created);
-        append_id_array(&mr.args, "updated", &mut out.updated);
-        append_id_array(&mr.args, "destroyed", &mut out.destroyed);
-        let has_more = mr
-            .args
-            .get("hasMoreChanges")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        out.new_state = new_state.clone();
-        if !has_more || since == new_state {
-            break;
-        }
-        since = new_state;
-    }
-    dedup_ids(&mut out.created);
-    dedup_ids(&mut out.updated);
-    dedup_ids(&mut out.destroyed);
-    Ok(out)
-}
-
-fn append_id_array(args: &Value, key: &str, out: &mut Vec<JmapId>) {
-    if let Some(arr) = args.get(key).and_then(Value::as_array) {
-        for v in arr {
-            if let Some(s) = v.as_str() {
-                out.push(JmapId(s.to_owned()));
-            }
+impl ChangesResult {
+    fn dedup(&mut self) {
+        for ids in [&mut self.created, &mut self.updated, &mut self.destroyed] {
+            let mut seen = IndexSet::with_capacity(ids.len());
+            ids.retain(|id| seen.insert(id.0.clone()));
         }
     }
-}
-
-fn dedup_ids(ids: &mut Vec<JmapId>) {
-    let mut seen = IndexSet::new();
-    ids.retain(|id| seen.insert(id.0.clone()));
-}
-
-fn decode_get<T: DeserializeOwned>(
-    mr: &MethodCall,
-    out: &mut GetResult<T>,
-) -> Result<(), JmapError> {
-    let list = mr
-        .args
-        .get("list")
-        .and_then(Value::as_array)
-        .ok_or_else(|| JmapError::malformed("get response has no list array"))?;
-    for item in list {
-        out.list.push(serde_json::from_value(item.clone())?);
-    }
-    if let Some(nf) = mr.args.get("notFound").and_then(Value::as_array) {
-        for v in nf {
-            if let Some(s) = v.as_str() {
-                out.not_found.push(JmapId(s.to_owned()));
-            }
-        }
-    }
-    if let Some(s) = mr.args.get("state").and_then(Value::as_str) {
-        out.state = Some(s.to_owned());
-    }
-    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -583,198 +431,332 @@ enum Section {
     Destroy,
 }
 
-fn collect_items(value: Option<&Value>, section: Section) -> Vec<(Section, String, Value)> {
-    match (section, value) {
-        (Section::Destroy, Some(Value::Array(ids))) => ids
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| (section, s.to_owned(), Value::Null)))
-            .collect(),
-        (_, Some(Value::Object(m))) => m
-            .iter()
-            .map(|(k, v)| (section, k.clone(), v.clone()))
-            .collect(),
-        _ => Vec::new(),
+struct SetItem {
+    section: Section,
+    key: String,
+    value: Value,
+}
+
+impl SetItem {
+    fn collect(value: Option<Value>, section: Section, out: &mut Vec<SetItem>) {
+        match (section, value) {
+            (Section::Destroy, Some(Value::Array(ids))) => {
+                out.extend(ids.into_iter().filter_map(|v| match v {
+                    Value::String(key) => Some(SetItem {
+                        section,
+                        key,
+                        value: Value::Null,
+                    }),
+                    _ => None,
+                }));
+            }
+            (_, Some(Value::Object(m))) => out.extend(m.into_iter().map(|(key, value)| SetItem {
+                section,
+                key,
+                value,
+            })),
+            _ => {}
+        }
     }
 }
 
-pub fn set_call(
-    client: &HttpClient,
-    api_url: &str,
-    account_id: &str,
-    type_name: &str,
-    body: SetRequest<'_>,
-    limits: &Limits,
-) -> Result<SetOutcome, JmapError> {
-    let mut items = collect_items(body.create.as_ref(), Section::Create);
-    items.extend(collect_items(body.update.as_ref(), Section::Update));
-    items.extend(collect_items(body.destroy.as_ref(), Section::Destroy));
+impl JmapAccount {
+    pub fn send(&self, req: &Request) -> Result<Response, JmapError> {
+        req.send(self.client(), self.api_url())
+    }
 
-    if items.is_empty() {
-        return set_send(
-            client,
-            api_url,
-            account_id,
-            type_name,
-            &[],
-            body.extra_args,
-            limits,
+    fn single_call(&self, req: &Request) -> Result<Response, JmapError> {
+        let resp = self.send(req)?;
+        resp.first()?.check_error()?;
+        Ok(resp)
+    }
+
+    fn base_args(&self) -> Map<String, Value> {
+        let mut args = Map::new();
+        args.insert(
+            "accountId".to_owned(),
+            Value::String(self.account_id().to_owned()),
         );
+        args
     }
 
-    let chunk = limits.max_objects_in_set.max(1) as usize;
-    let mut outcome = SetOutcome::default();
-    let mut start = 0;
-    while start < items.len() {
-        let end = (start + chunk).min(items.len());
-        let part = set_send(
-            client,
-            api_url,
-            account_id,
-            type_name,
-            &items[start..end],
-            body.extra_args,
-            limits,
-        )?;
-        outcome.absorb(part);
-        start = end;
-    }
-    Ok(outcome)
-}
-
-fn set_send(
-    client: &HttpClient,
-    api_url: &str,
-    account_id: &str,
-    type_name: &str,
-    items: &[(Section, String, Value)],
-    extra_args: &[(&str, Value)],
-    limits: &Limits,
-) -> Result<SetOutcome, JmapError> {
-    let mut args = Map::new();
-    args.insert("accountId".to_owned(), Value::String(account_id.to_owned()));
-    let mut create = Map::new();
-    let mut update = Map::new();
-    let mut destroy: Vec<Value> = Vec::new();
-    for (section, key, val) in items {
-        match section {
-            Section::Create => {
-                create.insert(key.clone(), val.clone());
+    pub fn query_all_ids(&self, type_name: &str) -> Result<Vec<JmapId>, JmapError> {
+        let mut restarts = 0u32;
+        loop {
+            match self.query_pages(type_name) {
+                Err(JmapError::AnchorNotFound) if restarts < ANCHOR_RESTARTS => restarts += 1,
+                other => return other,
             }
-            Section::Update => {
-                update.insert(key.clone(), val.clone());
-            }
-            Section::Destroy => destroy.push(Value::String(key.clone())),
         }
     }
-    if !create.is_empty() {
-        args.insert("create".to_owned(), Value::Object(create));
-    }
-    if !update.is_empty() {
-        args.insert("update".to_owned(), Value::Object(update));
-    }
-    if !destroy.is_empty() {
-        args.insert("destroy".to_owned(), Value::Array(destroy));
-    }
-    for (k, v) in extra_args {
-        args.insert((*k).to_owned(), v.clone());
-    }
-    let mut req = Request::new();
-    req.call(format!("{type_name}/set"), Value::Object(args), "s");
 
-    let oversize = req.fits(limits).is_err();
-    let send_result = if oversize {
-        Err(JmapError::RequestTooLarge)
-    } else {
-        req.send(client, api_url).and_then(|resp| {
+    fn query_pages(&self, type_name: &str) -> Result<Vec<JmapId>, JmapError> {
+        let limit = self.limits().max_objects_in_get.max(1);
+        let method = format!("{type_name}/query");
+        let mut collected: Vec<JmapId> = Vec::new();
+        let mut page_size: Option<usize> = None;
+        let mut anchor: Option<String> = None;
+
+        loop {
+            let mut args = self.base_args();
+            args.insert("limit".to_owned(), Value::from(limit));
+            if let Some(a) = anchor.take() {
+                args.insert("anchor".to_owned(), Value::String(a));
+                args.insert("anchorOffset".to_owned(), Value::from(1));
+            }
+            let mut req = Request::new();
+            req.call(method.as_str(), Value::Object(args), "q");
+            let resp = self.single_call(&req)?;
+            let page = resp.first()?;
+            let ids = page
+                .args
+                .get("ids")
+                .and_then(Value::as_array)
+                .ok_or_else(|| JmapError::malformed("query response has no ids array"))?;
+            let this_len = ids.len();
+            collected.reserve(this_len);
+            for v in ids {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| JmapError::malformed("query id is not a string"))?;
+                collected.push(JmapId(s.to_owned()));
+            }
+            match page_size {
+                None if this_len == 0 => break,
+                None => page_size = Some(this_len),
+                Some(full) if this_len == 0 || this_len < full => break,
+                Some(_) => {}
+            }
+            let last = collected
+                .last()
+                .map(|i| i.0.clone())
+                .ok_or_else(|| JmapError::malformed("non-empty page yielded no anchor"))?;
+            anchor = Some(last);
+        }
+        Ok(collected)
+    }
+
+    pub fn get<T: DeserializeOwned>(
+        &self,
+        type_name: &str,
+        ids: &[JmapId],
+        properties: Option<&[&str]>,
+    ) -> Result<GetResult<T>, JmapError> {
+        let mut out = GetResult::default();
+        let chunk = usize::try_from(self.limits().max_objects_in_get.max(1)).unwrap_or(usize::MAX);
+        for part in ids.chunks(chunk) {
+            self.get_chunk(type_name, part, properties, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    fn get_chunk<T: DeserializeOwned>(
+        &self,
+        type_name: &str,
+        ids: &[JmapId],
+        properties: Option<&[&str]>,
+        out: &mut GetResult<T>,
+    ) -> Result<(), JmapError> {
+        let mut args = self.base_args();
+        args.insert(
+            "ids".to_owned(),
+            Value::Array(ids.iter().map(|i| Value::String(i.0.clone())).collect()),
+        );
+        if let Some(props) = properties {
+            args.insert(
+                "properties".to_owned(),
+                Value::Array(
+                    props
+                        .iter()
+                        .chain(&["id"])
+                        .map(|s| Value::String((*s).to_owned()))
+                        .collect(),
+                ),
+            );
+        }
+        let mut req = Request::new();
+        req.call(format!("{type_name}/get"), Value::Object(args), "g");
+        let sent = req.send_within(self, self.limits()).and_then(|resp| {
             let mr = resp.first()?;
-            check_method_error(mr)?;
-            Ok(decode_set(mr))
-        })
-    };
-
-    match send_result {
-        Ok(outcome) => Ok(outcome),
-        Err(JmapError::RequestTooLarge) => {
-            if items.len() <= 1 {
-                return Err(JmapError::SingleObjectTooLarge(format!(
-                    "{type_name}/set of a single object exceeds maxSizeRequest"
-                )));
+            mr.check_error()?;
+            mr.decode_get(out)
+        });
+        match sent {
+            Err(JmapError::RequestTooLarge) if ids.len() <= 1 => {
+                Err(JmapError::SingleObjectTooLarge(format!(
+                    "{type_name}/get of a single id exceeds maxSizeRequest"
+                )))
             }
-            let mid = items.len() / 2;
-            let mut left = set_send(
-                client,
-                api_url,
-                account_id,
-                type_name,
-                &items[..mid],
-                extra_args,
-                limits,
-            )?;
-            let right = set_send(
-                client,
-                api_url,
-                account_id,
-                type_name,
-                &items[mid..],
-                extra_args,
-                limits,
-            )?;
-            left.absorb(right);
-            Ok(left)
+            Err(JmapError::RequestTooLarge) => {
+                let (head, tail) = ids.split_at(ids.len() / 2);
+                self.get_chunk(type_name, head, properties, out)?;
+                self.get_chunk(type_name, tail, properties, out)
+            }
+            other => other,
         }
-        Err(e) => Err(e),
     }
-}
 
-fn pairs(args: &Value, key: &str) -> Vec<(String, Value)> {
-    args.get(key)
-        .and_then(Value::as_object)
-        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        .unwrap_or_default()
-}
+    pub fn get_all<T: DeserializeOwned>(&self, type_name: &str) -> Result<GetResult<T>, JmapError> {
+        let mut args = self.base_args();
+        args.insert("ids".to_owned(), Value::Null);
+        let mut req = Request::new();
+        req.call(format!("{type_name}/get"), Value::Object(args), "g");
+        let resp = self.single_call(&req)?;
+        let mut out = GetResult::default();
+        resp.first()?.decode_get(&mut out)?;
+        Ok(out)
+    }
 
-fn keys(args: &Value, key: &str) -> Vec<String> {
-    args.get(key)
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default()
-}
+    pub fn state(&self, type_name: &str) -> Result<Option<String>, JmapError> {
+        let mut args = self.base_args();
+        args.insert("ids".to_owned(), Value::Array(Vec::new()));
+        let mut req = Request::new();
+        req.call(format!("{type_name}/get"), Value::Object(args), "g");
+        let resp = self.single_call(&req)?;
+        let mut out: GetResult<Value> = GetResult::default();
+        resp.first()?.decode_get(&mut out)?;
+        Ok(out.state)
+    }
 
-fn decode_set(mr: &MethodCall) -> SetOutcome {
-    SetOutcome {
-        created: pairs(&mr.args, "created"),
-        updated: mr
-            .args
-            .get("updated")
-            .and_then(Value::as_object)
-            .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default(),
-        destroyed: keys(&mr.args, "destroyed"),
-        not_created: pairs(&mr.args, "notCreated"),
-        not_updated: pairs(&mr.args, "notUpdated"),
-        not_destroyed: pairs(&mr.args, "notDestroyed"),
+    pub fn changes(&self, type_name: &str, since_state: &str) -> Result<ChangesResult, JmapError> {
+        let method = format!("{type_name}/changes");
+        let max_changes = self.limits().max_objects_in_get.max(1);
+        let mut out = ChangesResult::default();
+        let mut since = since_state.to_owned();
+        loop {
+            let mut args = self.base_args();
+            args.insert("sinceState".to_owned(), Value::String(since.clone()));
+            args.insert("maxChanges".to_owned(), Value::from(max_changes));
+            let mut req = Request::new();
+            req.call(method.as_str(), Value::Object(args), "c");
+            let resp = self.single_call(&req)?;
+            let mr = resp.first()?;
+            let new_state = mr
+                .args
+                .get("newState")
+                .and_then(Value::as_str)
+                .ok_or_else(|| JmapError::malformed("changes response has no newState"))?;
+            mr.append_ids("created", &mut out.created);
+            mr.append_ids("updated", &mut out.updated);
+            mr.append_ids("destroyed", &mut out.destroyed);
+            let has_more = mr
+                .args
+                .get("hasMoreChanges")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            out.new_state.clear();
+            out.new_state.push_str(new_state);
+            if !has_more || since == new_state {
+                break;
+            }
+            since.clear();
+            since.push_str(new_state);
+        }
+        out.dedup();
+        Ok(out)
+    }
+
+    pub fn set(&self, type_name: &str, body: SetRequest<'_>) -> Result<SetOutcome, JmapError> {
+        let mut items = Vec::new();
+        SetItem::collect(body.create, Section::Create, &mut items);
+        SetItem::collect(body.update, Section::Update, &mut items);
+        SetItem::collect(body.destroy, Section::Destroy, &mut items);
+
+        let method = format!("{type_name}/set");
+        if items.is_empty() {
+            return self.set_send(type_name, &method, &[], body.extra_args);
+        }
+
+        let chunk = usize::try_from(self.limits().max_objects_in_set.max(1)).unwrap_or(usize::MAX);
+        let mut outcome = SetOutcome::default();
+        for part in items.chunks(chunk) {
+            outcome.absorb(self.set_send(type_name, &method, part, body.extra_args)?);
+        }
+        Ok(outcome)
+    }
+
+    fn set_send(
+        &self,
+        type_name: &str,
+        method: &str,
+        items: &[SetItem],
+        extra_args: &[(&str, Value)],
+    ) -> Result<SetOutcome, JmapError> {
+        let mut args = self.base_args();
+        let mut create = Map::new();
+        let mut update = Map::new();
+        let mut destroy: Vec<Value> = Vec::new();
+        for item in items {
+            match item.section {
+                Section::Create => {
+                    create.insert(item.key.clone(), item.value.clone());
+                }
+                Section::Update => {
+                    update.insert(item.key.clone(), item.value.clone());
+                }
+                Section::Destroy => destroy.push(Value::String(item.key.clone())),
+            }
+        }
+        if !create.is_empty() {
+            args.insert("create".to_owned(), Value::Object(create));
+        }
+        if !update.is_empty() {
+            args.insert("update".to_owned(), Value::Object(update));
+        }
+        if !destroy.is_empty() {
+            args.insert("destroy".to_owned(), Value::Array(destroy));
+        }
+        for (k, v) in extra_args {
+            args.insert((*k).to_owned(), v.clone());
+        }
+        let mut req = Request::new();
+        req.call(method, Value::Object(args), "s");
+
+        let sent = req.send_within(self, self.limits()).and_then(|resp| {
+            let mr = resp.first()?;
+            mr.check_error()?;
+            Ok(mr.decode_set())
+        });
+        match sent {
+            Err(JmapError::RequestTooLarge) if items.len() <= 1 => {
+                Err(JmapError::SingleObjectTooLarge(format!(
+                    "{type_name}/set of a single object exceeds maxSizeRequest"
+                )))
+            }
+            Err(JmapError::RequestTooLarge) => {
+                let (head, tail) = items.split_at(items.len() / 2);
+                let mut left = self.set_send(type_name, method, head, extra_args)?;
+                left.absorb(self.set_send(type_name, method, tail, extra_args)?);
+                Ok(left)
+            }
+            other => other,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::logging::Level;
+    use serde_json::json;
     use std::cell::Cell;
 
     use super::*;
     use crate::error::Error;
-    use crate::jmap::http::{Auth, RetryPolicy};
+    use crate::logging::Logger;
+    use crate::net::auth::Auth;
+    use crate::net::http::{ClientOptions, TlsPolicy};
+    use crate::net::retry::RetryPolicy;
 
-    fn test_client(max_retries: u32) -> HttpClient {
-        HttpClient::new(
+    fn test_client(max_retries: u32) -> JmapClient {
+        JmapClient::new(
             Auth::Bearer {
                 token: "t".to_owned(),
             },
-            RetryPolicy::new(max_retries),
-            false,
+            ClientOptions {
+                retry: RetryPolicy::new(max_retries),
+                tls: TlsPolicy::Verify,
+                logger: Logger::new(Level::Quiet),
+            },
         )
     }
 
@@ -792,15 +774,10 @@ mod tests {
     ) -> (Result<&'static str, JmapError>, u32) {
         let client = test_client(max_retries);
         let calls = Cell::new(0u32);
-        let result = retry_method_call(
-            &client,
-            MethodCallKind::SingleObjectWrite,
-            &Logger::from_flags(true, 0),
-            || {
-                calls.set(calls.get() + 1);
-                outcome(calls.get())
-            },
-        );
+        let result = client.retry_method(MethodCallKind::SingleObjectWrite, || {
+            calls.set(calls.get() + 1);
+            outcome(calls.get())
+        });
         (result, calls.get())
     }
 
@@ -859,23 +836,26 @@ mod tests {
         r.call("Mailbox/get", json!({}), "a");
         r.call("Email/query", json!({}), "b");
         let u = r.using();
-        assert!(u.contains(&URN_CORE.to_owned()));
-        assert!(u.contains(&"urn:ietf:params:jmap:mail".to_owned()));
-        assert_eq!(u.iter().filter(|x| x.as_str() == URN_CORE).count(), 1);
+        assert!(u.contains(URN_CORE));
+        assert!(u.contains("urn:ietf:params:jmap:mail"));
+        assert_eq!(u.iter().filter(|x| **x == URN_CORE).count(), 1);
     }
 
     #[test]
     fn using_maps_principal_and_stalwart() {
         assert_eq!(
-            using_urn("Principal/query"),
+            Request::capability_of("Principal/query"),
             "urn:ietf:params:jmap:principals"
         );
-        assert_eq!(using_urn("x:Account/set"), "urn:stalwart:jmap");
+        assert_eq!(Request::capability_of("x:Account/set"), "urn:stalwart:jmap");
         assert_eq!(
-            using_urn("CalendarEvent/set"),
+            Request::capability_of("CalendarEvent/set"),
             "urn:ietf:params:jmap:calendars"
         );
-        assert_eq!(using_urn("Identity/get"), "urn:ietf:params:jmap:submission");
+        assert_eq!(
+            Request::capability_of("Identity/get"),
+            "urn:ietf:params:jmap:submission"
+        );
     }
 
     #[test]
@@ -905,8 +885,8 @@ mod tests {
             ]
         });
         let r = Response::parse(v).unwrap();
-        assert!(check_method_error(r.by_call_id("g").unwrap()).is_ok());
-        let err = check_method_error(r.by_call_id("x").unwrap()).unwrap_err();
+        assert!(r.by_call_id("g").unwrap().check_error().is_ok());
+        let err = r.by_call_id("x").unwrap().check_error().unwrap_err();
         assert!(matches!(err, JmapError::Method { .. }));
     }
 
@@ -914,7 +894,27 @@ mod tests {
     fn anchor_not_found_is_classified() {
         let v = json!({ "methodResponses": [["error", {"type": "anchorNotFound"}, "q"]] });
         let r = Response::parse(v).unwrap();
-        let err = check_method_error(r.first().unwrap()).unwrap_err();
+        let err = r.first().unwrap().check_error().unwrap_err();
         assert!(matches!(err, JmapError::AnchorNotFound));
+    }
+
+    #[test]
+    fn method_dispositions_depend_on_the_call_kind() {
+        assert_eq!(
+            MethodCallKind::Read.disposition("serverPartialFail"),
+            Disposition::Retry
+        );
+        assert_eq!(
+            MethodCallKind::SingleObjectWrite.disposition("serverPartialFail"),
+            Disposition::Fatal
+        );
+        assert_eq!(
+            MethodCallKind::SingleObjectWrite.disposition("serverUnavailable"),
+            Disposition::Retry
+        );
+        assert_eq!(
+            MethodCallKind::Read.disposition("forbidden"),
+            Disposition::Fatal
+        );
     }
 }

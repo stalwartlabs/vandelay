@@ -4,178 +4,104 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use encodify::base64::STANDARD;
 use serde_json::Value;
-use ureq::Agent;
-use ureq::config::{Config, ConfigBuilder, RedirectAuthHeaders};
-use ureq::tls::{RootCerts, TlsConfig};
-use ureq::typestate::AgentScope;
-use ureq::{ResponseExt, http::Uri};
+use ureq::ResponseExt;
+use ureq::http::{HeaderMap, Uri};
 
 use crate::jmap::error::JmapError;
 use crate::jmap::inflight::{Permit, Semaphore};
-use crate::jmap::retry::{self, Disposition, RateLimitState};
 use crate::jmap::session::Limits;
-use crate::logging::{HttpCall, LEVEL_BODIES, LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
+use crate::logging::{HttpCall, Level, Logger};
+use crate::net::auth::Auth;
+use crate::net::http::{
+    AgentProfile, BodyExcerpt, ClientOptions, HttpCore, Methods, Redirects, RetryStats,
+    TransportError,
+};
+use crate::net::retry::{Disposition, RateLimit, RetryAfter, RetryPolicy, RetryWait};
 
-const MAX_BODY: u64 = 512 * 1024 * 1024;
+const PROFILE: AgentProfile = AgentProfile {
+    redirects: Redirects::Follow,
+    methods: Methods::Standard,
+    max_body: 512 * 1024 * 1024,
+};
 
 const LONG_RETRY_THRESHOLD: Duration = Duration::from_secs(10);
 
-const BASIC: &str = "Basic ";
+const STATUS_UNAUTHORIZED: u16 = 401;
+const STATUS_FORBIDDEN: u16 = 403;
+const STATUS_PAYLOAD_TOO_LARGE: u16 = 413;
+const PROTO: &str = "JMAP";
 
-const IO_TIMEOUT: Duration = Duration::from_secs(300);
-
-#[derive(Debug, Clone)]
-pub enum Auth {
-    Basic { user: String, password: String },
-    Bearer { token: String },
-}
-
-impl Auth {
-    pub fn header_value(&self) -> String {
-        match self {
-            Auth::Basic { user, password } => {
-                let credentials = format!("{user}:{password}");
-                let mut header =
-                    String::with_capacity(BASIC.len() + STANDARD.encoded_len(credentials.len()));
-                header.push_str(BASIC);
-                STANDARD.encode_append(credentials, &mut header);
-                header
-            }
-            Auth::Bearer { token } => format!("Bearer {token}"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct RetryPolicy {
-    pub max_retries: u32,
-    pub base: Duration,
-    pub cap: Duration,
-    pub io_timeout: Duration,
-}
-
-impl RetryPolicy {
-    pub fn new(max_retries: u32) -> Self {
-        RetryPolicy {
-            max_retries,
-            base: Duration::from_millis(500),
-            cap: Duration::from_secs(30),
-            io_timeout: IO_TIMEOUT,
-        }
-    }
-
-    pub fn apply_timeouts(&self, builder: ConfigBuilder<AgentScope>) -> ConfigBuilder<AgentScope> {
-        let timeout = Some(self.io_timeout);
-        builder
-            .timeout_connect(timeout)
-            .timeout_per_read(timeout)
-            .timeout_per_write(timeout)
-    }
+struct Gates {
+    requests: Semaphore,
+    uploads: Semaphore,
 }
 
 struct Inner {
-    agent: Agent,
+    core: HttpCore,
     auth: Auth,
-    retry: RetryPolicy,
-    allow_invalid_certs: bool,
-    rate_limit: RateLimitState,
-    log_level: AtomicU8,
-    requests_gate: OnceLock<Semaphore>,
-    uploads_gate: OnceLock<Semaphore>,
+    gates: OnceLock<Gates>,
     max_upload_bytes: AtomicU64,
-    retries_total: AtomicU64,
-    retry_after_sleeps: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum Kind {
+enum Lane {
     Api,
     Upload,
 }
 
 #[derive(Clone)]
-pub struct HttpClient {
+pub struct JmapClient {
     inner: Arc<Inner>,
 }
 
 enum Attempt {
-    Ok {
+    Response {
         status: u16,
         body: Vec<u8>,
         retry_after: Option<Duration>,
-        rate_limit_headers: Vec<(String, String)>,
+        rate_headers: RateHeaders,
     },
     Transport(JmapError),
 }
 
-impl HttpClient {
-    pub fn new(auth: Auth, retry: RetryPolicy, allow_invalid_certs: bool) -> Self {
-        let config: Config = retry
-            .apply_timeouts(Config::builder())
-            .http_status_as_error(false)
-            .redirect_auth_headers(RedirectAuthHeaders::SameHost)
-            .tls_config(
-                TlsConfig::builder()
-                    .unversioned_rustls_crypto_provider(std::sync::Arc::new(
-                        rustls::crypto::aws_lc_rs::default_provider(),
-                    ))
-                    .root_certs(RootCerts::PlatformVerifier)
-                    .disable_verification(allow_invalid_certs)
-                    .build(),
-            )
-            .build();
-        HttpClient {
+struct Exchange<'a> {
+    method: &'a str,
+    url: &'a str,
+    body: Option<&'a [u8]>,
+    content_type: Option<&'a str>,
+}
+
+impl JmapClient {
+    pub fn new(auth: Auth, options: ClientOptions) -> JmapClient {
+        JmapClient {
             inner: Arc::new(Inner {
-                agent: config.new_agent(),
+                core: HttpCore::new(options, PROFILE),
                 auth,
-                retry,
-                allow_invalid_certs,
-                rate_limit: RateLimitState::new(),
-                log_level: AtomicU8::new(LEVEL_DEFAULT),
-                requests_gate: OnceLock::new(),
-                uploads_gate: OnceLock::new(),
+                gates: OnceLock::new(),
                 max_upload_bytes: AtomicU64::new(0),
-                retries_total: AtomicU64::new(0),
-                retry_after_sleeps: AtomicU64::new(0),
             }),
         }
     }
 
     pub fn set_limits(&self, limits: &Limits) {
-        let _ = self
-            .inner
-            .requests_gate
-            .set(Semaphore::new(limits.max_concurrent_requests));
-        let _ = self
-            .inner
-            .uploads_gate
-            .set(Semaphore::new(limits.max_concurrent_upload));
+        let _ = self.inner.gates.set(Gates {
+            requests: Semaphore::new(limits.max_concurrent_requests),
+            uploads: Semaphore::new(limits.max_concurrent_upload),
+        });
         self.inner
             .max_upload_bytes
             .store(limits.max_size_upload, Ordering::Relaxed);
     }
 
-    pub fn retries_observed(&self) -> u64 {
-        self.inner.retries_total.load(Ordering::Relaxed)
-    }
-
-    pub fn retry_after_sleeps(&self) -> u64 {
-        self.inner.retry_after_sleeps.load(Ordering::Relaxed)
-    }
-
-    fn acquire_requests(&self) -> Option<Permit<'_>> {
-        self.inner.requests_gate.get().map(Semaphore::acquire)
-    }
-
-    fn acquire_uploads(&self) -> Option<Permit<'_>> {
-        self.inner.uploads_gate.get().map(Semaphore::acquire)
+    pub fn stats(&self) -> RetryStats {
+        self.inner.core.stats().snapshot()
     }
 
     pub fn auth(&self) -> &Auth {
@@ -183,44 +109,47 @@ impl HttpClient {
     }
 
     pub fn retry(&self) -> &RetryPolicy {
-        &self.inner.retry
+        self.inner.core.retry()
     }
 
-    pub fn allow_invalid_certs(&self) -> bool {
-        self.inner.allow_invalid_certs
+    pub fn rate_limit(&self) -> &RateLimit {
+        self.inner.core.rate_limit()
     }
 
-    pub fn rate_limit(&self) -> &RateLimitState {
-        &self.inner.rate_limit
+    pub fn logger(&self) -> Logger {
+        self.inner.core.logger()
     }
 
-    pub fn throttle_level(&self) -> u32 {
-        self.inner.rate_limit.level()
-    }
-
-    pub fn set_logger(&self, logger: Logger) {
-        self.inner
-            .log_level
-            .store(logger.level(), Ordering::Relaxed);
-    }
-
-    fn logger(&self) -> Logger {
-        Logger::new(self.inner.log_level.load(Ordering::Relaxed))
+    pub fn backoff(&self, attempt: u32) -> Duration {
+        self.inner.core.backoff(attempt)
     }
 
     pub fn get(&self, url: &str) -> Result<String, JmapError> {
-        let body = self.execute(Kind::Api, "GET", url, None, None)?;
+        let body = self.execute(
+            Lane::Api,
+            &Exchange {
+                method: "GET",
+                url,
+                body: None,
+                content_type: None,
+            },
+        )?;
         String::from_utf8(body).map_err(|e| JmapError::Malformed(format!("non-utf8 body: {e}")))
     }
 
     pub fn post_json(&self, url: &str, body: &Value) -> Result<Value, JmapError> {
-        let payload = serde_json::to_vec(body)?;
+        self.post_payload(url, &serde_json::to_vec(body)?)
+    }
+
+    pub fn post_payload(&self, url: &str, payload: &[u8]) -> Result<Value, JmapError> {
         let raw = self.execute(
-            Kind::Api,
-            "POST",
-            url,
-            Some(&payload),
-            Some("application/json"),
+            Lane::Api,
+            &Exchange {
+                method: "POST",
+                url,
+                body: Some(payload),
+                content_type: Some("application/json"),
+            },
         )?;
         serde_json::from_slice(&raw)
             .map_err(|e| JmapError::Malformed(format!("response is not valid json: {e}")))
@@ -233,309 +162,275 @@ impl HttpClient {
         bytes: &[u8],
     ) -> Result<Value, JmapError> {
         let cap = self.inner.max_upload_bytes.load(Ordering::Relaxed);
-        if cap > 0 && (bytes.len() as u64) > cap {
+        if cap > 0 && u64::try_from(bytes.len()).unwrap_or(u64::MAX) > cap {
             return Err(JmapError::SingleObjectTooLarge(format!(
                 "blob upload of {} bytes exceeds maxSizeUpload ({cap})",
                 bytes.len()
             )));
         }
         let raw = self.execute(
-            Kind::Upload,
-            "POST",
-            upload_url,
-            Some(bytes),
-            Some(content_type),
+            Lane::Upload,
+            &Exchange {
+                method: "POST",
+                url: upload_url,
+                body: Some(bytes),
+                content_type: Some(content_type),
+            },
         )?;
         serde_json::from_slice(&raw)
             .map_err(|e| JmapError::Malformed(format!("upload response is not valid json: {e}")))
     }
 
     pub fn download(&self, url: &str) -> Result<Vec<u8>, JmapError> {
-        self.execute(Kind::Api, "GET", url, None, None)
+        self.execute(
+            Lane::Api,
+            &Exchange {
+                method: "GET",
+                url,
+                body: None,
+                content_type: None,
+            },
+        )
     }
 
-    fn execute(
-        &self,
-        kind: Kind,
-        method: &str,
-        url: &str,
-        body: Option<&[u8]>,
-        content_type: Option<&str>,
-    ) -> Result<Vec<u8>, JmapError> {
-        let policy = self.inner.retry;
-        let logger = self.logger();
+    fn permits(&self, lane: Lane) -> (Option<Permit<'_>>, Option<Permit<'_>>) {
+        let Some(gates) = self.inner.gates.get() else {
+            return (None, None);
+        };
+        let uploads = match lane {
+            Lane::Api => None,
+            Lane::Upload => Some(gates.uploads.acquire()),
+        };
+        (Some(gates.requests.acquire()), uploads)
+    }
+
+    fn execute(&self, lane: Lane, exchange: &Exchange<'_>) -> Result<Vec<u8>, JmapError> {
+        let core = &self.inner.core;
+        let max_retries = core.retry().max_retries;
+        let logger = core.logger();
         let mut attempt: u32 = 0;
         loop {
-            self.inner.rate_limit.cooldown().wait();
-            let attempt_outcome = {
-                let _r = self.acquire_requests();
-                let _u = if matches!(kind, Kind::Upload) {
-                    self.acquire_uploads()
-                } else {
-                    None
-                };
-                self.one_attempt(method, url, body, content_type)
+            core.rate_limit().cooldown().wait();
+            let outcome = {
+                let _permits = self.permits(lane);
+                self.one_attempt(exchange)
             };
-            match attempt_outcome {
-                Attempt::Ok { status, body, .. } if (200..300).contains(&status) => {
-                    self.inner.rate_limit.on_success();
+            match outcome {
+                Attempt::Response { status, body, .. } if (200..300).contains(&status) => {
+                    core.rate_limit().on_success();
                     return Ok(body);
                 }
-                Attempt::Ok {
+                Attempt::Response {
                     status,
                     body,
                     retry_after,
-                    rate_limit_headers,
+                    rate_headers,
                 } => {
-                    let disposition = self.status_disposition(status, &body);
-                    match disposition {
+                    let problem = serde_json::from_slice::<Value>(&body).ok();
+                    match StatusOutcome::classify(status, problem.as_ref()) {
                         StatusOutcome::Auth => {
                             return Err(JmapError::Auth(format!(
                                 "server returned {status}: {}",
-                                truncate(&body)
+                                BodyExcerpt(&body)
                             )));
                         }
-                        StatusOutcome::RequestTooLarge => {
-                            return Err(JmapError::RequestTooLarge);
-                        }
+                        StatusOutcome::RequestTooLarge => return Err(JmapError::RequestTooLarge),
                         StatusOutcome::Fatal => {
                             return Err(JmapError::HttpStatus {
                                 status,
-                                body: truncate(&body),
+                                body: BodyExcerpt(&body).to_string(),
                             });
                         }
-                        StatusOutcome::Retryable => {
-                            attempt += 1;
-                            self.inner.retries_total.fetch_add(1, Ordering::Relaxed);
-                            let detail = problem_detail(&body);
-                            let headers_blurb = format_rate_headers(&rate_limit_headers);
-                            let reason = match (&detail, headers_blurb.as_deref()) {
-                                (Some(d), Some(h)) => format!("http {status}: {d} [{h}]"),
-                                (Some(d), None) => format!("http {status}: {d}"),
-                                (None, Some(h)) => format!("http {status} [{h}]"),
-                                (None, None) => format!("http {status}"),
-                            };
-                            if attempt > policy.max_retries {
-                                return Err(JmapError::RetriesExhausted(format!(
-                                    "{method} {url} kept returning {reason}"
-                                )));
-                            }
-                            if retry_after.is_some() {
-                                self.inner
-                                    .retry_after_sleeps
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                            let delay = self.inner.rate_limit.on_throttle(&policy, retry_after);
-                            if delay >= LONG_RETRY_THRESHOLD {
-                                logger.warn(&format!(
-                                    "server rate-limited ({reason}); waiting {} before retry {}/{} (shared level {})",
-                                    format_retry_wait(delay),
-                                    attempt,
-                                    policy.max_retries,
-                                    self.inner.rate_limit.level(),
-                                ));
-                            }
-                            self.log_retry(
-                                &logger,
-                                RetryLog {
-                                    method,
-                                    url,
-                                    attempt,
-                                    delay,
-                                    reason: &reason,
-                                    body: &body,
-                                },
-                            );
-                            std::thread::sleep(delay);
-                        }
+                        StatusOutcome::Retryable => {}
                     }
+                    attempt += 1;
+                    core.stats().note_retry();
+                    let reason = RetryReason {
+                        status,
+                        problem: problem.as_ref(),
+                        rate_headers: &rate_headers,
+                    }
+                    .to_string();
+                    if attempt > max_retries {
+                        return Err(JmapError::RetriesExhausted(format!(
+                            "{} {} kept returning {reason}",
+                            exchange.method, exchange.url
+                        )));
+                    }
+                    if retry_after.is_some() {
+                        core.stats().note_retry_after();
+                    }
+                    let delay = core.throttle(retry_after);
+                    if delay >= LONG_RETRY_THRESHOLD {
+                        logger.warn(format_args!(
+                            "server rate-limited ({reason}); waiting {} before retry {attempt}/{max_retries} (shared level {})",
+                            RetryWait(delay),
+                            core.rate_limit().level(),
+                        ));
+                    }
+                    self.log_retry(exchange, attempt, delay, &reason, &body);
+                    thread::sleep(delay);
                 }
-                Attempt::Transport(err) => match transport_disposition(&err) {
-                    Disposition::Fatal => return Err(err),
-                    Disposition::Retryable => {
-                        attempt += 1;
-                        self.inner.retries_total.fetch_add(1, Ordering::Relaxed);
-                        if attempt > policy.max_retries {
-                            return Err(JmapError::RetriesExhausted(format!(
-                                "{method} {url}: {err}"
-                            )));
-                        }
-                        let delay = retry::backoff_delay(&policy, attempt);
-                        if delay >= LONG_RETRY_THRESHOLD {
-                            logger.warn(&format!(
-                                "transient transport failure ({err}); waiting {} before retry {}/{}",
-                                format_retry_wait(delay),
-                                attempt,
-                                policy.max_retries,
-                            ));
-                        }
-                        self.log_retry(
-                            &logger,
-                            RetryLog {
-                                method,
-                                url,
-                                attempt,
-                                delay,
-                                reason: &err.to_string(),
-                                body: &[],
-                            },
-                        );
-                        std::thread::sleep(delay);
+                Attempt::Transport(err) => {
+                    if let JmapError::Connect(_) = err {
+                        return Err(err);
                     }
-                },
+                    attempt += 1;
+                    core.stats().note_retry();
+                    if attempt > max_retries {
+                        return Err(JmapError::RetriesExhausted(format!(
+                            "{} {}: {err}",
+                            exchange.method, exchange.url
+                        )));
+                    }
+                    let delay = core.backoff(attempt);
+                    if delay >= LONG_RETRY_THRESHOLD {
+                        logger.warn(format_args!(
+                            "transient transport failure ({err}); waiting {} before retry {attempt}/{max_retries}",
+                            RetryWait(delay),
+                        ));
+                    }
+                    self.log_retry(exchange, attempt, delay, &err.to_string(), &[]);
+                    thread::sleep(delay);
+                }
             }
         }
     }
 
-    fn one_attempt(
-        &self,
-        method: &str,
-        url: &str,
-        body: Option<&[u8]>,
-        content_type: Option<&str>,
-    ) -> Attempt {
+    fn one_attempt(&self, exchange: &Exchange<'_>) -> Attempt {
+        let core = &self.inner.core;
         let auth = self.inner.auth.header_value();
-        let logger = self.logger();
+        let logger = core.logger();
         let started = Instant::now();
-        let result = if let Some(payload) = body {
-            let mut req = self
-                .inner
-                .agent
-                .post(url)
-                .header("Authorization", auth)
-                .header("Accept", "application/json");
-            if let Some(ct) = content_type {
-                req = req.header("Content-Type", ct);
+        let result = match exchange.body {
+            Some(payload) => {
+                let mut req = core
+                    .agent()
+                    .post(exchange.url)
+                    .header("Authorization", auth)
+                    .header("Accept", "application/json");
+                if let Some(ct) = exchange.content_type {
+                    req = req.header("Content-Type", ct);
+                }
+                req.send(payload)
             }
-            req.send(payload)
-        } else {
-            self.inner
-                .agent
-                .get(url)
+            None => core
+                .agent()
+                .get(exchange.url)
                 .header("Authorization", auth)
                 .header("Accept", "application/json")
-                .call()
+                .call(),
         };
-        match result {
-            Ok(mut resp) => {
-                let status = resp.status().as_u16();
-                let final_uri = resp.get_uri().clone();
-                let response_type = resp
-                    .headers()
+        let mut resp = match result {
+            Ok(resp) => resp,
+            Err(e) => {
+                let err = JmapError::from(TransportError::from(e));
+                logger.trace_http_error(
+                    PROTO,
+                    exchange.method,
+                    exchange.url,
+                    &err.to_string(),
+                    started.elapsed(),
+                );
+                return Attempt::Transport(err);
+            }
+        };
+        let status = resp.status().as_u16();
+        let final_uri = resp.get_uri().clone();
+        let headers = resp.headers();
+        let response_type = logger
+            .enabled(Level::Bodies)
+            .then(|| {
+                headers
                     .get("content-type")
                     .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned);
-                let retry_after = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(retry_after_header);
-                let rate_limit_headers: Vec<(String, String)> = resp
-                    .headers()
-                    .iter()
-                    .filter_map(|(name, value)| {
-                        let lower = name.as_str().to_ascii_lowercase();
-                        if matches!(
-                            lower.as_str(),
-                            "retry-after" | "ratelimit" | "ratelimit-policy" | "content-type"
-                        ) {
-                            value.to_str().ok().map(|v| (lower, v.to_owned()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                match resp.body_mut().with_config().limit(MAX_BODY).read_to_vec() {
-                    Ok(bytes) => {
-                        warn_on_redirect(&logger, method, url, &final_uri);
-                        logger.trace_http(&HttpCall {
-                            proto: "JMAP",
-                            method,
-                            url,
-                            status,
-                            elapsed: started.elapsed(),
-                            note: None,
-                            request: body,
-                            request_type: content_type,
-                            response: &bytes,
-                            response_type: response_type.as_deref(),
-                        });
-                        Attempt::Ok {
-                            status,
-                            body: bytes,
-                            retry_after,
-                            rate_limit_headers,
-                        }
-                    }
-                    Err(e) => Attempt::Transport(JmapError::Transport(format!(
-                        "reading response body: {e}"
-                    ))),
+                    .map(str::to_owned)
+            })
+            .flatten();
+        let retry_after = headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(RetryAfter::parse_now);
+        let rate_headers = if (200..300).contains(&status) {
+            RateHeaders::default()
+        } else {
+            RateHeaders::collect(headers)
+        };
+        match resp
+            .body_mut()
+            .with_config()
+            .limit(PROFILE.max_body)
+            .read_to_vec()
+        {
+            Ok(bytes) => {
+                self.warn_on_redirect(exchange, &final_uri);
+                logger.trace_http(&HttpCall {
+                    proto: PROTO,
+                    method: exchange.method,
+                    url: exchange.url,
+                    status,
+                    elapsed: started.elapsed(),
+                    note: None,
+                    request: exchange.body,
+                    request_type: exchange.content_type,
+                    response: &bytes,
+                    response_type: response_type.as_deref(),
+                });
+                Attempt::Response {
+                    status,
+                    body: bytes,
+                    retry_after,
+                    rate_headers,
                 }
             }
             Err(e) => {
-                let err = map_ureq_error(e);
-                logger.trace_http_error("JMAP", method, url, &err.to_string(), started.elapsed());
-                Attempt::Transport(err)
+                Attempt::Transport(JmapError::Transport(format!("reading response body: {e}")))
             }
         }
     }
 
-    fn status_disposition(&self, status: u16, body: &[u8]) -> StatusOutcome {
-        if status == 401 || status == 403 {
-            return StatusOutcome::Auth;
+    fn warn_on_redirect(&self, exchange: &Exchange<'_>, final_uri: &Uri) {
+        if final_uri == exchange.url {
+            return;
         }
-        if status == 413 {
-            return StatusOutcome::RequestTooLarge;
-        }
-        if let Ok(problem) = serde_json::from_slice::<Value>(body)
-            && let Some(kind) = problem.get("type").and_then(Value::as_str)
-        {
-            if kind.ends_with(":requestTooLarge") {
-                return StatusOutcome::RequestTooLarge;
-            }
-            if kind.ends_with(":limit") {
-                let which = problem.get("limit").and_then(Value::as_str).unwrap_or("");
-                let subtype = problem.get("subType").and_then(Value::as_str).unwrap_or("");
-                match which {
-                    "maxSizeRequest" | "maxSizeUpload" => {
-                        return StatusOutcome::RequestTooLarge;
-                    }
-                    "maxConcurrentRequests" | "maxConcurrentUpload" => {
-                        return StatusOutcome::Retryable;
-                    }
-                    _ if subtype == "rateLimit" => {
-                        return StatusOutcome::Retryable;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        match retry::classify_http_status(status) {
-            Disposition::Retryable => StatusOutcome::Retryable,
-            Disposition::Fatal => StatusOutcome::Fatal,
+        let landed = final_uri.to_string();
+        if HttpCore::is_cross_host(exchange.url, &landed) {
+            self.logger().warn(format_args!(
+                "{} {} was redirected across hosts to {landed}; a \
+                JMAP endpoint must not redirect: verify the server's advertised base \
+                URL and that the request host matches its configured hostname",
+                exchange.method, exchange.url
+            ));
         }
     }
 
-    fn log_retry(&self, logger: &Logger, r: RetryLog<'_>) {
-        if logger.enabled(LEVEL_BODIES) {
-            let snippet = if r.body.is_empty() {
-                String::new()
+    fn log_retry(
+        &self,
+        exchange: &Exchange<'_>,
+        attempt: u32,
+        delay: Duration,
+        reason: &str,
+        body: &[u8],
+    ) {
+        let logger = self.logger();
+        let max_retries = self.retry().max_retries;
+        if logger.enabled(Level::Bodies) {
+            let (sep, excerpt) = if body.is_empty() {
+                ("", BodyExcerpt(&[]))
             } else {
-                format!(" body={}", truncate(r.body))
+                (" body=", BodyExcerpt(body))
             };
-            eprintln!(
-                "retry {}/{} {} {} after {:?} ({}){snippet}",
-                r.attempt, self.inner.retry.max_retries, r.method, r.url, r.delay, r.reason,
-            );
-        } else if logger.enabled(LEVEL_PROGRESS) {
-            eprintln!(
-                "retry {}/{} ({})",
-                r.attempt, self.inner.retry.max_retries, r.reason
-            );
+            logger.info(format_args!(
+                "retry {attempt}/{max_retries} {} {} after {delay:?} ({reason}){sep}{excerpt}",
+                exchange.method, exchange.url,
+            ));
+        } else {
+            logger.progress(format_args!("retry {attempt}/{max_retries} ({reason})"));
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatusOutcome {
     Retryable,
     Fatal,
@@ -543,121 +438,149 @@ enum StatusOutcome {
     RequestTooLarge,
 }
 
-struct RetryLog<'a> {
-    method: &'a str,
-    url: &'a str,
-    attempt: u32,
-    delay: Duration,
-    reason: &'a str,
-    body: &'a [u8],
-}
-
-fn warn_on_redirect(logger: &Logger, method: &str, requested: &str, final_uri: &Uri) {
-    let landed = final_uri.to_string();
-    if cross_host(requested, &landed) {
-        logger.warn(&format!(
-            "{method} {requested} was redirected across hosts to {landed}; a \
-            JMAP endpoint must not redirect: verify the server's advertised base \
-            URL and that the request host matches its configured hostname"
-        ));
-    }
-}
-
-pub fn cross_host(requested: &str, landed: &str) -> bool {
-    match (url::Url::parse(requested), url::Url::parse(landed)) {
-        (Ok(a), Ok(b)) => {
-            a.host_str() != b.host_str() || a.port_or_known_default() != b.port_or_known_default()
+impl StatusOutcome {
+    fn classify(status: u16, problem: Option<&Value>) -> StatusOutcome {
+        if status == STATUS_UNAUTHORIZED || status == STATUS_FORBIDDEN {
+            return StatusOutcome::Auth;
         }
-        _ => false,
-    }
-}
-
-fn transport_disposition(err: &JmapError) -> Disposition {
-    match err {
-        JmapError::Connect(_) => Disposition::Fatal,
-        _ => Disposition::Retryable,
-    }
-}
-
-fn map_ureq_error(err: ureq::Error) -> JmapError {
-    match err {
-        ureq::Error::Io(e) => JmapError::Transport(format!("io: {e}")),
-        ureq::Error::Timeout(t) => JmapError::Transport(format!("timeout: {t}")),
-        ureq::Error::HostNotFound => JmapError::Transport("host not found".to_owned()),
-        ureq::Error::ConnectionFailed => JmapError::Transport("connection failed".to_owned()),
-        ureq::Error::BodyStalled => JmapError::Transport("body stalled".to_owned()),
-        ureq::Error::Tls(m) => JmapError::Transport(format!("tls: {m}")),
-        ureq::Error::TooManyRedirects => JmapError::Connect("too many redirects".to_owned()),
-        ureq::Error::RedirectFailed => JmapError::Connect("redirect failed".to_owned()),
-        ureq::Error::TlsRequired => {
-            JmapError::Connect("server requires TLS but transport is unsecured".to_owned())
+        if status == STATUS_PAYLOAD_TOO_LARGE {
+            return StatusOutcome::RequestTooLarge;
         }
-        other => JmapError::Connect(other.to_string()),
+        if let Some(problem) = problem
+            && let Some(kind) = problem.get("type").and_then(Value::as_str)
+        {
+            if kind.ends_with(":requestTooLarge") {
+                return StatusOutcome::RequestTooLarge;
+            }
+            if kind.ends_with(":limit") {
+                let which = problem
+                    .get("limit")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if let Some(outcome) = hashify::map!(
+                    which.as_bytes(),
+                    StatusOutcome,
+                    "maxSizeRequest" => StatusOutcome::RequestTooLarge,
+                    "maxSizeUpload" => StatusOutcome::RequestTooLarge,
+                    "maxConcurrentRequests" => StatusOutcome::Retryable,
+                    "maxConcurrentUpload" => StatusOutcome::Retryable,
+                ) {
+                    return *outcome;
+                }
+                if problem.get("subType").and_then(Value::as_str) == Some("rateLimit") {
+                    return StatusOutcome::Retryable;
+                }
+            }
+        }
+        match Disposition::of_status(status) {
+            Disposition::Retry => StatusOutcome::Retryable,
+            Disposition::Fatal => StatusOutcome::Fatal,
+        }
     }
 }
 
-fn truncate(body: &[u8]) -> String {
-    let text = String::from_utf8_lossy(body);
-    if text.len() <= 512 {
-        return text.into_owned();
+#[derive(Default)]
+struct RateHeaders(Vec<String>);
+
+impl RateHeaders {
+    fn collect(headers: &HeaderMap) -> RateHeaders {
+        let mut pairs: Vec<String> = headers
+            .iter()
+            .filter(|(name, _)| {
+                hashify::set!(
+                    name.as_str().as_bytes(),
+                    "retry-after",
+                    "ratelimit",
+                    "ratelimit-policy",
+                )
+            })
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| format!("{}={value}", name.as_str()))
+            })
+            .collect();
+        pairs.sort_unstable();
+        RateHeaders(pairs)
     }
-    let end = text.floor_char_boundary(512);
-    format!("{}...", &text[..end])
 }
 
-pub fn retry_after_header(value: &str) -> Option<Duration> {
-    retry::parse_retry_after(value, SystemTime::now())
-}
-
-fn problem_detail(body: &[u8]) -> Option<String> {
-    let value: Value = serde_json::from_slice(body).ok()?;
-    let title = value.get("title").and_then(Value::as_str);
-    let detail = value.get("detail").and_then(Value::as_str);
-    match (title, detail) {
-        (Some(t), Some(d)) => Some(format!("{t}: {d}")),
-        (Some(t), None) => Some(t.to_owned()),
-        (None, Some(d)) => Some(d.to_owned()),
-        (None, None) => None,
+impl fmt::Display for RateHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut parts = self.0.iter();
+        if let Some(first) = parts.next() {
+            f.write_str(first)?;
+        }
+        for part in parts {
+            f.write_str("; ")?;
+            f.write_str(part)?;
+        }
+        Ok(())
     }
 }
 
-fn format_rate_headers(headers: &[(String, String)]) -> Option<String> {
-    if headers.is_empty() {
-        return None;
+struct ProblemDetail<'a>(&'a Value);
+
+impl ProblemDetail<'_> {
+    fn of(problem: Option<&Value>) -> Option<ProblemDetail<'_>> {
+        let problem = problem?;
+        (problem.get("title").and_then(Value::as_str).is_some()
+            || problem.get("detail").and_then(Value::as_str).is_some())
+        .then_some(ProblemDetail(problem))
     }
-    let mut parts: Vec<String> = headers
-        .iter()
-        .filter(|(name, _)| name != "content-type")
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect();
-    if parts.is_empty() {
-        return None;
-    }
-    parts.sort();
-    Some(parts.join("; "))
 }
 
-pub fn format_retry_wait(d: Duration) -> String {
-    let total = d.as_secs();
-    if total == 0 {
-        format!("{}ms", d.as_millis())
-    } else if total < 60 {
-        format!("{total}s")
-    } else if total < 3600 {
-        format!("{}m{:02}s", total / 60, total % 60)
-    } else {
-        format!(
-            "{}h{:02}m{:02}s",
-            total / 3600,
-            (total % 3600) / 60,
-            total % 60
-        )
+impl fmt::Display for ProblemDetail<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let title = self.0.get("title").and_then(Value::as_str);
+        let detail = self.0.get("detail").and_then(Value::as_str);
+        match (title, detail) {
+            (Some(t), Some(d)) => write!(f, "{t}: {d}"),
+            (Some(t), None) => f.write_str(t),
+            (None, Some(d)) => f.write_str(d),
+            (None, None) => Ok(()),
+        }
+    }
+}
+
+struct RetryReason<'a> {
+    status: u16,
+    problem: Option<&'a Value>,
+    rate_headers: &'a RateHeaders,
+}
+
+impl fmt::Display for RetryReason<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "http {}", self.status)?;
+        if let Some(detail) = ProblemDetail::of(self.problem) {
+            write!(f, ": {detail}")?;
+        }
+        if !self.rate_headers.0.is_empty() {
+            write!(f, " [{}]", self.rate_headers)?;
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logging::Level;
+    use crate::net::http::TlsPolicy;
+
+    fn client(retry: RetryPolicy) -> JmapClient {
+        JmapClient::new(
+            Auth::Bearer {
+                token: "t".to_owned(),
+            },
+            ClientOptions {
+                retry,
+                tls: TlsPolicy::Verify,
+                logger: Logger::new(Level::Default),
+            },
+        )
+    }
 
     #[test]
     fn basic_header_matches_rfc7617_example() {
@@ -684,13 +607,7 @@ mod tests {
         let holder = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
         let mut retry = RetryPolicy::new(0);
         retry.io_timeout = Duration::from_millis(200);
-        let client = HttpClient::new(
-            Auth::Bearer {
-                token: "t".to_owned(),
-            },
-            retry,
-            false,
-        );
+        let client = client(retry);
         let started = Instant::now();
         let err = client.get(&url).unwrap_err();
         assert!(
@@ -703,7 +620,7 @@ mod tests {
 
     #[test]
     fn cross_host_detects_hostname_change() {
-        assert!(cross_host(
+        assert!(HttpCore::is_cross_host(
             "https://mail.example.com/jmap",
             "https://login.example.net/sso"
         ));
@@ -711,7 +628,7 @@ mod tests {
 
     #[test]
     fn cross_host_ignores_same_host_path_change() {
-        assert!(!cross_host(
+        assert!(!HttpCore::is_cross_host(
             "https://mail.example.com/jmap",
             "https://mail.example.com/jmap/api"
         ));
@@ -719,75 +636,36 @@ mod tests {
 
     #[test]
     fn cross_host_flags_port_change() {
-        assert!(cross_host(
+        assert!(HttpCore::is_cross_host(
             "https://mail.example.com/jmap",
             "https://mail.example.com:8443/jmap"
         ));
     }
 
     #[test]
-    fn truncate_does_not_panic_on_multibyte_boundary() {
-        let mut body = vec![b'a'; 510];
-        body.extend_from_slice("\u{1F4A9}".as_bytes());
-        body.extend_from_slice(&[b'b'; 600]);
-        let s = truncate(&body);
-        assert!(s.ends_with("..."));
-        assert!(s.is_char_boundary(s.len()));
-        let inner = s.trim_end_matches('.');
-        assert!(inner.is_char_boundary(inner.len()));
-    }
-
-    #[test]
-    fn truncate_short_body_returns_verbatim() {
-        let s = truncate("héllo".as_bytes());
-        assert_eq!(s, "héllo");
-    }
-
-    #[test]
     fn limit_problem_unknown_kind_on_429_is_retried() {
-        let client = HttpClient::new(
-            Auth::Bearer {
-                token: "t".to_owned(),
-            },
-            RetryPolicy::new(0),
-            false,
-        );
         let body = br#"{"type":"urn:ietf:params:jmap:error:limit","limit":"someServerLimit"}"#;
         assert!(matches!(
-            client.status_disposition(429, body),
+            StatusOutcome::classify(429, serde_json::from_slice(body).ok().as_ref()),
             StatusOutcome::Retryable
         ));
     }
 
     #[test]
     fn limit_problem_max_size_request_is_resplit() {
-        let client = HttpClient::new(
-            Auth::Bearer {
-                token: "t".to_owned(),
-            },
-            RetryPolicy::new(0),
-            false,
-        );
         let body = br#"{"type":"urn:ietf:params:jmap:error:limit","limit":"maxSizeRequest"}"#;
         assert!(matches!(
-            client.status_disposition(400, body),
+            StatusOutcome::classify(400, serde_json::from_slice(body).ok().as_ref()),
             StatusOutcome::RequestTooLarge
         ));
     }
 
     #[test]
     fn limit_problem_max_concurrent_is_retried() {
-        let client = HttpClient::new(
-            Auth::Bearer {
-                token: "t".to_owned(),
-            },
-            RetryPolicy::new(0),
-            false,
-        );
         let body =
             br#"{"type":"urn:ietf:params:jmap:error:limit","limit":"maxConcurrentRequests"}"#;
         assert!(matches!(
-            client.status_disposition(429, body),
+            StatusOutcome::classify(429, serde_json::from_slice(body).ok().as_ref()),
             StatusOutcome::Retryable
         ));
     }
@@ -806,13 +684,7 @@ mod tests {
 
     #[test]
     fn upload_rejects_oversize_before_sending() {
-        let client = HttpClient::new(
-            Auth::Bearer {
-                token: "t".to_owned(),
-            },
-            RetryPolicy::new(0),
-            false,
-        );
+        let client = client(RetryPolicy::new(0));
         client.set_limits(&limits_with(10, 4, 4));
         let err = client
             .upload(
@@ -825,18 +697,12 @@ mod tests {
             matches!(err, JmapError::SingleObjectTooLarge(_)),
             "got {err:?}"
         );
-        assert_eq!(client.retries_observed(), 0);
+        assert_eq!(client.stats().retries_observed, 0);
     }
 
     #[test]
     fn upload_within_max_size_is_not_short_circuited() {
-        let client = HttpClient::new(
-            Auth::Bearer {
-                token: "t".to_owned(),
-            },
-            RetryPolicy::new(0),
-            false,
-        );
+        let client = client(RetryPolicy::new(0));
         client.set_limits(&limits_with(1024, 4, 4));
         let err = client
             .upload(
@@ -854,7 +720,9 @@ mod tests {
     #[test]
     fn problem_detail_extracts_title_and_detail() {
         let body = br#"{"type":"about:blank","status":429,"title":"Quota exceeded","detail":"You have exceeded the blob upload quota of 1000 files or 50000000 bytes."}"#;
-        let got = problem_detail(body).expect("title+detail");
+        let got = ProblemDetail::of(serde_json::from_slice::<Value>(body).ok().as_ref())
+            .map(|d| d.to_string())
+            .expect("title+detail");
         assert!(got.contains("Quota exceeded"));
         assert!(got.contains("50000000 bytes"));
     }
@@ -862,34 +730,31 @@ mod tests {
     #[test]
     fn problem_detail_title_only() {
         let body = br#"{"title":"Too Many Requests"}"#;
-        assert_eq!(problem_detail(body).as_deref(), Some("Too Many Requests"));
+        assert_eq!(
+            ProblemDetail::of(serde_json::from_slice::<Value>(body).ok().as_ref())
+                .map(|d| d.to_string())
+                .as_deref(),
+            Some("Too Many Requests")
+        );
     }
 
     #[test]
     fn problem_detail_returns_none_for_empty_body() {
-        assert_eq!(problem_detail(b"{}"), None);
-        assert_eq!(problem_detail(b"not json"), None);
-    }
-
-    #[test]
-    fn format_retry_wait_short_medium_long() {
-        assert_eq!(format_retry_wait(Duration::from_millis(250)), "250ms");
-        assert_eq!(format_retry_wait(Duration::from_secs(7)), "7s");
-        assert_eq!(format_retry_wait(Duration::from_secs(67)), "1m07s");
-        assert_eq!(format_retry_wait(Duration::from_secs(1427)), "23m47s");
-        assert_eq!(format_retry_wait(Duration::from_secs(3661)), "1h01m01s");
+        assert_eq!(
+            ProblemDetail::of(serde_json::from_slice::<Value>(b"{}").ok().as_ref())
+                .map(|d| d.to_string()),
+            None
+        );
+        assert_eq!(
+            ProblemDetail::of(serde_json::from_slice::<Value>(b"not json").ok().as_ref())
+                .map(|d| d.to_string()),
+            None
+        );
     }
 
     #[test]
     fn counters_start_at_zero() {
-        let client = HttpClient::new(
-            Auth::Bearer {
-                token: "t".to_owned(),
-            },
-            RetryPolicy::new(0),
-            false,
-        );
-        assert_eq!(client.retries_observed(), 0);
-        assert_eq!(client.retry_after_sleeps(), 0);
+        let client = client(RetryPolicy::new(0));
+        assert_eq!(client.stats(), RetryStats::default());
     }
 }

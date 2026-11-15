@@ -6,57 +6,43 @@
 
 mod integration;
 
-use std::collections::HashSet;
-
 use integration::Account;
-use integration::dovecot::{AccountSeed, Dovecot, flag_probe_message, shared_message_id_probe};
+use integration::dovecot::{Dovecot, no_message_id_probe, shared_message_id_probe};
+use integration::layouts::ImapSuite;
 use integration::validate::{
-    assert_message_round_trip, blob_bytes, blob_id_for_hash, cleanup, common, count,
-    email_rows_for_blob, emails_in_mailbox, keywords_for_blob, mailbox_id_by_name,
-    mailbox_id_by_path, mailbox_path, open_archive, tmp_archive,
+    blob_bytes, blob_id_for_hash, cleanup, common, count, email_rows_for_blob, open_archive,
+    tmp_archive,
 };
 
 use rusqlite::Connection;
-use vandelay::error::Error;
-use vandelay::imap::client::{ConnectMode, ImapClient};
-use vandelay::imap::transport::Connector;
-use vandelay::logging::Logger;
-use vandelay::sync::import_imap::{ImapAuth, ImapImportConfig};
-use vandelay::sync::import_managesieve::{ManageSieveAuth, ManageSieveImportConfig};
-use vandelay::sync::{import_imap, import_managesieve};
+use vandelay::archive::sources::SourceChange;
+use vandelay::imap::client::ImapClient;
+use vandelay::import::imap::SaslAuth;
+use vandelay::import::managesieve::ManageSieveImport;
+use vandelay::logging::{Level, Logger};
+use vandelay::net::http::TlsPolicy;
+use vandelay::net::sasl::SaslPayload;
+use vandelay::net::stream::Cleartext;
+use vandelay::net::stream::ConnectMode;
+use vandelay::net::stream::Connector;
 
-fn imap_config(account: &Account, imap: &integration::Endpoint) -> ImapImportConfig {
-    ImapImportConfig {
-        url: format!("imap://{}:{}", imap.host, imap.port),
-        auth: ImapAuth::Basic {
-            user: account.username.clone(),
-            password: account.password.clone(),
-        },
-        allow_cleartext: false,
-        compress: false,
-        include: Vec::new(),
-        exclude: Vec::new(),
-        exclude_special: Vec::new(),
-        folder: Vec::new(),
-        subscribed_only: false,
-        automap: true,
-        include_deleted: false,
-        mime_keywords: false,
-        fetch_batch: 64,
-        imap_connections: 2,
-        allow_source_change: false,
+fn suite(d: &Dovecot) -> ImapSuite<'_> {
+    ImapSuite {
+        server: "dovecot",
+        imap: &d.imap,
+        cleartext: Cleartext::Forbid,
     }
 }
 
-fn sieve_config(account: &Account, sieve: &integration::Endpoint) -> ManageSieveImportConfig {
-    ManageSieveImportConfig {
+fn sieve_config(account: &Account, sieve: &integration::Endpoint) -> ManageSieveImport {
+    ManageSieveImport {
         url: format!("sieve://{}:{}", sieve.host, sieve.port),
-        auth: ManageSieveAuth::Basic {
+        auth: SaslAuth::Basic {
             user: account.username.clone(),
             password: account.password.clone(),
         },
-        allow_cleartext: true,
-        allow_source_change: false,
+        cleartext: Cleartext::Allow,
+        source_change: SourceChange::Reject,
     }
 }
 
@@ -71,6 +57,7 @@ fn dovecot_starts_seeds_and_imports() {
         "seed should return stats for every account"
     );
     d.verify_seed(&seeds).expect("dovecot verify");
+    let suite = suite(&d);
 
     for seed in &seeds {
         let account = d
@@ -90,43 +77,10 @@ fn dovecot_starts_seeds_and_imports() {
         );
 
         let archive = tmp_archive(&format!("dovecot-{}", seed.username));
-        let summary =
-            import_imap::run(common(&archive), imap_config(account, &d.imap)).expect("imap import");
-        assert!(
-            !summary.any_failed(),
-            "imap import had failures for {}: {summary:?}",
-            seed.username
-        );
+        suite.import(account, &archive, "imap import");
 
         let conn = open_archive(&archive);
-        let mailbox_count = count(&conn, "mailboxes") as usize;
-        let email_count = count(&conn, "emails") as usize;
-        let blob_count = count(&conn, "blobs") as usize;
-        let expected_mailboxes = account.layout.mailboxes.len() + 1;
-        assert_eq!(
-            mailbox_count, expected_mailboxes,
-            "{}: imported {mailbox_count} mailboxes, expected exactly {expected_mailboxes}",
-            seed.username
-        );
-        assert_eq!(
-            email_count, seed.mailbox.total_appends,
-            "{}: every seeded email must land in archive (appended {}, imported {email_count})",
-            seed.username, seed.mailbox.total_appends
-        );
-        assert!(blob_count > 0, "{}: blobs interned", seed.username);
-
-        let bad_match: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM emails WHERE message_match IS NULL OR message_match = ''",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            bad_match, 0,
-            "{}: every imported email must have a non-empty message_match",
-            seed.username
-        );
+        suite.assert_seeded(&conn, account, &seed.mailbox);
 
         let nomid_target = seed
             .mailbox
@@ -134,9 +88,7 @@ fn dovecot_starts_seeds_and_imports() {
             .nomid_target
             .clone()
             .expect("nomid target");
-        let nomid_hash = blake3::hash(&integration::dovecot::no_message_id_probe())
-            .as_bytes()
-            .to_vec();
+        let nomid_hash = blake3::hash(&no_message_id_probe()).as_bytes().to_vec();
         let nomid_matches: Vec<String> = {
             let mut nomid_stmt = conn
                 .prepare(
@@ -176,32 +128,7 @@ fn dovecot_starts_seeds_and_imports() {
             );
         }
 
-        if let Some(target) = &seed.mailbox.extras.flagged_target {
-            let probe = flag_probe_message();
-            let probe_hash = blake3::hash(&probe);
-            let blob_id = blob_id_for_hash(&conn, probe_hash.as_bytes()).expect("flag probe blob");
-            let stored = blob_bytes(&conn, blob_id);
-            assert_eq!(
-                stored, probe,
-                "{}: flag probe blob bytes mismatch",
-                seed.username
-            );
-            let keywords = keywords_for_blob(&conn, blob_id);
-            let kw_set: HashSet<_> = keywords.iter().map(String::as_str).collect();
-            assert!(
-                kw_set.contains("$seen"),
-                "{}: flag probe missing $seen in keywords {keywords:?}",
-                seed.username
-            );
-            assert!(
-                kw_set.contains("$flagged"),
-                "{}: flag probe missing $flagged in keywords {keywords:?}",
-                seed.username
-            );
-            let _ = target;
-        }
-
-        if let Some((a, b)) = &seed.mailbox.extras.mid_dedup_targets {
+        if seed.mailbox.extras.mid_dedup_targets.is_some() {
             let body = shared_message_id_probe();
             let hash = blake3::hash(&body);
             let blob_id = blob_id_for_hash(&conn, hash.as_bytes()).expect("shared-mid probe blob");
@@ -226,171 +153,19 @@ fn dovecot_starts_seeds_and_imports() {
                 "{}: shared-MID emails must have identical message_match, got {matches:?}",
                 seed.username
             );
-            let _ = (a, b);
         }
 
-        if let Some(target) = &seed.mailbox.extras.dedup_target {
-            let _ = target;
-        }
-
-        for path in &seed.mailbox.paths {
-            let id = mailbox_id_by_path(&conn, path, '/').unwrap_or_else(|| {
-                panic!("{}: mailbox path {path} missing in archive", seed.username)
-            });
-            assert_eq!(mailbox_path(&conn, id, '/'), *path);
-            let expected = seed.mailbox.histogram.get(path).copied().unwrap_or(0);
-            let got = emails_in_mailbox(&conn, id) as usize;
-            assert_eq!(
-                got, expected,
-                "{}: mailbox {path} email count {got} != appended {expected}",
-                seed.username
-            );
-        }
-        for append in &seed.mailbox.appends {
-            assert_message_round_trip(
-                &conn,
-                &append.raw,
-                &append.target,
-                &format!("{}/append/{:?}", seed.username, append.tag),
-            );
-        }
-        let inbox_role: Option<String> = conn
-            .query_row("SELECT role FROM mailboxes WHERE name = 'INBOX'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(
-            inbox_role,
-            Some("inbox".to_owned()),
-            "{}: INBOX role tagged",
-            seed.username
-        );
-        let inbox_id = mailbox_id_by_name(&conn, "INBOX").expect("INBOX");
-        let inbox_seeded = seed.mailbox.histogram.get("INBOX").copied().unwrap_or(0);
-        assert_eq!(
-            emails_in_mailbox(&conn, inbox_id) as usize,
-            inbox_seeded,
-            "{}: INBOX email count mismatch",
-            seed.username
-        );
         assert_received_at_rfc3339_ish(&conn);
-
         drop(conn);
 
-        let summary2 = import_imap::run(common(&archive), imap_config(account, &d.imap))
-            .expect("idempotent imap re-import");
-        assert!(
-            !summary2.any_failed(),
-            "{}: idempotent re-import had failures: {summary2:?}",
-            seed.username
-        );
-        let conn = open_archive(&archive);
-        let email_count2 = count(&conn, "emails") as usize;
-        let mailbox_count2 = count(&conn, "mailboxes") as usize;
-        let blob_count2 = count(&conn, "blobs") as usize;
-        assert_eq!(
-            email_count2, email_count,
-            "{}: idempotent re-import added emails",
-            seed.username
-        );
-        assert_eq!(
-            mailbox_count2, mailbox_count,
-            "{}: idempotent re-import added mailboxes",
-            seed.username
-        );
-        assert_eq!(
-            blob_count2, blob_count,
-            "{}: idempotent re-import added blobs",
-            seed.username
-        );
-        drop(conn);
-
-        d.delete_first_inbox_message(account)
-            .expect("expunge first INBOX message");
-        let summary_after = import_imap::run(common(&archive), imap_config(account, &d.imap))
-            .expect("re-import after expunge");
-        assert!(
-            !summary_after.any_failed(),
-            "{}: re-import after expunge had failures",
-            seed.username
-        );
-        let conn = open_archive(&archive);
-        let email_count3 = count(&conn, "emails") as usize;
-        assert_eq!(
-            email_count3,
-            email_count - 1,
-            "{}: expunged message was not pruned",
-            seed.username
-        );
-        drop(conn);
-
-        let (added_raw, added_mid) = d
-            .append_new_message(account, "INBOX", "post-import")
-            .expect("append new INBOX message");
-        let summary_after_append =
-            import_imap::run(common(&archive), imap_config(account, &d.imap))
-                .expect("re-import after append");
-        assert!(
-            !summary_after_append.any_failed(),
-            "{}: re-import after append had failures",
-            seed.username
-        );
-        let conn = open_archive(&archive);
-        let email_count_after_append = count(&conn, "emails") as usize;
-        assert_eq!(
-            email_count_after_append, email_count,
-            "{}: append-after-expunge should restore email count to baseline",
-            seed.username
-        );
-        let added_hash = blake3::hash(&added_raw);
-        let added_blob = integration::validate::blob_id_for_hash(&conn, added_hash.as_bytes())
-            .expect("added message blob present");
-        let stored = integration::validate::blob_bytes(&conn, added_blob);
-        assert_eq!(
-            stored, added_raw,
-            "{}: added message blob bytes mismatch",
-            seed.username
-        );
-        let mid_normalised = added_mid
-            .trim_matches(|c| c == '<' || c == '>')
-            .to_ascii_lowercase();
-        let mid_found: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM emails
-                 WHERE EXISTS (SELECT 1 FROM json_each(json_extract(message_match,'$.m')) j
-                               WHERE j.value = ?1)",
-                [mid_normalised.as_str()],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(
-            mid_found >= 1,
-            "{}: added Message-ID {added_mid} not found in message_match",
-            seed.username
-        );
-        let added_inbox_id = mailbox_id_by_name(&conn, "INBOX").expect("INBOX id");
-        let added_in_inbox: bool = conn
-            .query_row(
-                "SELECT EXISTS (SELECT 1 FROM emails
-                                WHERE blob_id = ?1
-                                  AND EXISTS (SELECT 1 FROM json_each(mailbox_ids) j
-                                              WHERE j.value = ?2))",
-                rusqlite::params![added_blob, added_inbox_id],
-                |r| r.get::<_, i64>(0).map(|n| n != 0),
-            )
-            .unwrap();
-        assert!(
-            added_in_inbox,
-            "{}: added message blob not linked to INBOX",
-            seed.username
-        );
-        drop(conn);
+        suite.assert_incremental(account, &archive);
 
         if !account.layout.sieve_scripts.is_empty() {
             let sieve_archive = tmp_archive(&format!("dovecot-sieve-{}", seed.username));
-            let summary =
-                import_managesieve::run(common(&sieve_archive), sieve_config(account, &d.sieve))
-                    .expect("sieve import");
+            let summary = sieve_config(account, &d.sieve)
+                .run(common(&sieve_archive))
+                .into_result()
+                .expect("sieve import");
             assert!(
                 !summary.any_failed(),
                 "sieve import had failures for {}: {summary:?}",
@@ -468,9 +243,10 @@ fn dovecot_starts_seeds_and_imports() {
             );
             drop(conn);
 
-            let summary2 =
-                import_managesieve::run(common(&sieve_archive), sieve_config(account, &d.sieve))
-                    .expect("idempotent sieve re-import");
+            let summary2 = sieve_config(account, &d.sieve)
+                .run(common(&sieve_archive))
+                .into_result()
+                .expect("idempotent sieve re-import");
             assert!(
                 !summary2.any_failed(),
                 "{}: idempotent sieve re-import had failures",
@@ -483,19 +259,7 @@ fn dovecot_starts_seeds_and_imports() {
         cleanup(&archive);
     }
 
-    let primary = &d.accounts[0];
-    let other = &d.accounts[1];
-    let shared_archive = tmp_archive("dovecot-source-change");
-    import_imap::run(common(&shared_archive), imap_config(primary, &d.imap))
-        .expect("seed archive with primary user");
-    let err = import_imap::run(common(&shared_archive), imap_config(other, &d.imap))
-        .expect_err("expected source-change abort");
-    assert!(
-        matches!(err, Error::SourceChange(_)),
-        "expected SourceChange, got {err:?}"
-    );
-    cleanup(&shared_archive);
-
+    suite.assert_source_change(&d.accounts[0], &d.accounts[1]);
     d.stop().expect("dovecot stop");
 }
 
@@ -517,53 +281,12 @@ fn assert_received_at_rfc3339_ish(conn: &Connection) {
     }
 }
 
-fn _unused(_: &AccountSeed) {}
-
 #[test]
 #[ignore = "requires Docker"]
 fn dovecot_non_ascii_mailbox_names_round_trip() {
     let d = Dovecot::start().expect("dovecot start");
-    let account = d.accounts.first().expect("account").clone();
-
-    let mutf7_name = "Envoy&AOk-s";
-    let utf8_name = "Envoyés";
-    let message = b"From: accents@vandelay.test\r\n\
-         To: user1@vandelay.test\r\n\
-         Subject: Accents\r\n\
-         Message-ID: <accents-1@vandelay.test>\r\n\
-         Date: Wed, 01 Jan 2025 12:00:00 +0000\r\n\
-         \r\n\
-         Accented folder probe.\r\n";
-    d.create_non_ascii_mailbox(&account, mutf7_name, message)
-        .expect("create accented mailbox");
-
-    let archive = tmp_archive("dovecot-non-ascii");
-    let summary =
-        import_imap::run(common(&archive), imap_config(&account, &d.imap)).expect("imap import");
-    assert!(
-        !summary.any_failed(),
-        "an accented folder name must not fail the import: {summary:?}"
-    );
-
-    let conn = open_archive(&archive);
-    let names: Vec<String> = {
-        let mut stmt = conn
-            .prepare("SELECT name FROM mailboxes ORDER BY name")
-            .unwrap();
-        stmt.query_map([], |r| r.get::<_, String>(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect()
-    };
-    let mailbox_id = mailbox_id_by_name(&conn, utf8_name).unwrap_or_else(|| {
-        panic!("no mailbox named {utf8_name}; names must not be mojibake, got {names:?}")
-    });
-    let emails = emails_in_mailbox(&conn, mailbox_id);
-    assert_eq!(
-        emails, 1,
-        "the message inside the accented folder must be imported"
-    );
-    cleanup(&archive);
+    let account = d.accounts.first().expect("account");
+    suite(&d).assert_non_ascii_round_trip(account);
 }
 
 #[test]
@@ -571,22 +294,27 @@ fn dovecot_non_ascii_mailbox_names_round_trip() {
 fn dovecot_post_login_capability_with_imapsieve_url_is_parsed() {
     let d = Dovecot::start().expect("dovecot start");
     let account = d.accounts.first().expect("account");
-    let connector = Connector::new(true).expect("connector");
+    let connector = Connector::new(TlsPolicy::AcceptInvalid).expect("connector");
     let mut client = ImapClient::connect(
         &connector,
         &d.imap.host,
         d.imap.port,
         ConnectMode::StartTls,
-        Logger::from_flags(false, 0),
+        Logger::new(Level::Default),
     )
     .expect("connect");
-    assert!(client.has_capability("SASL-IR"));
+    assert!(client.capabilities().contains("SASL-IR"));
     client
-        .authenticate_plain(&account.username, &account.password)
+        .authenticate(SaslPayload::Plain {
+            authcid: &account.username,
+            password: &account.password,
+        })
         .expect("AUTHENTICATE PLAIN must survive the untagged post-login CAPABILITY");
     assert!(
-        client.has_capability("IMAPSIEVE=sieve://127.0.0.1:4190"),
+        client
+            .capabilities()
+            .contains("IMAPSIEVE=sieve://127.0.0.1:4190"),
         "post-login capabilities must carry the IMAPSIEVE URL: {:?}",
-        client.capabilities
+        client.capabilities()
     );
 }

@@ -4,11 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use crate::dav::client::DavClient;
-use crate::dav::href::{Href, absolute_url, normalise};
-use crate::dav::parse::DavResponse;
-use crate::dav::xml;
-use crate::jmap::error::JmapError;
+use crate::dav::client::{DavClient, MultiStatus};
+use crate::dav::error::DavError;
+use crate::dav::href::{Href, HrefError};
+use crate::dav::parse::ResourceProps;
+use crate::dav::xml::Propfind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DavKind {
@@ -26,31 +26,31 @@ impl DavKind {
         }
     }
 
-    pub fn home_set_body(self) -> Option<String> {
+    pub fn home_set_body(self) -> Option<&'static str> {
         match self {
-            DavKind::Caldav => Some(xml::propfind_calendar_home_set()),
-            DavKind::Carddav => Some(xml::propfind_addressbook_home_set()),
+            DavKind::Caldav => Some(Propfind::CalendarHomeSet.body()),
+            DavKind::Carddav => Some(Propfind::AddressbookHomeSet.body()),
             DavKind::Webdav => None,
         }
     }
 
-    pub fn principal_and_home_set_body(self) -> Option<String> {
+    pub fn principal_and_home_set_body(self) -> Option<&'static str> {
         match self {
-            DavKind::Caldav => Some(xml::propfind_principal_and_calendar_home_set()),
-            DavKind::Carddav => Some(xml::propfind_principal_and_addressbook_home_set()),
+            DavKind::Caldav => Some(Propfind::PrincipalAndCalendarHomeSet.body()),
+            DavKind::Carddav => Some(Propfind::PrincipalAndAddressbookHomeSet.body()),
             DavKind::Webdav => None,
         }
     }
 
-    pub fn collection_listing_body(self) -> String {
+    pub fn collection_listing_body(self) -> &'static str {
         match self {
-            DavKind::Caldav => xml::propfind_calendar_collections(),
-            DavKind::Carddav => xml::propfind_addressbook_collections(),
-            DavKind::Webdav => xml::propfind_webdav_listing(),
+            DavKind::Caldav => Propfind::CalendarCollections.body(),
+            DavKind::Carddav => Propfind::AddressbookCollections.body(),
+            DavKind::Webdav => Propfind::WebdavListing.body(),
         }
     }
 
-    pub fn extract_home_set(self, props: &crate::dav::parse::ResourceProps) -> Option<&str> {
+    pub fn extract_home_set(self, props: &ResourceProps) -> Option<&str> {
         match self {
             DavKind::Caldav => props.calendar_home_set.as_deref(),
             DavKind::Carddav => props.addressbook_home_set.as_deref(),
@@ -58,7 +58,7 @@ impl DavKind {
         }
     }
 
-    pub fn item_resourcetype_matches(self, props: &crate::dav::parse::ResourceProps) -> bool {
+    pub fn item_resourcetype_matches(self, props: &ResourceProps) -> bool {
         match self {
             DavKind::Caldav => props.is_calendar,
             DavKind::Carddav => props.is_addressbook,
@@ -71,17 +71,15 @@ impl DavKind {
 pub struct DiscoveredCollection {
     pub url: String,
     pub href: Href,
-    pub props: crate::dav::parse::ResourceProps,
+    pub props: ResourceProps,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiscoveryError {
     #[error("transport: {0}")]
-    Transport(#[from] JmapError),
-    #[error("xml: {0}")]
-    Parse(#[from] crate::dav::parse::ParseError),
+    Transport(#[from] DavError),
     #[error("href: {0}")]
-    Href(#[from] crate::dav::href::HrefError),
+    Href(#[from] HrefError),
     #[error("no DAV collections found under {url}")]
     NotFound { url: String },
 }
@@ -93,229 +91,189 @@ pub struct Discovery {
     pub collections: Vec<DiscoveredCollection>,
 }
 
-pub fn discover(
-    client: &DavClient,
-    kind: DavKind,
-    user_url: &str,
-) -> Result<Discovery, DiscoveryError> {
-    if let Some(disc) = try_treat_url_as_home_or_collection(client, kind, user_url)? {
-        return Ok(disc);
-    }
-    if let Some(disc) = try_via_principal(client, kind, user_url)? {
-        return Ok(disc);
-    }
-    if let Some(well_known) = kind.well_known_uri() {
-        let absolute = absolute_url(user_url, &Href::from_normalised(well_known.to_owned()))?;
-        if let Some(disc) = try_via_principal(client, kind, &absolute)? {
+impl Discovery {
+    pub fn run(
+        client: &DavClient,
+        kind: DavKind,
+        user_url: &str,
+    ) -> Result<Discovery, DiscoveryError> {
+        let probe = Probe { client, kind };
+        if let Some(disc) = probe.home_or_collection(user_url)? {
             return Ok(disc);
         }
-        if let Some(disc) = try_treat_url_as_home_or_collection(client, kind, &absolute)? {
+        if let Some(disc) = probe.via_principal(user_url)? {
             return Ok(disc);
         }
+        if let Some(well_known) = kind.well_known_uri() {
+            let absolute = Href::join_absolute(user_url, well_known)?;
+            if let Some(disc) = probe.via_principal(&absolute)? {
+                return Ok(disc);
+            }
+            if let Some(disc) = probe.home_or_collection(&absolute)? {
+                return Ok(disc);
+            }
+        }
+        Err(DiscoveryError::NotFound {
+            url: user_url.to_owned(),
+        })
     }
-    Err(DiscoveryError::NotFound {
-        url: user_url.to_owned(),
-    })
 }
 
-fn try_treat_url_as_home_or_collection(
-    client: &DavClient,
+#[derive(Clone, Copy)]
+struct Probe<'a> {
+    client: &'a DavClient,
     kind: DavKind,
-    url: &str,
-) -> Result<Option<Discovery>, DiscoveryError> {
-    let body = kind.collection_listing_body();
-    let collections = match propfind_collections(client, kind, url, &body) {
-        Ok(c) => c,
-        Err(DiscoveryError::Transport(JmapError::HttpStatus { status, .. }))
-            if (400..600).contains(&status) =>
-        {
-            return Ok(None);
-        }
-        Err(DiscoveryError::Transport(JmapError::Malformed(_)))
-        | Err(DiscoveryError::Transport(JmapError::RetriesExhausted(_))) => {
-            return Ok(None);
-        }
-        Err(e) => return Err(e),
-    };
-    if collections.is_empty() {
-        return Ok(None);
-    }
-    let principal_url = resolve_principal_url(client, kind, url)?;
-    Ok(Some(Discovery {
-        principal_url,
-        home_set_url: url.to_owned(),
-        collections,
-    }))
 }
 
-fn resolve_principal_url(
-    client: &DavClient,
-    kind: DavKind,
-    url: &str,
-) -> Result<Option<String>, DiscoveryError> {
-    if matches!(kind, DavKind::Webdav) {
-        return Ok(None);
+impl Probe<'_> {
+    fn is_dead_end(err: &DavError) -> bool {
+        match err {
+            DavError::HttpStatus { status, .. } => (400..600).contains(status),
+            DavError::RetriesExhausted(_) | DavError::Multistatus(_) => true,
+            _ => false,
+        }
     }
-    let body = xml::propfind_current_user_principal();
-    let ms = match client.propfind_responses(url, 0, &body, url) {
-        Ok(ms) => ms,
-        Err(JmapError::HttpStatus { status, .. }) if (400..600).contains(&status) => {
-            return Ok(None);
-        }
-        Err(JmapError::RetriesExhausted(_)) | Err(JmapError::Malformed(_)) => return Ok(None),
-        Err(e) => return Err(DiscoveryError::Transport(e)),
-    };
-    let final_url = ms.final_url.clone();
-    let Some(principal_href) = ms
-        .responses
-        .iter()
-        .find_map(|r| r.props.current_user_principal.as_deref())
-    else {
-        return Ok(None);
-    };
-    let resolved = absolute_url(&final_url, &normalise(&final_url, principal_href)?)?;
-    Ok(Some(resolved))
-}
 
-fn try_via_principal(
-    client: &DavClient,
-    kind: DavKind,
-    url: &str,
-) -> Result<Option<Discovery>, DiscoveryError> {
-    let Some(combined_body) = kind.principal_and_home_set_body() else {
-        return Ok(None);
-    };
-    let first_ms = match client.propfind_responses(url, 0, &combined_body, url) {
-        Ok(ms) => ms,
-        Err(JmapError::HttpStatus { status, .. }) if (400..600).contains(&status) => {
+    fn propfind(&self, url: &str, body: &str) -> Result<Option<MultiStatus>, DiscoveryError> {
+        match self.client.propfind_responses(url, 0, body, url) {
+            Ok(ms) => Ok(Some(ms)),
+            Err(e) if Probe::is_dead_end(&e) => Ok(None),
+            Err(e) => Err(DiscoveryError::Transport(e)),
+        }
+    }
+
+    fn home_or_collection(&self, url: &str) -> Result<Option<Discovery>, DiscoveryError> {
+        let collections = match self.collections(url) {
+            Ok(c) => c,
+            Err(DiscoveryError::Transport(e)) if Probe::is_dead_end(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if collections.is_empty() {
             return Ok(None);
         }
-        Err(JmapError::RetriesExhausted(_)) | Err(JmapError::Malformed(_)) => return Ok(None),
-        Err(e) => return Err(DiscoveryError::Transport(e)),
-    };
-    let first_final_url = first_ms.final_url.clone();
-    let direct_home_set = first_ms
-        .responses
-        .iter()
-        .find_map(|r| kind.extract_home_set(&r.props))
-        .map(|h| h.to_owned());
-    let (principal_url, home_set_url) = if let Some(home) = direct_home_set {
-        let resolved = absolute_url(&first_final_url, &normalise(&first_final_url, &home)?)?;
-        (first_final_url.clone(), resolved)
-    } else {
-        let principal_href = first_ms
+        let principal_url = self.principal_url(url)?;
+        Ok(Some(Discovery {
+            principal_url,
+            home_set_url: url.to_owned(),
+            collections,
+        }))
+    }
+
+    fn principal_url(&self, url: &str) -> Result<Option<String>, DiscoveryError> {
+        if self.kind == DavKind::Webdav {
+            return Ok(None);
+        }
+        let Some(ms) = self.propfind(url, Propfind::CurrentUserPrincipal.body())? else {
+            return Ok(None);
+        };
+        let Some(principal_href) = ms
             .responses
             .iter()
             .find_map(|r| r.props.current_user_principal.as_deref())
-            .map(|h| h.to_owned());
-        let principal_url = match principal_href {
-            Some(rel) => absolute_url(&first_final_url, &normalise(&first_final_url, &rel)?)?,
-            None => first_final_url.clone(),
-        };
-        let Some(home_set_body) = kind.home_set_body() else {
+        else {
             return Ok(None);
         };
-        let home_ms =
-            match client.propfind_responses(&principal_url, 0, &home_set_body, &principal_url) {
-                Ok(ms) => ms,
-                Err(JmapError::HttpStatus { status, .. }) if (400..600).contains(&status) => {
-                    return Ok(None);
-                }
-                Err(JmapError::RetriesExhausted(_)) | Err(JmapError::Malformed(_)) => {
-                    return Ok(None);
-                }
-                Err(e) => return Err(DiscoveryError::Transport(e)),
-            };
-        let principal_after_redirect = home_ms.final_url.clone();
-        let home_set_href = home_ms
+        let resolved = Href::parse(&ms.final_url, principal_href)?.to_absolute(&ms.final_url)?;
+        Ok(Some(resolved))
+    }
+
+    fn via_principal(&self, url: &str) -> Result<Option<Discovery>, DiscoveryError> {
+        let kind = self.kind;
+        let Some(combined_body) = kind.principal_and_home_set_body() else {
+            return Ok(None);
+        };
+        let Some(first_ms) = self.propfind(url, combined_body)? else {
+            return Ok(None);
+        };
+        let first_final_url = first_ms.final_url.as_str();
+        let direct_home_set = first_ms
             .responses
             .iter()
-            .find_map(|r| kind.extract_home_set(&r.props))
-            .map(|h| h.to_owned());
-        let Some(home_set_rel) = home_set_href else {
-            return Ok(None);
-        };
-        let resolved = absolute_url(
-            &principal_after_redirect,
-            &normalise(&principal_after_redirect, &home_set_rel)?,
-        )?;
-        (principal_url, resolved)
-    };
-    let listing_body = kind.collection_listing_body();
-    let collections = propfind_collections(client, kind, &home_set_url, &listing_body)?;
-    if collections.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(Discovery {
-        principal_url: Some(principal_url),
-        home_set_url,
-        collections,
-    }))
-}
-
-fn propfind_collections(
-    client: &DavClient,
-    kind: DavKind,
-    url: &str,
-    body: &str,
-) -> Result<Vec<DiscoveredCollection>, DiscoveryError> {
-    let responses = propfind_depth(client, url, 1, body)?;
-    let self_href = normalise(url, "").map(|h| h.into_string()).ok();
-    let mut out: Vec<DiscoveredCollection> = Vec::new();
-    for r in responses {
-        let is_self = self_href.as_deref() == Some(r.href.as_str());
-        if matches!(kind, DavKind::Webdav) {
-            if !r.props.is_collection {
-                continue;
-            }
-            if !is_self {
-                continue;
-            }
+            .find_map(|r| kind.extract_home_set(&r.props));
+        let (principal_url, home_set_url) = if let Some(home) = direct_home_set {
+            let resolved = Href::parse(first_final_url, home)?.to_absolute(first_final_url)?;
+            (first_final_url.to_owned(), resolved)
         } else {
-            if !kind.item_resourcetype_matches(&r.props) {
-                continue;
-            }
-            if calendar_supports_only_vfreebusy(&r.props) {
-                client.logger().warn(&format!(
-                    "calendar {} supports only {:?}; skipping",
-                    r.href.as_str(),
-                    r.props.supported_components,
-                ));
-                continue;
-            }
+            let principal_href = first_ms
+                .responses
+                .iter()
+                .find_map(|r| r.props.current_user_principal.as_deref());
+            let principal_url = match principal_href {
+                Some(rel) => Href::parse(first_final_url, rel)?.to_absolute(first_final_url)?,
+                None => first_final_url.to_owned(),
+            };
+            let Some(home_set_body) = kind.home_set_body() else {
+                return Ok(None);
+            };
+            let Some(home_ms) = self.propfind(&principal_url, home_set_body)? else {
+                return Ok(None);
+            };
+            let principal_after_redirect = home_ms.final_url.as_str();
+            let Some(home_set_rel) = home_ms
+                .responses
+                .iter()
+                .find_map(|r| kind.extract_home_set(&r.props))
+            else {
+                return Ok(None);
+            };
+            let resolved = Href::parse(principal_after_redirect, home_set_rel)?
+                .to_absolute(principal_after_redirect)?;
+            (principal_url, resolved)
+        };
+        let collections = self.collections(&home_set_url)?;
+        if collections.is_empty() {
+            return Ok(None);
         }
-        let abs = absolute_url(url, &r.href)?;
-        out.push(DiscoveredCollection {
-            url: abs,
-            href: r.href.clone(),
-            props: r.props,
-        });
+        Ok(Some(Discovery {
+            principal_url: Some(principal_url),
+            home_set_url,
+            collections,
+        }))
     }
-    Ok(out)
-}
 
-fn calendar_supports_only_vfreebusy(props: &crate::dav::parse::ResourceProps) -> bool {
-    if !props.is_calendar {
-        return false;
+    fn collections(&self, url: &str) -> Result<Vec<DiscoveredCollection>, DiscoveryError> {
+        let kind = self.kind;
+        let responses = self
+            .client
+            .propfind_responses(url, 1, kind.collection_listing_body(), url)?
+            .responses;
+        let self_href = Href::parse(url, "").map(Href::into_string).ok();
+        let mut out: Vec<DiscoveredCollection> = Vec::new();
+        for r in responses {
+            if kind == DavKind::Webdav {
+                let is_self = self_href.as_deref() == Some(r.href.as_str());
+                if !r.props.is_collection || !is_self {
+                    continue;
+                }
+            } else {
+                if !kind.item_resourcetype_matches(&r.props) {
+                    continue;
+                }
+                if Probe::supports_only_vfreebusy(&r.props) {
+                    self.client.logger().warn(format_args!(
+                        "calendar {} supports only VFREEBUSY; skipped",
+                        r.href.as_str(),
+                    ));
+                    continue;
+                }
+            }
+            out.push(DiscoveredCollection {
+                url: r.href.to_absolute(url)?,
+                href: r.href,
+                props: r.props,
+            });
+        }
+        Ok(out)
     }
-    if props.supported_components.is_empty() {
-        return false;
-    }
-    let has_useful = props
-        .supported_components
-        .iter()
-        .any(|c| matches!(c.as_str(), "VEVENT" | "VTODO" | "VJOURNAL"));
-    !has_useful
-}
 
-fn propfind_depth(
-    client: &DavClient,
-    url: &str,
-    depth: u8,
-    body: &str,
-) -> Result<Vec<DavResponse>, DiscoveryError> {
-    let ms = client.propfind_responses(url, depth, body, url)?;
-    Ok(ms.responses)
+    fn supports_only_vfreebusy(props: &ResourceProps) -> bool {
+        props.is_calendar
+            && !props.supported_components.is_empty()
+            && !props
+                .supported_components
+                .iter()
+                .any(|c| hashify::set!(c.as_bytes(), "VEVENT", "VTODO", "VJOURNAL"))
+    }
 }
 
 #[cfg(test)]
@@ -344,7 +302,7 @@ mod tests {
 
     #[test]
     fn item_resourcetype_matches_calendar_for_caldav() {
-        let p = crate::dav::parse::ResourceProps {
+        let p = ResourceProps {
             is_calendar: true,
             ..Default::default()
         };
@@ -354,7 +312,7 @@ mod tests {
 
     #[test]
     fn item_resourcetype_matches_collection_for_webdav() {
-        let p = crate::dav::parse::ResourceProps {
+        let p = ResourceProps {
             is_collection: true,
             ..Default::default()
         };

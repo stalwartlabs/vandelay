@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::JmapId;
+use super::common::Lenient;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,10 +26,6 @@ pub struct AddressBook {
     #[serde(default)]
     pub is_default: bool,
 
-    #[serde(default = "default_true")]
+    #[serde(default = "Lenient::default_true")]
     pub is_subscribed: bool,
-}
-
-fn default_true() -> bool {
-    true
 }

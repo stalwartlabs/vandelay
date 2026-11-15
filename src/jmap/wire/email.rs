@@ -7,7 +7,7 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use super::common::lenient_utc_date;
+use super::common::Lenient;
 use super::{JmapId, UtcDate};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,7 +20,7 @@ pub struct Email {
 
     #[serde(
         default,
-        deserialize_with = "lenient_utc_date",
+        deserialize_with = "Lenient::utc_date",
         serialize_with = "time::serde::rfc3339::option::serialize",
         skip_serializing_if = "Option::is_none"
     )]

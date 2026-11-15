@@ -6,32 +6,33 @@
 
 mod integration;
 
-use std::collections::HashSet;
-
 use integration::Account;
-use integration::baikal::{AccountSeed, Baikal};
+use integration::baikal::Baikal;
+use integration::layouts::{
+    assert_contact_collection_exact, assert_contact_data_well_formed,
+    assert_contact_uids_round_trip, assert_event_collection_exact, assert_event_data_well_formed,
+    assert_event_uids_round_trip,
+};
 use integration::validate::{
-    all_contact_uids, all_event_uids, assert_contact_round_trip, assert_event_round_trip,
-    calendar_event_count, cleanup, collection_id_by_name, collection_names, common,
-    contact_card_count, count, open_archive, tmp_archive,
+    all_contact_uids, all_event_uids, assert_contact_round_trip, assert_event_round_trip, cleanup,
+    common, count, open_archive, tmp_archive,
 };
 
-use rusqlite::Connection;
-use serde_json::Value;
+use vandelay::archive::sources::SourceChange;
 use vandelay::error::Error;
-use vandelay::sync::import_dav;
-use vandelay::sync::import_dav::{DavAuth, DavImportConfig, DavKindArg, SourceChange};
+use vandelay::import::dav::{DavImport, DavKindArg};
+use vandelay::net::auth::Auth;
 
-fn dav_config(kind: DavKindArg, account: &Account, dav_root: &str) -> DavImportConfig {
+fn dav_config(kind: DavKindArg, account: &Account, dav_root: &str) -> DavImport {
     let path = match kind {
         DavKindArg::Caldav => format!("{dav_root}/calendars/{}/", account.username),
         DavKindArg::Carddav => format!("{dav_root}/addressbooks/{}/", account.username),
         DavKindArg::Webdav => format!("{dav_root}/"),
     };
-    DavImportConfig {
+    DavImport {
         kind,
         url: path,
-        auth: DavAuth::Basic {
+        auth: Auth::Basic {
             user: account.username.clone(),
             password: account.password.clone(),
         },
@@ -42,15 +43,11 @@ fn dav_config(kind: DavKindArg, account: &Account, dav_root: &str) -> DavImportC
     }
 }
 
-fn dav_config_via_discovery(
-    kind: DavKindArg,
-    account: &Account,
-    dav_root: &str,
-) -> DavImportConfig {
-    DavImportConfig {
+fn dav_config_via_discovery(kind: DavKindArg, account: &Account, dav_root: &str) -> DavImport {
+    DavImport {
         kind,
         url: format!("{dav_root}/"),
-        auth: DavAuth::Basic {
+        auth: Auth::Basic {
             user: account.username.clone(),
             password: account.password.clone(),
         },
@@ -103,11 +100,10 @@ fn baikal_starts_seeds_and_imports() {
         );
 
         let cal_archive = tmp_archive(&format!("baikal-cal-{}", seed.username));
-        let summary = import_dav::run(
-            common(&cal_archive),
-            dav_config(DavKindArg::Caldav, account, &dav_root),
-        )
-        .expect("caldav import");
+        let summary = dav_config(DavKindArg::Caldav, account, &dav_root)
+            .run(common(&cal_archive))
+            .into_result()
+            .expect("caldav import");
         assert!(
             !summary.any_failed(),
             "{}: first caldav import had failures: {summary:?}",
@@ -132,11 +128,10 @@ fn baikal_starts_seeds_and_imports() {
         let blob_count = count(&conn, "blobs") as usize;
         drop(conn);
 
-        let summary2 = import_dav::run(
-            common(&cal_archive),
-            dav_config(DavKindArg::Caldav, account, &dav_root),
-        )
-        .expect("idempotent caldav re-import");
+        let summary2 = dav_config(DavKindArg::Caldav, account, &dav_root)
+            .run(common(&cal_archive))
+            .into_result()
+            .expect("idempotent caldav re-import");
         assert!(
             !summary2.any_failed(),
             "{}: idempotent caldav re-import had failures",
@@ -164,11 +159,10 @@ fn baikal_starts_seeds_and_imports() {
         drop(conn);
 
         let card_archive = tmp_archive(&format!("baikal-card-{}", seed.username));
-        let summary = import_dav::run(
-            common(&card_archive),
-            dav_config(DavKindArg::Carddav, account, &dav_root),
-        )
-        .expect("carddav import");
+        let summary = dav_config(DavKindArg::Carddav, account, &dav_root)
+            .run(common(&card_archive))
+            .into_result()
+            .expect("carddav import");
         assert!(
             !summary.any_failed(),
             "{}: first carddav import had failures: {summary:?}",
@@ -192,11 +186,10 @@ fn baikal_starts_seeds_and_imports() {
         let card_count = count(&conn, "contact_cards") as usize;
         drop(conn);
 
-        let summary2 = import_dav::run(
-            common(&card_archive),
-            dav_config(DavKindArg::Carddav, account, &dav_root),
-        )
-        .expect("idempotent carddav re-import");
+        let summary2 = dav_config(DavKindArg::Carddav, account, &dav_root)
+            .run(common(&card_archive))
+            .into_result()
+            .expect("idempotent carddav re-import");
         assert!(
             !summary2.any_failed(),
             "{}: idempotent carddav re-import had failures",
@@ -225,11 +218,10 @@ fn baikal_starts_seeds_and_imports() {
         let vanish_uid = seed.calendars[0].items.first().unwrap().uid.clone();
         b.delete_item(account, &vanish_href)
             .expect("baikal delete vanished item");
-        let summary_after_vanish = import_dav::run(
-            common(&cal_archive),
-            dav_config(DavKindArg::Caldav, account, &dav_root),
-        )
-        .expect("caldav re-import after vanish");
+        let summary_after_vanish = dav_config(DavKindArg::Caldav, account, &dav_root)
+            .run(common(&cal_archive))
+            .into_result()
+            .expect("caldav re-import after vanish");
         assert!(
             !summary_after_vanish.any_failed(),
             "{}: re-import after vanish had failures",
@@ -254,11 +246,10 @@ fn baikal_starts_seeds_and_imports() {
         let (_added_event_href, added_event_uid) = b
             .add_event(account, 0, &format!("bk-{}", seed.username), &icals)
             .expect("baikal add event");
-        let summary_after_add_event = import_dav::run(
-            common(&cal_archive),
-            dav_config(DavKindArg::Caldav, account, &dav_root),
-        )
-        .expect("caldav re-import after add");
+        let summary_after_add_event = dav_config(DavKindArg::Caldav, account, &dav_root)
+            .run(common(&cal_archive))
+            .into_result()
+            .expect("caldav re-import after add");
         assert!(
             !summary_after_add_event.any_failed(),
             "{}: re-import after add-event had failures",
@@ -283,11 +274,10 @@ fn baikal_starts_seeds_and_imports() {
         let (_added_card_href, added_card_uid) = b
             .add_contact(account, 0, &format!("bk-{}", seed.username), &vcards)
             .expect("baikal add contact");
-        let summary_after_add_contact = import_dav::run(
-            common(&card_archive),
-            dav_config(DavKindArg::Carddav, account, &dav_root),
-        )
-        .expect("carddav re-import after add");
+        let summary_after_add_contact = dav_config(DavKindArg::Carddav, account, &dav_root)
+            .run(common(&card_archive))
+            .into_result()
+            .expect("carddav re-import after add");
         assert!(
             !summary_after_add_contact.any_failed(),
             "{}: re-import after add-contact had failures",
@@ -310,11 +300,10 @@ fn baikal_starts_seeds_and_imports() {
         drop(conn);
 
         let discovery_archive = tmp_archive(&format!("baikal-cal-discovery-{}", seed.username));
-        let discovery_summary = import_dav::run(
-            common(&discovery_archive),
-            dav_config_via_discovery(DavKindArg::Caldav, account, &dav_root),
-        )
-        .expect("caldav import via discovery from dav root");
+        let discovery_summary = dav_config_via_discovery(DavKindArg::Caldav, account, &dav_root)
+            .run(common(&discovery_archive))
+            .into_result()
+            .expect("caldav import via discovery from dav root");
         assert!(
             !discovery_summary.any_failed(),
             "{}: caldav import via discovery had failures: {discovery_summary:?}",
@@ -337,16 +326,14 @@ fn baikal_starts_seeds_and_imports() {
     let primary = &b.accounts[0];
     let other = &b.accounts[1];
     let shared_archive = tmp_archive("baikal-source-change");
-    import_dav::run(
-        common(&shared_archive),
-        dav_config(DavKindArg::Caldav, primary, &dav_root),
-    )
-    .expect("seed archive with primary user");
-    let err = import_dav::run(
-        common(&shared_archive),
-        dav_config(DavKindArg::Caldav, other, &dav_root),
-    )
-    .expect_err("expected source-change abort");
+    dav_config(DavKindArg::Caldav, primary, &dav_root)
+        .run(common(&shared_archive))
+        .into_result()
+        .expect("seed archive with primary user");
+    let err = dav_config(DavKindArg::Caldav, other, &dav_root)
+        .run(common(&shared_archive))
+        .into_result()
+        .expect_err("expected source-change abort");
     assert!(
         matches!(err, Error::SourceChange(_)),
         "expected SourceChange, got {err:?}"
@@ -401,10 +388,10 @@ fn baikal_carddav_preserves_apple_item_labels() {
         .expect("put vcard");
 
     let archive = tmp_archive("baikal-ablabels");
-    let cfg = DavImportConfig {
+    let cfg = DavImport {
         kind: DavKindArg::Carddav,
         url: format!("{dav_root}/addressbooks/{}/", account.username),
-        auth: DavAuth::Basic {
+        auth: Auth::Basic {
             user: account.username.clone(),
             password: account.password.clone(),
         },
@@ -413,7 +400,10 @@ fn baikal_carddav_preserves_apple_item_labels() {
         multiget_batch: 25,
         source_change: SourceChange::Reject,
     };
-    let summary = import_dav::run(common(&archive), cfg).expect("carddav import");
+    let summary = cfg
+        .run(common(&archive))
+        .into_result()
+        .expect("carddav import");
     assert!(
         !summary.any_failed(),
         "carddav import had failures: {summary:?}"
@@ -446,136 +436,4 @@ fn baikal_carddav_preserves_apple_item_labels() {
 
     cleanup(&archive);
     b.stop().expect("baikal stop");
-}
-
-fn assert_event_collection_exact(conn: &Connection, seed: &AccountSeed) {
-    let names = collection_names(conn, "calendars");
-    let expected: HashSet<String> = seed
-        .calendars
-        .iter()
-        .map(|c| c.display_name.clone())
-        .collect();
-    assert_eq!(
-        names, expected,
-        "{}: calendar displayname set mismatch",
-        seed.username
-    );
-    for plan in &seed.calendars {
-        let cal_id = collection_id_by_name(conn, "calendars", &plan.display_name)
-            .unwrap_or_else(|| panic!("calendar {} missing", plan.display_name));
-        let got = calendar_event_count(conn, cal_id);
-        assert_eq!(
-            got as usize,
-            plan.items.len(),
-            "{}: calendar {} event count {got} != seeded {}",
-            seed.username,
-            plan.display_name,
-            plan.items.len()
-        );
-    }
-}
-
-fn assert_contact_collection_exact(conn: &Connection, seed: &AccountSeed) {
-    let names = collection_names(conn, "address_books");
-    let expected: HashSet<String> = seed
-        .address_books
-        .iter()
-        .map(|c| c.display_name.clone())
-        .collect();
-    assert_eq!(
-        names, expected,
-        "{}: address book displayname set mismatch",
-        seed.username
-    );
-    for plan in &seed.address_books {
-        let book_id = collection_id_by_name(conn, "address_books", &plan.display_name)
-            .unwrap_or_else(|| panic!("address book {} missing", plan.display_name));
-        let got = contact_card_count(conn, book_id);
-        assert_eq!(
-            got as usize,
-            plan.items.len(),
-            "{}: book {} contact count {got} != seeded {}",
-            seed.username,
-            plan.display_name,
-            plan.items.len()
-        );
-    }
-}
-
-fn assert_event_uids_round_trip(conn: &Connection, seed: &AccountSeed) {
-    let imported = all_event_uids(conn);
-    let expected = seed.event_uids();
-    let missing: Vec<_> = expected.difference(&imported).collect();
-    assert!(
-        missing.is_empty(),
-        "{}: event uids missing from archive: {missing:?}",
-        seed.username
-    );
-}
-
-fn assert_contact_uids_round_trip(conn: &Connection, seed: &AccountSeed) {
-    let imported = all_contact_uids(conn);
-    let expected = seed.contact_uids();
-    let missing: Vec<_> = expected.difference(&imported).collect();
-    assert!(
-        missing.is_empty(),
-        "{}: contact uids missing from archive: {missing:?}",
-        seed.username
-    );
-}
-
-fn assert_event_data_well_formed(conn: &Connection) {
-    let mut stmt = conn
-        .prepare("SELECT data, data_type FROM calendar_events")
-        .expect("prepare");
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        .expect("query")
-        .filter_map(|r| r.ok())
-        .collect();
-    assert!(!rows.is_empty(), "no calendar_events rows");
-    for (raw, data_type) in rows {
-        assert_eq!(
-            data_type, "Event",
-            "all VEVENT seeds must land as Event, got data_type={data_type}, raw={raw}"
-        );
-        let v: Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| panic!("calendar_events.data invalid JSON: {e}; raw={raw}"));
-        let obj = v.as_object().expect("event data is object");
-        let kind = obj
-            .get("@type")
-            .or_else(|| obj.get("type"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        assert_eq!(kind, "Event", "JSCalendar @type must be Event, got {kind}");
-        assert!(obj.contains_key("uid"), "event JSON missing uid: {obj:?}");
-        assert!(
-            obj.contains_key("start"),
-            "event JSON missing start: {obj:?}"
-        );
-    }
-}
-
-fn assert_contact_data_well_formed(conn: &Connection) {
-    let mut stmt = conn
-        .prepare("SELECT uid, data FROM contact_cards")
-        .expect("prepare");
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        .expect("query")
-        .filter_map(|r| r.ok())
-        .collect();
-    assert!(!rows.is_empty(), "no contact_cards rows");
-    for (uid, raw) in rows {
-        assert!(!uid.is_empty(), "contact uid empty");
-        let v: Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| panic!("contact_cards.data invalid JSON: {e}; raw={raw}"));
-        let obj = v.as_object().expect("contact data is object");
-        let kind = obj
-            .get("@type")
-            .or_else(|| obj.get("type"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        assert_eq!(kind, "Card", "JSContact @type must be Card, got {kind}");
-    }
 }

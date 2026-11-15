@@ -4,173 +4,247 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use serde_json::{Value, json};
+use std::fmt;
+use std::str;
 
-pub fn normalize_message_id(raw: &str) -> String {
-    let t = raw.trim();
-    let t = t.strip_prefix('<').unwrap_or(t);
-    let t = t.strip_suffix('>').unwrap_or(t);
-    t.trim().to_lowercase()
-}
+use serde::ser::{Serialize, Serializer};
+use serde_json::Value;
 
-pub fn fold_name(name: &str) -> String {
-    name.trim().to_lowercase()
-}
+const FIELD_SEPARATOR: &[u8] = b"\x1f";
+const MESSAGE_ID_SEPARATOR: &str = "\x1f";
+const KEY_LEN: usize = 32;
 
-pub fn blake3_fields(fields: &[&str]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    for (i, f) in fields.iter().enumerate() {
-        if i > 0 {
-            hasher.update(b"\x1f");
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Key32(pub [u8; KEY_LEN]);
+
+impl Key32 {
+    pub const ZERO: Key32 = Key32([0; KEY_LEN]);
+
+    pub fn of_fields(fields: &[&str]) -> Key32 {
+        let mut hasher = blake3::Hasher::new();
+        let mut fields = fields.iter();
+        if let Some(first) = fields.next() {
+            hasher.update(first.as_bytes());
         }
-        hasher.update(f.as_bytes());
+        for field in fields {
+            hasher.update(FIELD_SEPARATOR);
+            hasher.update(field.as_bytes());
+        }
+        Key32(*hasher.finalize().as_bytes())
     }
-    *hasher.finalize().as_bytes()
+
+    pub fn identity(name: &str, email: &str) -> Key32 {
+        Key32::of_fields(&[name, &email.to_lowercase()])
+    }
+
+    pub fn participant_identity(calendar_address: &str, name: &str) -> Key32 {
+        Key32::of_fields(&[&calendar_address.to_lowercase(), name])
+    }
+
+    pub fn from_hex(text: &str) -> Option<Key32> {
+        let bytes = text.as_bytes();
+        if bytes.len() != KEY_LEN * 2 {
+            return None;
+        }
+        let mut out = [0u8; KEY_LEN];
+        for (slot, pair) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
+            *slot = u8::from_str_radix(str::from_utf8(pair).ok()?, 16).ok()?;
+        }
+        Some(Key32(out))
+    }
 }
 
-pub fn blake3_bytes(bytes: &[u8]) -> [u8; 32] {
-    *blake3::hash(bytes).as_bytes()
+impl fmt::Display for Key32 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in &self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
 }
 
-pub fn identity_key(name: &str, email: &str) -> [u8; 32] {
-    blake3_fields(&[name, &email.to_lowercase()])
+impl Serialize for Key32 {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
 }
 
-pub fn participant_identity_key(calendar_address: &str, name: &str) -> [u8; 32] {
-    blake3_fields(&[&calendar_address.to_lowercase(), name])
+#[derive(Debug, Clone, Copy)]
+pub struct MessageId<'a>(pub &'a str);
+
+impl MessageId<'_> {
+    pub fn normalized(self) -> String {
+        let t = self.0.trim();
+        let t = t.strip_prefix('<').unwrap_or(t);
+        let t = t.strip_suffix('>').unwrap_or(t);
+        t.trim().to_lowercase()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FoldedName(String);
+
+impl FoldedName {
+    pub fn new(name: &str) -> FoldedName {
+        FoldedName(name.trim().to_lowercase())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EmailKey {
     MessageId(String),
-    Fallback([u8; 32]),
+    Fallback(Key32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmailIndex {
     pub mids: Vec<String>,
-
-    pub fb: [u8; 32],
+    pub fb: Key32,
 }
 
-fn join_addrs(addrs: &[String]) -> String {
-    addrs
-        .iter()
-        .map(|a| a.to_lowercase())
-        .collect::<Vec<_>>()
-        .join(",")
+#[derive(serde::Serialize)]
+struct StoredIndex<'a> {
+    f: Key32,
+    m: &'a [String],
 }
 
-pub fn email_index(
-    message_ids: &[String],
-    from: &[String],
-    subject: &str,
-    sent_at: &str,
-    to: &[String],
-) -> EmailIndex {
-    let mut mids: Vec<String> = message_ids
-        .iter()
-        .map(|m| normalize_message_id(m))
-        .filter(|s| !s.is_empty())
-        .collect();
-    mids.sort();
-    mids.dedup();
-    let fb = blake3_fields(&[&join_addrs(from), subject, sent_at, &join_addrs(to)]);
-    EmailIndex { mids, fb }
-}
+impl EmailIndex {
+    pub fn new(
+        message_ids: &[String],
+        from: &[String],
+        subject: &str,
+        sent_at: &str,
+        to: &[String],
+    ) -> EmailIndex {
+        let mut mids: Vec<String> = message_ids
+            .iter()
+            .map(|m| MessageId(m).normalized())
+            .filter(|s| !s.is_empty())
+            .collect();
+        mids.sort_unstable();
+        mids.dedup();
+        let fb = Key32::of_fields(&[
+            &EmailIndex::address_list(from),
+            subject,
+            sent_at,
+            &EmailIndex::address_list(to),
+        ]);
+        EmailIndex { mids, fb }
+    }
 
-pub fn index_to_json(idx: &EmailIndex) -> String {
-    json!({ "m": idx.mids, "f": hex(&idx.fb) }).to_string()
-}
+    fn address_list(addrs: &[String]) -> String {
+        let mut out = String::with_capacity(addrs.iter().map(|a| a.len() + 1).sum());
+        for (i, addr) in addrs.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&addr.to_lowercase());
+        }
+        out
+    }
 
-pub fn index_from_json(text: &str) -> EmailIndex {
-    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
-    let mids = v
-        .get("m")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(str::to_owned))
-                .collect()
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(&StoredIndex {
+            f: self.fb,
+            m: &self.mids,
         })
-        .unwrap_or_default();
-    let fb = v
-        .get("f")
-        .and_then(Value::as_str)
-        .and_then(unhex)
-        .unwrap_or([0u8; 32]);
-    EmailIndex { mids, fb }
-}
-
-fn hex(bytes: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(64);
-    for b in bytes {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
+        .unwrap_or_default()
     }
-    s
-}
 
-fn unhex(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
+    pub fn from_json(text: &str) -> EmailIndex {
+        let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+        let mids = v
+            .get("m")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fb = v
+            .get("f")
+            .and_then(Value::as_str)
+            .and_then(Key32::from_hex)
+            .unwrap_or(Key32::ZERO);
+        EmailIndex { mids, fb }
     }
-    let mut out = [0u8; 32];
-    for (i, slot) in out.iter_mut().enumerate() {
-        *slot = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(out)
-}
 
-pub fn email_key(idx: &EmailIndex) -> EmailKey {
-    if idx.mids.is_empty() {
-        EmailKey::Fallback(idx.fb)
-    } else {
-        EmailKey::MessageId(idx.mids.join("\x1f"))
+    pub fn key(&self) -> EmailKey {
+        if self.mids.is_empty() {
+            EmailKey::Fallback(self.fb)
+        } else {
+            EmailKey::MessageId(self.mids.join(MESSAGE_ID_SEPARATOR))
+        }
     }
-}
-
-pub fn email_keys(indices: &[EmailIndex]) -> Vec<EmailKey> {
-    indices.iter().map(email_key).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // address_list matches the old lowercase-and-join, empty entries included
+    #[test]
+    fn address_list_matches_the_old_join() {
+        let reference = |addrs: &[String]| {
+            addrs
+                .iter()
+                .map(|a| a.to_lowercase())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let cases: [&[&str]; 7] = [
+            &[],
+            &[""],
+            &["", ""],
+            &["", "B@x"],
+            &["a@X", ""],
+            &["A@x", "", "c@Y"],
+            &["ΣΑΣ@x"],
+        ];
+        for case in cases {
+            let addrs: Vec<String> = case.iter().map(|a| (*a).to_owned()).collect();
+            assert_eq!(
+                EmailIndex::address_list(&addrs),
+                reference(&addrs),
+                "{case:?}"
+            );
+        }
+    }
+
     #[test]
     fn message_id_normalization_strips_brackets_and_lowercases() {
-        assert_eq!(normalize_message_id("  <ABC@Host.COM> "), "abc@host.com");
-        assert_eq!(normalize_message_id("plain@x"), "plain@x");
+        assert_eq!(MessageId("  <ABC@Host.COM> ").normalized(), "abc@host.com");
+        assert_eq!(MessageId("plain@x").normalized(), "plain@x");
     }
 
     #[test]
     fn name_fold_is_case_insensitive() {
-        assert_eq!(fold_name(" Sales "), fold_name("sales"));
-        assert_ne!(fold_name("Sales"), fold_name("sale"));
+        assert_eq!(FoldedName::new(" Sales "), FoldedName::new("sales"));
+        assert_ne!(FoldedName::new("Sales"), FoldedName::new("sale"));
     }
 
     #[test]
     fn identity_collapse_ignores_signature() {
         assert_eq!(
-            identity_key("Alice", "A@x.test"),
-            identity_key("Alice", "a@x.test")
+            Key32::identity("Alice", "A@x.test"),
+            Key32::identity("Alice", "a@x.test")
         );
     }
 
     #[test]
     fn participant_identity_key_lowercases_address_only() {
-        let a = participant_identity_key("MailTo:User@Host", "Bob");
-        let b = participant_identity_key("mailto:user@host", "Bob");
+        let a = Key32::participant_identity("MailTo:User@Host", "Bob");
+        let b = Key32::participant_identity("mailto:user@host", "Bob");
         assert_eq!(a, b);
-        assert_ne!(a, participant_identity_key("mailto:user@host", "bob"));
+        assert_ne!(a, Key32::participant_identity("mailto:user@host", "bob"));
     }
 
     fn idx(mids: &[&str], from: &[&str], subj: &str, sent: &str, to: &[&str]) -> EmailIndex {
         let m: Vec<String> = mids.iter().map(|s| (*s).to_owned()).collect();
         let f: Vec<String> = from.iter().map(|s| (*s).to_owned()).collect();
         let t: Vec<String> = to.iter().map(|s| (*s).to_owned()).collect();
-        email_index(&m, &f, subj, sent, &t)
+        EmailIndex::new(&m, &f, subj, sent, &t)
     }
 
     #[test]
@@ -183,7 +257,7 @@ mod tests {
 
     #[test]
     fn unique_single_message_id_uses_message_id_key() {
-        let keys = email_keys(&[
+        let keys: Vec<EmailKey> = [
             idx(
                 &["<m1@h>"],
                 &["a@x"],
@@ -198,14 +272,17 @@ mod tests {
                 "2020-01-02T00:00:00Z",
                 &["b@y"],
             ),
-        ]);
+        ]
+        .iter()
+        .map(EmailIndex::key)
+        .collect();
         assert_eq!(keys[0], EmailKey::MessageId("m1@h".to_owned()));
         assert_eq!(keys[1], EmailKey::MessageId("m2@h".to_owned()));
     }
 
     #[test]
     fn shared_message_id_matches_regardless_of_other_fields() {
-        let keys = email_keys(&[
+        let keys: Vec<EmailKey> = [
             idx(
                 &["<dup@h>"],
                 &["a@x"],
@@ -220,14 +297,17 @@ mod tests {
                 "2020-01-02T00:00:00Z",
                 &["d@y"],
             ),
-        ]);
+        ]
+        .iter()
+        .map(EmailIndex::key)
+        .collect();
         assert_eq!(keys[0], EmailKey::MessageId("dup@h".to_owned()));
         assert_eq!(keys[0], keys[1], "same Message-ID is the same message");
     }
 
     #[test]
     fn only_absent_message_id_falls_back_multi_is_still_message_id() {
-        let keys = email_keys(&[
+        let keys: Vec<EmailKey> = [
             idx(&[], &["a@x"], "S", "2020-01-01T00:00:00Z", &["b@y"]),
             idx(
                 &["<a@h>", "<b@h>"],
@@ -236,7 +316,10 @@ mod tests {
                 "2020-01-01T00:00:00Z",
                 &["b@y"],
             ),
-        ]);
+        ]
+        .iter()
+        .map(EmailIndex::key)
+        .collect();
         assert!(matches!(keys[0], EmailKey::Fallback(_)));
         assert_eq!(keys[1], EmailKey::MessageId("a@h\u{1f}b@h".to_owned()));
     }
@@ -253,16 +336,31 @@ mod tests {
     #[test]
     fn index_json_roundtrips() {
         let i = idx(&["<m@h>"], &["a@x"], "S", "2020-01-01T00:00:00Z", &["b@y"]);
-        let j = index_to_json(&i);
-        let back = index_from_json(&j);
+        let j = i.to_json();
+        let back = EmailIndex::from_json(&j);
         assert_eq!(i, back);
-        assert_eq!(email_keys(&[i]), email_keys(&[back]));
+        assert_eq!(i.key(), back.key());
     }
 
     #[test]
     fn malformed_stored_json_degrades_to_empty_fallback() {
-        let back = index_from_json("{}");
+        let back = EmailIndex::from_json("{}");
         assert!(back.mids.is_empty());
-        assert_eq!(back.fb, [0u8; 32]);
+        assert_eq!(back.fb, Key32::ZERO);
+    }
+
+    // A stored fallback key with multibyte text degrades to the zero key instead of panicking.
+    #[test]
+    fn non_ascii_fallback_hex_is_rejected_without_panicking() {
+        let text = format!("{{\"f\":\"a{}a\",\"m\":[]}}", "\u{e9}".repeat(31));
+        assert_eq!(EmailIndex::from_json(&text).fb, Key32::ZERO);
+    }
+
+    #[test]
+    fn stored_json_layout_is_unchanged() {
+        let i = idx(&["<m@h>"], &[], "", "", &[]);
+        let hex = i.fb.to_string();
+        assert_eq!(i.to_json(), format!("{{\"f\":\"{hex}\",\"m\":[\"m@h\"]}}"));
+        assert_eq!(Key32::from_hex(&hex), Some(i.fb));
     }
 }

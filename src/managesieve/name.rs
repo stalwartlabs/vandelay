@@ -4,36 +4,42 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-pub fn encode_argument(s: &str, out: &mut String) {
-    let bytes = s.as_bytes();
-    if can_be_quoted(bytes) {
-        out.push('"');
-        for ch in s.chars() {
-            if ch == '"' || ch == '\\' {
-                out.push('\\');
+use std::fmt;
+
+const MAX_QUOTED_LEN: usize = 1024;
+
+#[derive(Debug, Clone, Copy)]
+pub struct SieveString<'a>(pub &'a str);
+
+impl SieveString<'_> {
+    pub fn can_be_quoted(self) -> bool {
+        let bytes = self.0.as_bytes();
+        bytes.len() <= MAX_QUOTED_LEN
+            && bytes
+                .iter()
+                .all(|&b| b == b'\t' || (0x20..=0x7e).contains(&b))
+    }
+}
+
+impl fmt::Display for SieveString<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.can_be_quoted() {
+            f.write_str("\"")?;
+            for part in self.0.split_inclusive(['"', '\\']) {
+                match part.strip_suffix(['"', '\\']) {
+                    Some(head) => {
+                        f.write_str(head)?;
+                        f.write_str("\\")?;
+                        f.write_str(part.get(head.len()..).unwrap_or_default())?;
+                    }
+                    None => f.write_str(part)?,
+                }
             }
-            out.push(ch);
+            f.write_str("\"")
+        } else {
+            write!(f, "{{{}+}}\r\n{}", self.0.len(), self.0)
         }
-        out.push('"');
-    } else {
-        out.push('{');
-        out.push_str(&bytes.len().to_string());
-        out.push_str("+}\r\n");
-        out.push_str(s);
     }
-}
-
-pub fn can_be_quoted(bytes: &[u8]) -> bool {
-    if bytes.len() > 1024 {
-        return false;
-    }
-    bytes
-        .iter()
-        .all(|&b| b != b'\r' && b != b'\n' && b != 0 && (b == b'\t' || (0x20..=0x7e).contains(&b)))
-}
-
-pub fn contains_literal(bytes: &[u8]) -> bool {
-    bytes.contains(&b'{')
 }
 
 #[cfg(test)]
@@ -41,9 +47,7 @@ mod tests {
     use super::*;
 
     fn encoded(s: &str) -> String {
-        let mut out = String::new();
-        encode_argument(s, &mut out);
-        out
+        SieveString(s).to_string()
     }
 
     #[test]
@@ -101,23 +105,17 @@ mod tests {
 
     #[test]
     fn tab_is_allowed_in_quoted_string() {
-        assert!(can_be_quoted(b"abc\tdef"));
+        assert!(SieveString("abc\tdef").can_be_quoted());
     }
 
     #[test]
     fn nul_byte_forces_literal() {
-        assert!(!can_be_quoted(b"a\0b"));
+        assert!(!SieveString("a\0b").can_be_quoted());
     }
 
     #[test]
     fn names_over_quoted_threshold_use_literal() {
-        let long: Vec<u8> = (0..2048).map(|_| b'x').collect();
-        assert!(!can_be_quoted(&long));
-    }
-
-    #[test]
-    fn contains_literal_detects_open_brace() {
-        assert!(contains_literal(b"GETSCRIPT {3+}\r\nabc\r\n"));
-        assert!(!contains_literal(b"GETSCRIPT \"abc\"\r\n"));
+        let long = "x".repeat(2048);
+        assert!(!SieveString(&long).can_be_quoted());
     }
 }

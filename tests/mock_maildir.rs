@@ -4,56 +4,31 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+mod common;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use tempfile::TempDir;
-use vandelay::logging::Logger;
-use vandelay::sync::CommonConfig;
-use vandelay::sync::import_maildir::{MaildirImportConfig, run};
+use vandelay::archive::sources::SourceChange;
+use vandelay::imap::automap::Automap;
+use vandelay::import::imap::DeletedMessages;
+use vandelay::import::maildir::MaildirImport;
+use vandelay::sync::RunMode;
+use vandelay::types::ObjectType;
 
-fn tmp_archive(tag: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "vandelay-mock-maildir-{tag}-{}-{}.sqlite",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_file(&p);
-    p
-}
-
-fn common(archive: &Path) -> CommonConfig {
-    CommonConfig {
-        archive: archive.to_path_buf(),
-        threads: 1,
-        dry_run: false,
-        max_retries: 1,
-        allow_invalid_certs: false,
-        logger: Logger::from_flags(true, 0),
-    }
-}
-
-fn base_cfg(root: &Path) -> MaildirImportConfig {
-    MaildirImportConfig {
+fn base_cfg(root: &Path) -> MaildirImport {
+    MaildirImport {
         maildir: root.to_path_buf(),
         include: Vec::new(),
         exclude: Vec::new(),
         folder: Vec::new(),
-        automap: true,
-        include_deleted: false,
-        allow_source_change: false,
+        automap: Automap::Enabled,
+        deleted: DeletedMessages::Skip,
+        source_change: SourceChange::Reject,
     }
-}
-
-fn count(conn: &Connection, table: &str) -> i64 {
-    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
-        .unwrap()
 }
 
 fn ensure_maildir(root: &Path) {
@@ -209,8 +184,11 @@ fn dovecot_fixture(root: &Path) -> HashMap<&'static str, Vec<&'static str>> {
 fn dovecot_layout_imports_every_folder_with_correct_roles() {
     let td = TempDir::new().unwrap();
     let expected = dovecot_fixture(td.path());
-    let archive = tmp_archive("dovecot");
-    let summary = run(common(&archive), base_cfg(td.path())).expect("import");
+    let archive = common::tmp_archive("dovecot");
+    let summary = base_cfg(td.path())
+        .run(common::options(&archive))
+        .into_result()
+        .expect("import");
     assert!(!summary.any_failed(), "import failed: {summary:?}");
 
     let conn = Connection::open(&archive).unwrap();
@@ -254,10 +232,13 @@ fn dovecot_layout_imports_every_folder_with_correct_roles() {
 fn dovecot_include_deleted_keeps_trash_message() {
     let td = TempDir::new().unwrap();
     dovecot_fixture(td.path());
-    let archive = tmp_archive("dovecot-include-deleted");
+    let archive = common::tmp_archive("dovecot-include-deleted");
     let mut cfg = base_cfg(td.path());
-    cfg.include_deleted = true;
-    let summary = run(common(&archive), cfg).expect("import");
+    cfg.deleted = DeletedMessages::Keep;
+    let summary = cfg
+        .run(common::options(&archive))
+        .into_result()
+        .expect("import");
     assert!(!summary.any_failed());
     let conn = Connection::open(&archive).unwrap();
     let trash = emails_for_folder(&conn, "Trash");
@@ -304,8 +285,11 @@ fn courier_fixture(root: &Path) {
 fn courier_layout_with_orphan_parent_creates_ephemeral_lists_row() {
     let td = TempDir::new().unwrap();
     courier_fixture(td.path());
-    let archive = tmp_archive("courier");
-    let summary = run(common(&archive), base_cfg(td.path())).expect("import");
+    let archive = common::tmp_archive("courier");
+    let summary = base_cfg(td.path())
+        .run(common::options(&archive))
+        .into_result()
+        .expect("import");
     assert!(!summary.any_failed(), "{summary:?}");
 
     let conn = Connection::open(&archive).unwrap();
@@ -337,6 +321,39 @@ fn courier_layout_with_orphan_parent_creates_ephemeral_lists_row() {
     let _ = fs::remove_file(&archive);
 }
 
+#[test]
+fn two_folders_with_the_same_automapped_role_keep_one_role() {
+    // R3: "Sent" and "Sent Items" both automap to sent; only the first keeps the role.
+    let td = TempDir::new().unwrap();
+    ensure_maildir(td.path());
+    ensure_subfolder(td.path(), ".Sent");
+    ensure_subfolder(td.path(), ".Sent Items");
+    let archive = common::tmp_archive("dup-role");
+    for _ in 0..2 {
+        let summary = base_cfg(td.path())
+            .run(common::options(&archive))
+            .into_result()
+            .expect("import");
+        assert!(!summary.any_failed());
+    }
+    let conn = Connection::open(&archive).unwrap();
+    let roles: Vec<(String, Option<String>)> = conn
+        .prepare("SELECT name, role FROM mailboxes WHERE name LIKE 'Sent%' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        roles,
+        [
+            ("Sent".to_owned(), Some("sent".to_owned())),
+            ("Sent Items".to_owned(), None),
+        ]
+    );
+    let _ = fs::remove_file(&archive);
+}
+
 fn qmail_fixture(root: &Path) {
     ensure_maildir(root);
 
@@ -365,11 +382,14 @@ fn qmail_fixture(root: &Path) {
 fn qmail_root_only_maildir_imports_inbox_only() {
     let td = TempDir::new().unwrap();
     qmail_fixture(td.path());
-    let archive = tmp_archive("qmail");
-    let summary = run(common(&archive), base_cfg(td.path())).expect("import");
+    let archive = common::tmp_archive("qmail");
+    let summary = base_cfg(td.path())
+        .run(common::options(&archive))
+        .into_result()
+        .expect("import");
     assert!(!summary.any_failed());
     let conn = Connection::open(&archive).unwrap();
-    let mboxes = count(&conn, "mailboxes");
+    let mboxes = common::count(&conn, "mailboxes");
     assert_eq!(mboxes, 1, "INBOX only");
     let inbox = emails_for_folder(&conn, "INBOX");
     assert_eq!(inbox.len(), 3);
@@ -414,8 +434,11 @@ fn cyrus_export_fixture(root: &Path) {
 fn cyrus_style_export_imports_cleanly() {
     let td = TempDir::new().unwrap();
     cyrus_export_fixture(td.path());
-    let archive = tmp_archive("cyrus");
-    let summary = run(common(&archive), base_cfg(td.path())).expect("import");
+    let archive = common::tmp_archive("cyrus");
+    let summary = base_cfg(td.path())
+        .run(common::options(&archive))
+        .into_result()
+        .expect("import");
     assert!(!summary.any_failed());
     let conn = Connection::open(&archive).unwrap();
     assert_eq!(emails_for_folder(&conn, "INBOX").len(), 2);
@@ -434,10 +457,13 @@ fn cyrus_style_export_imports_cleanly() {
 fn include_filter_keeps_only_matching_folders() {
     let td = TempDir::new().unwrap();
     dovecot_fixture(td.path());
-    let archive = tmp_archive("filter-include");
+    let archive = common::tmp_archive("filter-include");
     let mut cfg = base_cfg(td.path());
     cfg.include = vec![regex::Regex::new(r"^(INBOX|Sent)$").unwrap()];
-    let summary = run(common(&archive), cfg).expect("import");
+    let summary = cfg
+        .run(common::options(&archive))
+        .into_result()
+        .expect("import");
     assert!(!summary.any_failed());
     let conn = Connection::open(&archive).unwrap();
     assert!(folder_mailbox_id(&conn, "INBOX").is_some());
@@ -451,10 +477,13 @@ fn include_filter_keeps_only_matching_folders() {
 fn exclude_filter_drops_matching_folders() {
     let td = TempDir::new().unwrap();
     dovecot_fixture(td.path());
-    let archive = tmp_archive("filter-exclude");
+    let archive = common::tmp_archive("filter-exclude");
     let mut cfg = base_cfg(td.path());
     cfg.exclude = vec![regex::Regex::new(r"^Trash$").unwrap()];
-    let summary = run(common(&archive), cfg).expect("import");
+    let summary = cfg
+        .run(common::options(&archive))
+        .into_result()
+        .expect("import");
     assert!(!summary.any_failed());
     let conn = Connection::open(&archive).unwrap();
     assert!(folder_mailbox_id(&conn, "Trash").is_none());
@@ -466,13 +495,16 @@ fn exclude_filter_drops_matching_folders() {
 fn explicit_folder_overrides_include_exclude() {
     let td = TempDir::new().unwrap();
     dovecot_fixture(td.path());
-    let archive = tmp_archive("filter-folder");
+    let archive = common::tmp_archive("filter-folder");
     let mut cfg = base_cfg(td.path());
     cfg.folder = vec!["Sent".to_owned()];
-    let summary = run(common(&archive), cfg).expect("import");
+    let summary = cfg
+        .run(common::options(&archive))
+        .into_result()
+        .expect("import");
     assert!(!summary.any_failed());
     let conn = Connection::open(&archive).unwrap();
-    let mbox_count = count(&conn, "mailboxes");
+    let mbox_count = common::count(&conn, "mailboxes");
     assert_eq!(mbox_count, 1);
     assert!(folder_mailbox_id(&conn, "Sent").is_some());
     let _ = fs::remove_file(&archive);
@@ -482,10 +514,13 @@ fn explicit_folder_overrides_include_exclude() {
 fn noautomap_drops_roles_except_inbox() {
     let td = TempDir::new().unwrap();
     dovecot_fixture(td.path());
-    let archive = tmp_archive("noautomap");
+    let archive = common::tmp_archive("noautomap");
     let mut cfg = base_cfg(td.path());
-    cfg.automap = false;
-    let summary = run(common(&archive), cfg).expect("import");
+    cfg.automap = Automap::Disabled;
+    let summary = cfg
+        .run(common::options(&archive))
+        .into_result()
+        .expect("import");
     assert!(!summary.any_failed());
     let conn = Connection::open(&archive).unwrap();
     let sent_role: Option<String> = conn
@@ -507,20 +542,27 @@ fn noautomap_drops_roles_except_inbox() {
 fn dry_run_reports_diff_without_writing_emails() {
     let td = TempDir::new().unwrap();
     dovecot_fixture(td.path());
-    let archive = tmp_archive("dry-run");
-    let mut common_cfg = common(&archive);
-    common_cfg.dry_run = true;
-    let summary = run(common_cfg, base_cfg(td.path())).expect("dryrun");
-    let (mailbox_label, mailbox_counts) = &summary.per_type[0];
-    let (email_label, email_counts) = &summary.per_type[1];
-    assert_eq!(*mailbox_label, "mailbox");
-    assert_eq!(*email_label, "email");
-    assert!(mailbox_counts.created >= 6);
-    assert!(email_counts.created >= 6);
+    let archive = common::tmp_archive("dry-run");
+    let mut common_cfg = common::options(&archive);
+    common_cfg.mode = RunMode::DryRun;
+    let summary = base_cfg(td.path())
+        .run(common_cfg)
+        .into_result()
+        .expect("dryrun");
+    let (mailbox_label, mailbox_plan) = &summary.plan[0];
+    let (email_label, email_plan) = &summary.plan[1];
+    assert_eq!(*mailbox_label, ObjectType::Mailbox);
+    assert_eq!(*email_label, ObjectType::Email);
+    assert!(mailbox_plan.new >= 6);
+    assert!(email_plan.new >= 6);
 
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "emails"), 0, "dry-run wrote no emails");
-    assert_eq!(count(&conn, "mailboxes"), 0, "dry-run wrote no mailboxes");
+    assert_eq!(common::count(&conn, "emails"), 0, "dry-run wrote no emails");
+    assert_eq!(
+        common::count(&conn, "mailboxes"),
+        0,
+        "dry-run wrote no mailboxes"
+    );
     let _ = fs::remove_file(&archive);
 }
 
@@ -528,8 +570,11 @@ fn dry_run_reports_diff_without_writing_emails() {
 fn rejects_path_without_cur_subdir() {
     let td = TempDir::new().unwrap();
     fs::create_dir_all(td.path().join("new")).unwrap();
-    let archive = tmp_archive("not-a-maildir");
-    let err = run(common(&archive), base_cfg(td.path())).expect_err("should refuse");
+    let archive = common::tmp_archive("not-a-maildir");
+    let err = base_cfg(td.path())
+        .run(common::options(&archive))
+        .into_result()
+        .expect_err("should refuse");
     assert!(matches!(err, vandelay::error::Error::Usage(_)));
     let _ = fs::remove_file(&archive);
 }
@@ -541,8 +586,11 @@ fn rejects_dovecot_layout_fs_tree() {
     for s in ["cur", "new", "tmp"] {
         fs::create_dir_all(td.path().join("Sent").join(s)).unwrap();
     }
-    let archive = tmp_archive("layout-fs");
-    let err = run(common(&archive), base_cfg(td.path())).expect_err("should refuse");
+    let archive = common::tmp_archive("layout-fs");
+    let err = base_cfg(td.path())
+        .run(common::options(&archive))
+        .into_result()
+        .expect_err("should refuse");
     match err {
         vandelay::error::Error::Usage(msg) => {
             assert!(msg.contains("Maildir++"), "msg was: {msg}");
@@ -554,10 +602,13 @@ fn rejects_dovecot_layout_fs_tree() {
 
 #[test]
 fn rejects_nonexistent_path() {
-    let archive = tmp_archive("nonexistent");
+    let archive = common::tmp_archive("nonexistent");
     let mut cfg = base_cfg(Path::new("/definitely/not/a/real/maildir"));
     cfg.maildir = PathBuf::from("/definitely/not/a/real/maildir");
-    let err = run(common(&archive), cfg).expect_err("should refuse");
+    let err = cfg
+        .run(common::options(&archive))
+        .into_result()
+        .expect_err("should refuse");
     assert!(matches!(err, vandelay::error::Error::Usage(_)));
     let _ = fs::remove_file(&archive);
 }
@@ -569,9 +620,15 @@ fn source_change_protection_refuses_second_path() {
     let td_b = TempDir::new().unwrap();
     qmail_fixture(td_b.path());
 
-    let archive = tmp_archive("source-change");
-    run(common(&archive), base_cfg(td_a.path())).expect("first import");
-    let err = run(common(&archive), base_cfg(td_b.path())).expect_err("second import refused");
+    let archive = common::tmp_archive("source-change");
+    base_cfg(td_a.path())
+        .run(common::options(&archive))
+        .into_result()
+        .expect("first import");
+    let err = base_cfg(td_b.path())
+        .run(common::options(&archive))
+        .into_result()
+        .expect_err("second import refused");
     assert!(matches!(err, vandelay::error::Error::SourceChange(_)));
     let _ = fs::remove_file(&archive);
 }
@@ -583,11 +640,17 @@ fn allow_source_change_unlocks_second_path() {
     let td_b = TempDir::new().unwrap();
     qmail_fixture(td_b.path());
 
-    let archive = tmp_archive("allow-source-change");
-    run(common(&archive), base_cfg(td_a.path())).expect("first import");
+    let archive = common::tmp_archive("allow-source-change");
+    base_cfg(td_a.path())
+        .run(common::options(&archive))
+        .into_result()
+        .expect("first import");
     let mut second = base_cfg(td_b.path());
-    second.allow_source_change = true;
-    run(common(&archive), second).expect("second import permitted");
+    second.source_change = SourceChange::Allow;
+    second
+        .run(common::options(&archive))
+        .into_result()
+        .expect("second import permitted");
     let _ = fs::remove_file(&archive);
 }
 
@@ -595,11 +658,14 @@ fn allow_source_change_unlocks_second_path() {
 fn folder_and_include_are_mutually_exclusive() {
     let td = TempDir::new().unwrap();
     ensure_maildir(td.path());
-    let archive = tmp_archive("mutex-folder-include");
+    let archive = common::tmp_archive("mutex-folder-include");
     let mut cfg = base_cfg(td.path());
     cfg.folder = vec!["INBOX".to_owned()];
     cfg.include = vec![regex::Regex::new("^Sent$").unwrap()];
-    let err = run(common(&archive), cfg).expect_err("mutex");
+    let err = cfg
+        .run(common::options(&archive))
+        .into_result()
+        .expect_err("mutex");
     match err {
         vandelay::error::Error::Usage(msg) => {
             assert!(
@@ -616,11 +682,14 @@ fn folder_and_include_are_mutually_exclusive() {
 fn folder_and_exclude_are_mutually_exclusive() {
     let td = TempDir::new().unwrap();
     ensure_maildir(td.path());
-    let archive = tmp_archive("mutex-folder-exclude");
+    let archive = common::tmp_archive("mutex-folder-exclude");
     let mut cfg = base_cfg(td.path());
     cfg.folder = vec!["INBOX".to_owned()];
     cfg.exclude = vec![regex::Regex::new("^Trash$").unwrap()];
-    let err = run(common(&archive), cfg).expect_err("mutex");
+    let err = cfg
+        .run(common::options(&archive))
+        .into_result()
+        .expect_err("mutex");
     assert!(matches!(err, vandelay::error::Error::Usage(_)));
     let _ = fs::remove_file(&archive);
 }
@@ -638,12 +707,18 @@ fn three_level_folder_delete_is_leaf_first() {
         "1.M0.host:2,S",
         &rfc5322("3lvl-1", "x", "body"),
     );
-    let archive = tmp_archive("three-level-delete");
-    run(common(&archive), base_cfg(td.path())).expect("first import");
+    let archive = common::tmp_archive("three-level-delete");
+    base_cfg(td.path())
+        .run(common::options(&archive))
+        .into_result()
+        .expect("first import");
 
     fs::remove_dir_all(td.path().join(".A.B.C")).unwrap();
     fs::remove_dir_all(td.path().join(".A.B")).unwrap();
-    let summary = run(common(&archive), base_cfg(td.path())).expect("second import");
+    let summary = base_cfg(td.path())
+        .run(common::options(&archive))
+        .into_result()
+        .expect("second import");
     assert!(!summary.any_failed(), "{summary:?}");
     let (_, mbox) = &summary.per_type[0];
     let (_, email) = &summary.per_type[1];
@@ -665,12 +740,15 @@ fn same_unique_id_in_two_folders_produces_two_rows_one_blob() {
     let body = rfc5322("dup-1", "shared", "shared body");
     write_message(td.path(), "cur", "1.M0.host:2,S", &body);
     write_message(&sent, "cur", "1.M0.host:2,S", &body);
-    let archive = tmp_archive("cross-folder-dup");
-    let summary = run(common(&archive), base_cfg(td.path())).expect("import");
+    let archive = common::tmp_archive("cross-folder-dup");
+    let summary = base_cfg(td.path())
+        .run(common::options(&archive))
+        .into_result()
+        .expect("import");
     assert!(!summary.any_failed(), "{summary:?}");
     let conn = Connection::open(&archive).unwrap();
-    assert_eq!(count(&conn, "blobs"), 1, "BLAKE3 dedup");
-    assert_eq!(count(&conn, "emails"), 2, "one row per folder");
+    assert_eq!(common::count(&conn, "blobs"), 1, "BLAKE3 dedup");
+    assert_eq!(common::count(&conn, "emails"), 2, "one row per folder");
     let inbox = emails_for_folder(&conn, "INBOX");
     let sent_rows = emails_for_folder(&conn, "Sent");
     assert_eq!(inbox.len(), 1);
@@ -702,8 +780,11 @@ fn unreadable_file_is_counted_and_warned_not_aborted() {
     perms.set_mode(0o000);
     fs::set_permissions(&bad, perms).unwrap();
 
-    let archive = tmp_archive("unreadable");
-    let summary = run(common(&archive), base_cfg(td.path())).expect("not aborted");
+    let archive = common::tmp_archive("unreadable");
+    let summary = base_cfg(td.path())
+        .run(common::options(&archive))
+        .into_result()
+        .expect("not aborted");
 
     let mut perms = fs::metadata(&bad).unwrap().permissions();
     perms.set_mode(0o600);
@@ -723,8 +804,11 @@ fn pointing_at_a_dot_subfolder_warns_but_imports() {
     let sub = ensure_subfolder(parent.path(), ".Sent");
     write_message(&sub, "cur", "1.M0.host:2,S", &rfc5322("sub-1", "x", "x"));
 
-    let archive = tmp_archive("dot-subfolder-as-root");
-    let summary = run(common(&archive), base_cfg(&sub)).expect("import proceeds");
+    let archive = common::tmp_archive("dot-subfolder-as-root");
+    let summary = base_cfg(&sub)
+        .run(common::options(&archive))
+        .into_result()
+        .expect("import proceeds");
     assert!(!summary.any_failed(), "{summary:?}");
     let conn = Connection::open(&archive).unwrap();
 
@@ -744,8 +828,11 @@ fn malformed_message_yields_zero_message_match_but_imports() {
         "2.M0.host:2,S",
         b"X-Garbage: yes\r\n\r\nno headers",
     );
-    let archive = tmp_archive("malformed");
-    let summary = run(common(&archive), base_cfg(td.path())).expect("import");
+    let archive = common::tmp_archive("malformed");
+    let summary = base_cfg(td.path())
+        .run(common::options(&archive))
+        .into_result()
+        .expect("import");
     assert!(!summary.any_failed(), "{summary:?}");
     let conn = Connection::open(&archive).unwrap();
     let inbox = emails_for_folder(&conn, "INBOX");
@@ -777,8 +864,11 @@ fn received_at_comes_from_the_filename_not_a_clobbered_mtime() {
         f.set_modified(restored).unwrap();
     }
 
-    let archive = tmp_archive("received_at");
-    let summary = run(common(&archive), base_cfg(root)).expect("import");
+    let archive = common::tmp_archive("received_at");
+    let summary = base_cfg(root)
+        .run(common::options(&archive))
+        .into_result()
+        .expect("import");
     assert!(!summary.any_failed());
 
     let conn = Connection::open(&archive).unwrap();
