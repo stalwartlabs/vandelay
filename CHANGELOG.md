@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.17] - Unreleased
+
+### Fixed
+- Export: emails whose stored match key differed from the target's own parse (for example two `Message-ID` headers) were imported again on every run; an unmatched email is now checked with `Email/parse` against the target before import
+
 ## [1.0.16] - 2026-11-11
 
 ### Fixed
@@ -17,7 +22,6 @@ All notable changes to this project will be documented in this file. This projec
     - a folder without a `FolderClass` (such as Outlook's `(This computer only)` contacts folders) was always imported as a mailbox, and contacts, appointments, tasks, notes and journal entries found in mail folders (typically Deleted Items) were stored as emails; a class-less folder now takes its kind from the classes of a few of its items, and mail folders skip `IPM.Contact`, `IPM.DistList`, `IPM.Appointment`, `IPM.Task`, `IPM.StickyNote` and `IPM.Activity` items, with a count per class in the log (fixes #62)
 - MS Exchange Graph:
     - all-day events, the occurrences and exceptions of all-day series, and contact birthdays landed one day early east of UTC when Graph returned them as UTC instants rather than at midnight, and every occurrence of such a series could be imported as deleted; a value that is not at midnight is now taken in the event's time zone (UTC for birthdays), rounded to the nearest midnight. Outlook's "no date" (year 4500 or later) is no longer imported as a birthday, a recurrence end or an event (#59, #66)
-- Export: emails whose stored match key differed from the target's own parse (for example two `Message-ID` headers) were imported again on every run; an unmatched email is now checked with `Email/parse` against the target before import
 
 ### Changed
 - Release builds: the `x86_64` and `aarch64` musl binaries are built with `cargo-zigbuild` like the other musl targets, so a release no longer depends on installing `musl-tools` from the Ubuntu package mirrors; dependency installation is retried
