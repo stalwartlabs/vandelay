@@ -243,7 +243,14 @@ fn import_dry_run_writes_nothing() {
         .run(common(&archive, RunMode::DryRun))
         .into_result()
         .expect("dry-run import");
-    assert!(summary.per_type.is_empty(), "dry-run returns empty summary");
+    assert_eq!(summary.failed(), 0, "dry-run reports no failures");
+    assert!(
+        summary
+            .per_type
+            .iter()
+            .all(|(_, c)| c.created == 0 && c.fetched == 0 && c.updated == 0 && c.deleted == 0),
+        "dry-run counts nothing as applied"
+    );
 
     let conn = Connection::open(&archive).unwrap();
     assert_eq!(count(&conn, "emails"), 0);

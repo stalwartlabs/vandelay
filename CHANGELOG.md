@@ -2,7 +2,10 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
-## [1.1.0] - Unreleased
+## [1.1.0] - 2026-11-16
+
+### Changed
+- Code cleanup and refactoring.
 
 ### Fixed
 - Export: emails whose stored match key differed from the target's own parse (for example two `Message-ID` headers) were imported again on every run; an unmatched email is now checked with `Email/parse` against the target before import
